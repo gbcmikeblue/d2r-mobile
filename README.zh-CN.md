@@ -262,7 +262,7 @@ dm/tools/mac_app.sh        # 产出 ~/dm-work/out/macapp/D2R Mobile.app
 - 没验过的那几项，走通或走不通都值得告诉我们。
 - 想改代码：先跑通上面的测试入口，每次改动都要过回归闸门。
 
-**往别的平台走：** 这套做法不限于 iPhone 和 iPad。Apple 芯片的 Mac 可以直接移植过去——我们每天的回归测试就是把同一个包放在 Mac 上跑的。安卓手机用的是同一类处理器，游戏程序同样可以原生执行，这条路完全走得通：要换的只是宿主和图形层对接的那一侧。作者手边没有安卓手机，非常期待看到有人把它带到安卓上。
+**往别的平台走：** 这套做法不限于 iPhone 和 iPad。Apple 芯片的 Mac 可以直接移植过去——我们每天的回归测试就是把同一个包放在 Mac 上跑的。安卓手机用的是同一类处理器，游戏程序同样可以原生执行，这条路完全走得通：要换的只是宿主和图形层对接的那一侧。作者手边没有安卓手机，非常期待看到有人把它带到安卓上。这件事要做什么——能复用什么、要重写什么、风险在哪——见 [docs/ANDROID.zh-CN.md](docs/ANDROID.zh-CN.md)。
 
 ## 各部分的说明
 
@@ -276,6 +276,8 @@ dm/tools/mac_app.sh        # 产出 ~/dm-work/out/macapp/D2R Mobile.app
 | [docs/DEPENDENCIES.zh-CN.md](docs/DEPENDENCIES.zh-CN.md) | 依赖清单与第三方许可证 |
 | [docs/NO_XCODE.zh-CN.md](docs/NO_XCODE.zh-CN.md) | 不用 Xcode、不用 Mac 的做法 |
 | [docs/MAC.zh-CN.md](docs/MAC.zh-CN.md) | 在 Mac 上玩：构建 macOS App、键位、已知不足 |
+| [docs/ANDROID.zh-CN.md](docs/ANDROID.zh-CN.md) | 安卓移植：是否可行、能复用什么、要重做什么、风险与建议路线 |
+| [docs/ANDROID_PLAIN.zh-CN.md](docs/ANDROID_PLAIN.zh-CN.md) | 上面那份分析的通俗版，给不写代码的读者 |
 | [docs/DERIVED.zh-CN.md](docs/DERIVED.zh-CN.md) | 仓库里与游戏有关的东西：有什么、没有什么、为什么 |
 
 ## 声明
