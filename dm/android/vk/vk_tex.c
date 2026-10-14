@@ -89,6 +89,8 @@ typedef struct {
     VkFormat fmt; uint32_t w, h, d, levels, layers;
     int depth_like, dsa;      // dsa：深度模板合并（D24S8 / D32FS8）| dsa: combined depth-stencil
     int dirty;                // 池被 CPU 改过，下次取用前重传 | pool changed on the CPU; re-upload before the next use
+    int gpu_written;          // GPU 写过：池不再是真值，CPU 读回要走 VkImage | the GPU has written it: the pool is no longer the truth and a CPU readback must go through the VkImage
+    VkImageLayout lay;        // 当前布局（转换只在这一层发生）| current layout (transitions happen only here)
 } ent_t;
 
 static ent_t *g_tab; static int g_cap, g_n;
@@ -260,8 +262,52 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     vkUnmapMemory(vk_dev(), sm);
     vkDestroyBuffer(vk_dev(), stg, NULL);
     vkFreeMemory(vk_dev(), sm, NULL);
-    if (done) { atomic_fetch_add(&g_uploads, 1); atomic_fetch_add(&g_upload_bytes, (uint64_t)total); }
+    if (done) { atomic_fetch_add(&g_uploads, 1); atomic_fetch_add(&g_upload_bytes, (uint64_t)total); e->lay = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
     return done;
+}
+
+// 布局转换：只在真的变了时插屏障。回放层开通道前转成附件布局、收通道后转回可采样布局。
+// Layout transition, inserting a barrier only when the layout really changes. The replay layer turns a target
+// into an attachment layout before opening a pass and back into a sampleable layout after closing it.
+void vk_tex_transition(const tex_t *t, VkImageLayout want, VkCommandBuffer cb) {
+    if (!t || !cb || !t->serial) return;
+    if (vk_tex_image(t) == VK_NULL_HANDLE) return;   // 先保证建好并上传（内部自己加锁，这里不能再持锁）| make sure it exists and is uploaded first (that path locks on its own, so no lock may be held here)
+    pthread_mutex_lock(&g_mu);
+    ent_t *e = find_slot(t->serial, 0);
+    if (!e || !e->img || e->lay == want) { pthread_mutex_unlock(&g_mu); return; }
+    VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = e->lay, .newLayout = want,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = e->img,
+        .subresourceRange = { e->depth_like ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (e->dsa ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT,
+                              0, e->levels, 0, e->layers },
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                         0, NULL, 0, NULL, 1, &b);
+    e->lay = want;
+    pthread_mutex_unlock(&g_mu);
+}
+
+void vk_tex_gpu_written(const tex_t *t) {
+    if (!t || !t->serial) return;
+    pthread_mutex_lock(&g_mu);
+    ent_t *e = find_slot(t->serial, 1);
+    // GPU 写过之后池就不再是真值：清掉重传标记，免得下一次取用把它又按池内容覆盖回去
+    // Once the GPU has written it the pool is no longer the truth: clear the re-upload flag so the next use does
+    // not overwrite it from the pool again
+    if (e) { if (!e->img) e->serial = 0, g_n--; else { e->gpu_written = 1; e->dirty = 0; } }
+    pthread_mutex_unlock(&g_mu);
+}
+
+int vk_tex_is_gpu_written(const tex_t *t) {
+    int v = 0;
+    if (!t || !t->serial) return 0;
+    pthread_mutex_lock(&g_mu);
+    ent_t *e = find_slot(t->serial, 0);
+    if (e) v = e->gpu_written;
+    pthread_mutex_unlock(&g_mu);
+    return v;
 }
 
 static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *aspect) {

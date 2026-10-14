@@ -41,6 +41,25 @@ VkImageView vk_tex_view(const tex_t *t);
 void vk_tex_invalidate(uint64_t serial);
 void vk_tex_drop(uint64_t serial);
 
+// 布局跟踪与转换：VkImage 的当前布局由这一层记着，转换只在真的变了时才插屏障。
+// 回放层在开通道前把它转成附件布局、收通道后转回可采样布局；不这么做，下一帧采样会读到还没写完的内容。
+// Layout tracking and transitions: this layer remembers each VkImage's current layout and only inserts a barrier
+// when it actually changes. The replay layer turns a target into an attachment layout before opening a pass and
+// back into a sampleable layout after closing it; without that, the next frame would sample unfinished content.
+//
+// 说明：贴图先创建后才有布局，所以传入 command buffer（上传也是这一层自己做的，创建时期望 UNDEFINED）。
+// Note: a texture has a layout only once it exists, so a command buffer is passed in (uploads are done by this
+// layer too, and a freshly created image starts out UNDEFINED).
+void vk_tex_transition(const tex_t *t, VkImageLayout want, VkCommandBuffer cb);
+
+// 标记/查询"这张贴图被 GPU 写过"：GPU 写过之后，CPU 读回必须走 VkImage 那一侧（把驱动布局排回池的块线性），
+// 不能再直读池内存。用作渲染目标时由回放层调。
+// Mark / query "the GPU has written this texture": after that, a CPU readback must go through the VkImage (swizzling
+// the driver layout back into the pool's block-linear form) instead of reading pool memory directly. Called by the
+// replay layer when the texture serves as a render target.
+void vk_tex_gpu_written(const tex_t *t);
+int vk_tex_is_gpu_written(const tex_t *t);
+
 // CPU 读贴图（NVN ReadTexels）：与 Metal 侧同签名。这里走"池内存是真值"的直读路径（解排布直读），
 // 还没考虑 GPU 写出过的贴图——那一类要等回读通了再从 VkImage 取（见 docs/ANDROID_PLAN 的 M2 进度）。
 // CPU texture read (NVN ReadTexels), same signature as the Metal side. This takes the "pool memory is the truth"

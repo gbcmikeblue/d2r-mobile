@@ -31,3 +31,18 @@ uint32_t vk_zero_copy_type(void);
 
 // 这一段设备是否开了某个扩展 | whether this device enabled a given extension
 int vk_have_ext(const char *name);
+
+// 动态渲染是否可用（回放层开渲染通道的前提；不可用时那一层退回只记状态）
+// Whether dynamic rendering is available (the replay layer's precondition for opening passes; without it that
+// layer falls back to recording state only)
+int vk_have_dyn_render(void);
+
+// 动态渲染的入口。安卓的 libvulkan.so 是**桩库**（只导出到 Vulkan 1.1），1.3 的入口直接引用会链接失败
+// （undefined symbol: vkCmdBeginRendering），必须用 vkGetDeviceProcAddr 取——与取 vkGetMemoryFdKHR 同一个套路。
+// 设备没起来或没取到时这两个指针是 NULL，调用方必须先看 vk_have_dyn_render()。
+// The dynamic-rendering entry points. Android's libvulkan.so is a **stub** library (it exports up to Vulkan 1.1),
+// so referring to a 1.3 entry point directly fails to link (undefined symbol: vkCmdBeginRendering); it has to be
+// fetched with vkGetDeviceProcAddr -- the same pattern as vkGetMemoryFdKHR. Both pointers are NULL when the device
+// is not up or the lookup failed, so callers must check vk_have_dyn_render() first.
+extern PFN_vkCmdBeginRendering dm_vkCmdBeginRendering;
+extern PFN_vkCmdEndRendering dm_vkCmdEndRendering;
