@@ -39,7 +39,10 @@ void mtl_present_wait(uint64_t ticket) { (void)ticket; }
 void mtl_present_flush(void) { }
 double mtl_presented_time(uint64_t ticket) { (void)ticket; return 0; }
 void mtl_ub_present(double interval_ms) { (void)interval_ms; }
-void mtl_set_frame(uint64_t f) { (void)f; }
+// mtl_set_frame / mtl_gpu_ms / mtl_gpu_span 已由回放层实现（nvn_vk.c 的 GPU 计时那一节），所以这里不再留空桩。
+// mtl_set_frame / mtl_gpu_ms / mtl_gpu_span are implemented by the replay layer now (the GPU timing section of
+// nvn_vk.c), so the stubs are gone from here.
+
 uint64_t mtl_drawable_ns_take(void) { return 0; }
 
 // 按请求截图（DM_NVN_SHOT_UI 用）：在当前出图帧之后第 k 帧截图；没有出图，请求直接丢弃。
@@ -92,8 +95,6 @@ uint64_t mtl_udc_saved_bytes(void) { return 0; }
 uint64_t mtl_upload_bytes(void) { return 0; }
 uint64_t mtl_upload_ns_take(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
-double mtl_gpu_ms(uint64_t frame) { (void)frame; return 0; }
-int mtl_gpu_span(uint64_t frame, uint64_t *t0, uint64_t *t1) { (void)frame; if (t0) *t0 = 0; if (t1) *t1 = 0; return 0; }
 
 // ---- 苹果私有接口：本线程累计 {指令, 周期}（libSystem；Mac / iOS 都有，安卓没有对应物）----
 // ---- Apple private interface: this thread's cumulative {instructions, cycles} (libSystem; present on Mac and iOS, no Android counterpart) ----

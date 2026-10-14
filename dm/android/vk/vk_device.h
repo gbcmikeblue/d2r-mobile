@@ -42,6 +42,12 @@ int vk_have_ext(const char *name);
 int vk_have_fill_non_solid(void);
 int vk_have_attr_divisor(void);
 int vk_have_anisotropy(void);          // 各向异性过滤可用（采样器要用）| anisotropic filtering available (needed by samplers)
+
+// GPU 计时（时间戳查询）的两个前置条件：本队列族的时间戳有效位数（0 = 测不了）与每刻多少纳秒。
+// Two prerequisites for GPU timing (timestamp queries): this queue family's timestamp valid-bit count (0 means it
+// cannot be measured) and how many nanoseconds a tick is.
+int vk_ts_bits(void);
+double vk_ts_period_ns(void);
 int vk_have_attr_divisor_zero(void);   // divisor 可为 0（NVN 的"常量流"正好能用这个表达）| divisor may be 0 (exactly what NVN's "constant stream" needs)
 
 // 动态渲染是否可用（回放层开渲染通道的前提；不可用时那一层退回只记状态）

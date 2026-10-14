@@ -46,6 +46,39 @@ int vk_have_attr_divisor(void) { return g_attr_divisor; }
 int vk_have_attr_divisor_zero(void) { return g_attr_divisor_zero; }
 int vk_have_anisotropy(void) { return g_aniso; }
 
+// 时间戳查询的两个读数（GPU 计时用）。有效位数按**本队列族**取——设备级属性里没有这一项，
+// 而一个族支持不代表别的族支持。0 表示这个族测不了，调用方据此关掉计时并说清原因。
+// The two readings behind timestamp queries (for GPU timing). The valid-bit count is taken **for this queue
+// family**: it is not a device-level property and one family supporting it does not mean another does. Zero means
+// this family cannot measure it, and the caller turns timing off and says why.
+static int g_ts_bits = -1, g_ts_cached;
+static double g_ts_period;
+int vk_ts_bits(void) {
+    if (g_ts_bits >= 0) return g_ts_bits;
+    g_ts_bits = 0;
+    vk_device_init();
+    if (!g_dev) return 0;
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g_phys, &nq, NULL);
+    VkQueueFamilyProperties *qf = nq ? calloc(nq, sizeof *qf) : NULL;
+    if (qf) {
+        vkGetPhysicalDeviceQueueFamilyProperties(g_phys, &nq, qf);
+        if (g_qfi < nq) g_ts_bits = (int)qf[g_qfi].timestampValidBits;
+        free(qf);
+    }
+    return g_ts_bits;
+}
+double vk_ts_period_ns(void) {
+    if (g_ts_cached) return g_ts_period;
+    g_ts_cached = 1;
+    vk_device_init();
+    if (!g_dev) return 0;
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(g_phys, &p);
+    g_ts_period = (double)p.limits.timestampPeriod;
+    return g_ts_period;
+}
+
 // 安卓的桩库只到 1.1：1.3 的入口从设备上取（见 vk_device.h 的说明）
 // Android's stub library stops at 1.1, so the 1.3 entry points are fetched from the device (see vk_device.h)
 PFN_vkCmdBeginRendering dm_vkCmdBeginRendering;

@@ -269,6 +269,140 @@ static void pass_begin(void);
 static void pass_end(void);
 static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途槽回收时重置它的池）| defined in the descriptor section (resets a slot's pool when it is reaped)
 
+// ========== GPU 计时（M2-6d 的收尾指标）==========
+// ========== GPU timing (M2-6d's closing metric) ==========
+// 安卓侧的 mtl_gpu_ms 原本是空桩（直接 return 0），所以日志里的 "GPU 0.00 ms" **从来不是测量结果**。
+// 这里把它变成真测量：每次通道开始 / 结束各写一个时间戳（vkCmdWriteTimestamp），栅栏过了之后读回，
+// 取"最后一次结束 − 第一次开始"作为这次提交的 GPU 跨度，累进按帧的环——与苹果侧同一套语义
+// （那边的 GPUStartTime/GPUEndTime 也是按帧号回查、未全部完成时返回 -1）。
+// On Android mtl_gpu_ms used to be a stub returning 0, so the "GPU 0.00 ms" in the log was **never a measurement**.
+// This makes it real: a timestamp at the start and the end of every pass (vkCmdWriteTimestamp), read back once the
+// fence has signalled, with "last end minus first start" as the submission's GPU span accumulated into a per-frame
+// ring -- the same semantics as Apple's (whose GPUStartTime/GPUEndTime are also looked up by frame number and
+// return -1 while incomplete).
+#define GPU_RING 1024        // 与苹果侧同一个环大小 | the same ring size as Apple
+#define GPU_PASS_MAX 64      // 一次提交最多记这么多通道；超了就不再写时间戳（那一次的量会偏小） | at most this many passes per submission; beyond it no more timestamps are written (that submission reads low)
+typedef struct { _Atomic uint64_t frame, ns, pending, t0, t1; } gpu_rec;
+static gpu_rec g_gpu[GPU_RING];
+static _Atomic uint64_t g_cur_frame;
+static VkQueryPool g_tsq;
+static int g_ts_told;
+static uint8_t g_slot_npass[MAX_INFLIGHT];
+static uint64_t g_slot_frame[MAX_INFLIGHT];
+
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); }
+
+static int gpu_pool(void) {
+    if (g_tsq) return 1;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return 0;
+    if (!vk_ts_bits()) {
+        static int said;
+        if (!said++) LOG("【黄】本队列族不支持时间戳查询（有效位数 0）：GPU 时间这一项测不了，仍报 0");
+        return 0;
+    }
+    VkQueryPoolCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = MAX_INFLIGHT * GPU_PASS_MAX * 2 };
+    if (vkCreateQueryPool(vk_dev(), &ci, NULL, &g_tsq) != VK_SUCCESS) { LOG("【红】建时间戳查询池失败"); return 0; }
+    LOG("【绿】GPU 计时就绪：时间戳 %d 位有效、每刻 %.2f ns、%d 槽 × %d 通道",
+        vk_ts_bits(), vk_ts_period_ns(), MAX_INFLIGHT, GPU_PASS_MAX);
+    return 1;
+}
+
+// 一个槽开始录制：清掉这一槽的通道计数，并在命令缓冲里复位它的查询区间（复位是命令，GPU 执行时才生效）
+// A slot starts recording: clear this slot's pass count and reset its query range in the command buffer (the reset
+// is a command and only takes effect when the GPU executes it)
+static void gpu_slot_reset(int slot, VkCommandBuffer cb) {
+    g_slot_npass[slot] = 0;
+    if (slot < 0 || !gpu_pool()) return;
+    vkCmdResetQueryPool(cb, g_tsq, (uint32_t)(slot * GPU_PASS_MAX * 2), (uint32_t)(GPU_PASS_MAX * 2));
+}
+
+// 通道起止各写一个时间戳。只有**真的开成**通道时才写（见调用点），所以起止必然配对。
+// One timestamp at each end of a pass. Written only when the pass **really opened** (see the call sites), so the
+// pairs always match.
+static void gpu_pass_ts(int slot, VkCommandBuffer cb, int end) {
+    if (!g_tsq || slot < 0 || slot >= MAX_INFLIGHT || g_slot_npass[slot] >= GPU_PASS_MAX) return;
+    uint32_t q = (uint32_t)(slot * GPU_PASS_MAX * 2 + g_slot_npass[slot] * 2 + (end ? 1 : 0));
+    vkCmdWriteTimestamp(cb, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsq, q);
+    if (end) g_slot_npass[slot]++;
+}
+
+static void gpu_tag_begin(uint64_t f) {
+    gpu_rec *g = &g_gpu[f % GPU_RING];
+    if (atomic_load(&g->frame) != f) {
+        atomic_store(&g->frame, f); atomic_store(&g->ns, 0); atomic_store(&g->pending, 0);
+        atomic_store(&g->t0, UINT64_MAX); atomic_store(&g->t1, 0);
+    }
+    atomic_fetch_add(&g->pending, 1);
+}
+
+static void gpu_tag_done(uint64_t f, uint64_t t0, uint64_t t1) {
+    gpu_rec *g = &g_gpu[f % GPU_RING];
+    if (atomic_load(&g->frame) != f) return;
+    if (t1 > t0) {
+        atomic_fetch_add(&g->ns, t1 - t0);
+        uint64_t v;
+        for (v = atomic_load(&g->t0); t0 < v && !atomic_compare_exchange_weak(&g->t0, &v, t0);) {}
+        for (v = atomic_load(&g->t1); t1 > v && !atomic_compare_exchange_weak(&g->t1, &v, t1);) {}
+    }
+    atomic_fetch_sub(&g->pending, 1);
+}
+
+// 提交时记下这次提交属于哪一帧：完成是滞后的，回查只能靠帧号（与苹果侧一样）。
+// Record which frame a submission belongs to at commit time: completion is late, so the lookup can only go by
+// frame number (the same as on Apple).
+static void gpu_note_frame(int slot, uint64_t f) {
+    g_slot_frame[slot] = f;
+    if (f) gpu_tag_begin(f);
+}
+
+// 栅栏过了：把这一槽的时间戳读回来，换算成纳秒累进那一帧
+// The fence has signalled: read this slot's timestamps back and add them to that frame in nanoseconds
+static void gpu_slot_readback(int slot) {
+    uint64_t f = g_slot_frame[slot];
+    int n = g_slot_npass[slot];
+    g_slot_npass[slot] = 0;
+    g_slot_frame[slot] = 0;
+    if (!f) return;
+    uint64_t t0 = 0, t1 = 0;
+    if (g_tsq && n > 0) {
+        static uint64_t res[GPU_PASS_MAX * 2];
+        VkResult r = vkGetQueryPoolResults(vk_dev(), g_tsq, (uint32_t)(slot * GPU_PASS_MAX * 2), (uint32_t)(n * 2),
+                                           sizeof res, res, sizeof(uint64_t),
+                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (r == VK_SUCCESS) {
+            for (int i = 0; i < n; i++) {
+                uint64_t a = res[i * 2], b = res[i * 2 + 1];
+                if (!a || !b) continue;
+                if (!t0 || a < t0) t0 = a;
+                if (b > t1) t1 = b;
+            }
+            double per = vk_ts_period_ns();
+            t0 = (uint64_t)((double)t0 * per);
+            t1 = (uint64_t)((double)t1 * per);
+        } else if (g_ts_told++ < 3) {
+            LOG("【黄】读时间戳失败 VkResult %d（这一槽的 GPU 时间按 0 记）", (int)r);
+        }
+    }
+    gpu_tag_done(f, t0, t1);
+}
+
+double mtl_gpu_ms(uint64_t f) {
+    gpu_rec *g = &g_gpu[f % GPU_RING];
+    if (atomic_load(&g->frame) != f || atomic_load(&g->pending)) return -1;
+    return (double)atomic_load(&g->ns) / 1e6;
+}
+
+int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
+    gpu_rec *g = &g_gpu[f % GPU_RING];
+    if (atomic_load(&g->frame) != f || atomic_load(&g->pending)) return 0;
+    uint64_t a = atomic_load(&g->t0), b = atomic_load(&g->t1);
+    if (t0) *t0 = a;
+    if (t1) *t1 = b;
+    return b >= a && b ? 1 : 0;
+}
+
 static void inflight_reap(void) {
     for (int i = 0; i < MAX_INFLIGHT; i++) {
         if (!g_inf[i].pending) continue;
@@ -287,6 +421,7 @@ static void inflight_reap(void) {
         // The slot is reaped (fence signalled): this slot's descriptor pool can be reset whole -- every set in it
         // has been consumed by the GPU and never will be again
         desc_slot_reset(i);
+        gpu_slot_readback(i);   // 这一槽的时间戳也读回来（同一时刻：GPU 已经做完） | read this slot's timestamps too (same moment: the GPU is done)
     }
 }
 
@@ -338,6 +473,7 @@ void mtl_sub_begin(void) {
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     if (vkBeginCommandBuffer(g_inf[i].cb, &bi) != VK_SUCCESS) { LOG("【红】开始命令缓冲失败"); return; }
     g_inf[i].cur = 1; g_inf[i].npost = 0; g_inf[i].stage_off = 0;
+    gpu_slot_reset(i, g_inf[i].cb);   // 这一槽的查询区间复位（时间戳必须在同一命令缓冲里先复位再写） | reset this slot's query range (timestamps must be reset before being written, in the same command buffer)
     // 一次提交 = 一段连续的命令流：目标与清除按提交清零，视口/裁剪/绑定这些跨命令缓冲保留
     // （游戏在一个提交里给多个命令缓冲，状态在它们之间是接着用的）
     // One submission is one continuous command stream: targets and clears are cleared per submission, while
@@ -398,6 +534,7 @@ uint64_t mtl_sub_commit(void) {
     if (r != VK_SUCCESS) { LOG("【红】提交失败 VkResult %d", (int)r); return g_fence; }
     in->pending = 1;
     in->value = ++g_fence;
+    gpu_note_frame(i, atomic_load(&g_cur_frame));   // 这次提交属于哪一帧（完成是滞后的，回查靠帧号） | which frame this submission belongs to (completion is late; the lookup goes by frame number)
     g_sub_total++;
     // 每 300 次提交报一次 op 分布：这就是"接下来该实现哪些 op"的实测依据。
     // 只报次数最多的 5 个：宿主的 LOG 有长度上限，一行塞 12 个 op 会被截断（实测截在 119 字符，
@@ -460,6 +597,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 
 static void pass_end(void) {
     if (!g_rs.open || g_cur_slot < 0) { g_rs.open = 0; return; }
+    gpu_pass_ts(g_cur_slot, g_inf[g_cur_slot].cb, 1);   // 结束时间戳要在收通道之前写（之后写就不在这段里了）| the end timestamp goes in before the pass is closed (afterwards it would be outside the pass)
     if (dm_vkCmdEndRendering) dm_vkCmdEndRendering(g_inf[g_cur_slot].cb);
     // 关通道后把附件转回可采样：下一帧可能拿它当贴图读
     // Turn the attachments back into a sampleable layout after closing: the next frame may sample them
@@ -705,7 +843,8 @@ static void pass_begin(void) {
     ri.renderArea.extent = (VkExtent2D){ w, h };
     if (g_rs.nvp) vkCmdSetViewport(cb, 0, (uint32_t)g_rs.nvp, g_rs.vp);
     if (g_rs.nsc) vkCmdSetScissor(cb, 0, (uint32_t)g_rs.nsc, g_rs.sc);
-    dm_vkCmdBeginRendering(cb, &ri);   // 桩库不导出，走 vkGetDeviceProcAddr 取的指针（见 vk_device.h）| not exported by the stub library, so it goes through the pointer fetched with vkGetDeviceProcAddr (see vk_device.h)
+    dm_vkCmdBeginRendering(cb, &ri);
+    gpu_pass_ts(g_cur_slot, cb, 0);   // 通道真的开成了，写起始时间戳 | the pass really opened, so write the start timestamp   // 桩库不导出，走 vkGetDeviceProcAddr 取的指针（见 vk_device.h）| not exported by the stub library, so it goes through the pointer fetched with vkGetDeviceProcAddr (see vk_device.h)
     g_rs.open = 1;
     atomic_fetch_add(&g_pass_n, 1);
 }
