@@ -489,12 +489,12 @@ The next step is the replay layer itself (`nvn_vk.c`): implementing `mtl_init` /
 
 ### M2 — minimal Vulkan replay layer (the largest item)
 
-- [ ] Vulkan skeleton: device, queue, `ANativeWindow` swapchain
-- [ ] MemoryPool → `VkDeviceMemory` plus host-visible/coherent buffers (validate the "GPU address = CPU address" zero-copy assumption) ★risk
-- [ ] Map Texture / Sampler / TextureView
-- [ ] Program: build `VkShaderModule` / pipelines from SPIR-V
-- [ ] Minimal command set: `SetRenderTargets`, clear, `DrawArrays`, present
-- [ ] **Acceptance**: a picture appears (a solid clear first, then progressively up to the main menu)
+- [x] Device and queue (`ANativeWindow` swapchain waits for M3)
+- [x] MemoryPool → `VkDeviceMemory` plus host-visible/coherent buffers (the "GPU address = CPU address" zero-copy assumption **verified in both directions**) ★risk
+- [x] Map Texture / Sampler / TextureView (format table 154/157, samplers cached by parameters, sub-views built per view; **the render-target path's views are still to be wired up**)
+- [x] Program: build `VkShaderModule` / pipelines from SPIR-V (descriptor writing and real draws work: 1.22 million draws, 83 pipelines, no failures)
+- [x] Minimal command set: `SetRenderTargets`, clear, `DrawArrays`, `DrawIndexed` (`Present` waits for M3)
+- [ ] **Acceptance**: a picture appears (a solid clear first, then progressively up to the main menu) -- there is **no window**, and the only way to "see" it right now is to read one frame back offscreen and write it to disk
 
 ### M3 — front end + touch + audio
 
@@ -541,6 +541,7 @@ Android 12 / API 31 is the recommendation: Vulkan 1.1 and up is mandatory by the
 | **TBDR / render-pass merging** | `nvn_mtl.m`'s pass merging and attachment load/store were validated on macOS; phone GPU architectures differ | Start with the plainest path in M2 (the equivalent of `DM_NVN_TBDR=0`), optimize later |
 | **Size of `nvn_mtl.m`** | About 5,800 lines of Metal, the single largest piece | Port by NVN function group, with equivalence tests in the spirit of `dm/gfx/tests` |
 | **Performance** | The 60 fps on iOS comes from deep tuning; it cannot be assumed to carry over | A dedicated tuning stage in M4 |
+| **Sporadic early crash (1 run in 4, measured)** | `CRASH sig=11` lands in the **host** and the process dies about **0.1 s** after start (`pc` in the host range, every thread still at 0.00 s CPU time); three consecutive runs did not reproduce it | The scene is saved in the log; if the frequency rises, follow the "0.1 s after start" timeline -- at that point only the heap switch and SDK init have run |
 
 ## 6. Working on Windows (encoding and commands)
 
@@ -568,8 +569,17 @@ The port is currently being driven from a Windows machine. These are the traps a
 
 ## 7. Next step
 
-Proceed in the order on this page: finish the rest of M0 (SDK/NDK + device), then Recon A and Recon B, then M1.
-After each milestone, tick it off here and record the conclusion.
+Proceed in the order on this page; after each milestone, tick it off here and record the conclusion. **M2 is current**:
+descriptor writing and real draws work (step 10), textures and samplers resolve by NVN slot (step 11) and views are wired
+up (step 12). What follows is ordered by value:
+
+1. Get `p_set_rt`'s views into the shadow state -- the device reading "0 sub-views created" points exactly here (the
+   views that limit mip levels or layers belong to render targets, and the SET_RT path still passes the base view), and
+   handle "an attachment whose view limits the mip range has a different size" with it;
+2. **Read one frame back offscreen and write it to disk** -- with no window this is the only way to "see" the picture
+   (the judgment is already measured: this window had `ReadTexels` read a GPU-written texture 0 times, so it is still a
+   debugging tool rather than a functional gap);
+3. Docs and cleanup to wrap up.
 
 ---
 
@@ -604,8 +614,10 @@ After each milestone, tick it off here and record the conclusion.
 3. Render-state shadow plus the pass machinery ✓ (`CLEAR` reaches the GPU for the first time);
 4. Shader loading ✓ (step 8 below);
 5. The pipeline layer ✓ (step 9 below: descriptor set layouts, pipeline layouts, compute pipelines, graphics pipelines);
-6. The replay layer's shadow binding storage plus the state interpretation -> really issuing `DRAW` / `DRAW_IDX` (**next**);
-7. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it).
+6. The replay layer's shadow binding storage plus the state interpretation -> really issuing `DRAW` / `DRAW_IDX` ✓ (step 10 here: 1.22 million draws on the device, 83 pipelines, no failures);
+7. Textures and samplers resolved by NVN slot ✓ (step 11 here: decoded exactly from the handle, 520k bound, "sampler id not found" 0);
+8. Views land ✓ (step 12 here: sub-views built per view; **the render-target path is still to be wired up**);
+9. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it) -- **next**.
 
 One **known latent issue** is recorded in the commit message: on Android `crash.c` always passes `is_write = 0`, and the dirty-page fault hook looks at that bit first, so a write to a write-protected page inside a pool walks into the crash path. The crash report already prints the faulting instruction encoding, which is what a correct read/write decision needs.
 
@@ -812,6 +824,14 @@ stored at registration (`treg_e.has_v/v`) and **never read**. Now `vk_tex_view(c
 four sub-views per texture by view content, with `subresourceRange` from `base_level/nlevels/min_layer/nlayers`, format
 from `set_format` and `viewType` from `set_target`; image creation adds `MUTABLE_FORMAT` (the precondition for
 reinterpreting formats) and `2D_ARRAY_COMPATIBLE` (3D only). The two render-target paths still pass the base view
-(`p_set_rt`'s views are not in the shadow state yet), as noted in the code. **The device was disconnected at commit
-time**, so the three view counters (base / hit / created) have to wait for it -- the previous log shows the game does
-register views (`TextureViewSetLevels=2369, SetLayers=2030`).
+(`p_set_rt`'s views are not in the shadow state yet), as noted in the code. **Device readings**: `views: 234,866 base, 0 sub-view hits, 0 sub-views created` -- **not a single sub-view was
+created**, and that number **explains itself**: the textures the game registers for *sampling* all come from
+`TextureViewSetDefaults` (all zero = no limits), while the views that really limit mip levels or layers belong to
+**render targets** (`SetLevels/SetLayers` are called 2369/2030 times), and the SET_RT path deliberately still passes the
+base view (see "the two render-target paths still pass the base view" above). So the zero points exactly at what to wire
+up next: get `p_set_rt`'s `cview/dview` into the shadow state and handle "an attachment whose view limits the mip range
+has a different size" along with it.
+
+**The same device run measured that judgment too**: `ReadTexels read a GPU-written texture 0 times` -- this window never
+reads back a GPU-written texture, so "read back through the VkImage" is still only a **debugging tool** rather than a
+functional gap (the offscreen screenshot rides on it).
