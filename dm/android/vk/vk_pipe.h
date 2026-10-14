@@ -103,6 +103,22 @@ VkPrimitiveTopology vk_topo_of(int nvn_prim);
 #define VK_PIPE_DUMMY_BIND 31
 VkBuffer vk_pipe_dummy_buffer(void);
 
+// 空白图像 / 采样器：描述符写入时给"游戏没绑、或还没解析出来"的贴图绑定用。写空描述符是必须的——
+// 未写的描述符内容是不确定的，驱动可能据此做任何事；而"写什么"这件事上，游戏绑了空槽时 NVN 自己也读 0。
+// Dummy image / sampler: used when writing descriptors for texture bindings the game left unbound or that cannot
+// be resolved yet. Writing something is mandatory -- an unwritten descriptor holds undefined contents and the
+// driver may do anything with them -- and as for what to write, NVN itself reads 0 when the game binds an empty
+// slot.
+VkImageView vk_pipe_dummy_view(void);
+VkSampler vk_pipe_dummy_sampler(void);
+
+// 合并后的绑定表（**布局顺序 = binding 升序**）。描述符写入必须按同一个顺序填动态偏移数组，
+// 所以这张表要能取出来，而不是在两边各算一次。
+// The merged binding table (**layout order = ascending binding**). Descriptor writing must fill its dynamic
+// offset array in that same order, so the table must be obtainable rather than computed separately on both sides.
+typedef struct { uint32_t binding, count; VkDescriptorType type; VkShaderStageFlags stage; int kind; } vk_pipe_bind;
+int vk_pipe_binds(const vk_shader *const *sh, int n, vk_pipe_bind *out, int cap);
+
 // 按 NVN 图元号的累计绘制次数（out 至少 16 项）：用来看那四种没有对应物的图元到底会不会出现
 // Cumulative draw count per NVN primitive number (out needs at least 16 entries): shows whether those four
 // primitives without counterparts ever appear

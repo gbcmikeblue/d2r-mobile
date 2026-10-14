@@ -267,6 +267,7 @@ static rstate_t g_rs = { .st_vmask = { 0xff, 0xff }, .st_wmask = { 0xff, 0xff } 
 static _Atomic uint64_t g_pass_n, g_clear_n, g_draw_skip, g_shadow_n;
 static void pass_begin(void);
 static void pass_end(void);
+static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途槽回收时重置它的池）| defined in the descriptor section (resets a slot's pool when it is reaped)
 
 static void inflight_reap(void) {
     for (int i = 0; i < MAX_INFLIGHT; i++) {
@@ -282,6 +283,10 @@ static void inflight_reap(void) {
         }
         g_inf[i].npost = 0;
         g_inf[i].pending = 0;
+        // 槽已回收（栅栏过了）：这个槽的描述符池可以整池重置——池里所有集都被 GPU 用完且再也不用了
+        // The slot is reaped (fence signalled): this slot's descriptor pool can be reset whole -- every set in it
+        // has been consumed by the GPU and never will be again
+        desc_slot_reset(i);
     }
 }
 
@@ -466,6 +471,187 @@ static void pass_end(void) {
 // 开通道：把影子状态物化成 VkRenderingInfo（清除在 loadOp 上，与 NVN 的语义一致——清除发生在通道开头）
 // Open a pass, materialising the shadow state into a VkRenderingInfo (clears ride on loadOp, matching NVN's
 // semantics where a clear happens at the start of a pass)
+// ========== 描述符写入（M2-6d-3 的 B 步）==========
+// ========== Descriptor writing (step B of M2-6d-3) ==========
+// 三件事决定了这里的形状：
+//   ① **池按在途槽开**：描述符集在 GPU 用完之前不能改写，而回放层本来就有"在途槽 + 栅栏"这套（见 g_inf），
+//      所以每个槽一个池，槽被回收（栅栏已过）时整池重置——不需要任何额外的同步；
+//   ② **缓冲走动态偏移**：客体数据就在零拷贝池里，`mtl_addr` 给出(缓冲, 偏移)，所以描述符里存基址、
+//      偏移走 dynamicOffsets（与苹果侧的 setBuffer:offset: 同一个意思）。动态偏移数组必须按**布局顺序**
+//      （binding 升序）填，所以顺序来自 vk_pipe_binds 的同一张表，不在两边各算一次；
+//   ③ **缓冲地址为 0 或不认识 → 写空白**：写空描述符是必须的（未写的描述符内容不确定），而游戏没绑时
+//      NVN 自己也读 0，所以空白是忠实的回退。
+// Three facts shape this:
+//   1. **A pool per in-flight slot**: a descriptor set cannot be rewritten until the GPU is done with it, and the
+//      replay layer already has in-flight slots with fences (see g_inf), so each slot owns a pool that is reset
+//      whole once the slot is reaped (fence signalled) -- no extra synchronisation needed;
+//   2. **Buffers go through dynamic offsets**: the guest data already sits in zero-copy pools and `mtl_addr`
+//      returns (buffer, offset), so the descriptor holds the base and the offset travels in dynamicOffsets (the
+//      same meaning as setBuffer:offset: on Apple). The dynamic offset array must be filled in **layout order**
+//      (ascending binding), so that order comes from the same vk_pipe_binds table rather than being computed twice;
+//   3. **A zero or unrecognised buffer address writes a blank**: writing something is mandatory (an unwritten
+//      descriptor is undefined), and NVN itself reads 0 when the game bound nothing, so a blank is a faithful
+//      fallback.
+#define DESC_POOL_SETS 512
+#define DESC_POOLS 2                      // 一个槽最多两池：满了再开一池，回收时一起销毁 | at most two pools per slot: a second one when full, both destroyed on reap
+static VkDescriptorPool g_dpool[MAX_INFLIGHT][DESC_POOLS];
+static uint8_t g_dpool_n[MAX_INFLIGHT];
+static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_draws, g_desc_skip;
+
+static void desc_slot_reset(int slot) {
+    for (int k = 0; k < DESC_POOLS; k++)
+        if (g_dpool[slot][k]) { vkDestroyDescriptorPool(vk_dev(), g_dpool[slot][k], NULL); g_dpool[slot][k] = VK_NULL_HANDLE; }
+    g_dpool_n[slot] = 0;
+}
+
+static VkDescriptorPool desc_pool_at(int slot, int idx) {
+    if (g_dpool[slot][idx]) return g_dpool[slot][idx];
+    if (idx >= DESC_POOLS) return VK_NULL_HANDLE;
+    VkDescriptorPoolSize ps[4] = {
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, DESC_POOL_SETS },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, DESC_POOL_SETS },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DESC_POOL_SETS },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128 },
+    };
+    VkDescriptorPoolCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = DESC_POOL_SETS, .poolSizeCount = 4, .pPoolSizes = ps };
+    VkDescriptorPool p = VK_NULL_HANDLE;
+    if (vkCreateDescriptorPool(vk_dev(), &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (g_dpool_n[slot] < idx + 1) g_dpool_n[slot] = (uint8_t)(idx + 1);
+    return (g_dpool[slot][idx] = p);
+}
+
+static VkDescriptorSet desc_alloc(int slot, VkDescriptorSetLayout lay) {
+    for (int idx = 0; idx < DESC_POOLS; idx++) {
+        VkDescriptorPool p = desc_pool_at(slot, idx);
+        if (!p) break;
+        VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = p, .descriptorSetCount = 1, .pSetLayouts = &lay };
+        VkDescriptorSet s = VK_NULL_HANDLE;
+        if (vkAllocateDescriptorSets(vk_dev(), &ai, &s) == VK_SUCCESS) return s;
+    }
+    return VK_NULL_HANDLE;
+}
+
+// 按 binding 找 uniform 缓冲的客体 c 槽（来自 res.json 的 cbufs）
+// Find the guest c slot of a uniform buffer by binding (from res.json's cbufs)
+static int desc_cbuf_slot(const vk_shader *sh, uint32_t binding) {
+    for (uint32_t i = 0; i < sh->ncbuf; i++) if (sh->cbuf[i].binding == binding) return (int)sh->cbuf[i].slot;
+    return -1;
+}
+static const vk_sbuf_ref *desc_sbuf_ref(const vk_shader *sh, uint32_t binding) {
+    for (uint32_t i = 0; i < sh->nsbuf; i++) if (sh->sbuf[i].binding == binding) return &sh->sbuf[i];
+    return NULL;
+}
+// 声明了这条 binding 的着色器（合并表里的每条都要落到某个阶段上）
+// The shader that declares this binding (every entry of the merged table must land on some stage)
+static const vk_shader *desc_stage_of(const vk_shader *const *sh, int n, uint32_t binding) {
+    for (int i = 0; i < n; i++) {
+        if (!sh[i]) continue;
+        for (uint32_t k = 0; k < sh[i]->nspv; k++) if (sh[i]->spv[k].binding == binding) return sh[i];
+    }
+    return NULL;
+}
+
+// 缓冲类绑定的地址与长度：UBO 直接来自 c 槽，SSBO 先看有没有直接绑（游戏用 BindStorageBuffer），
+// 否则按 res.json 的讲法从 c[cb_slot] 的 cb_offset 处读那个地址。
+// Address and length of a buffer binding: a UBO comes straight from its c slot, an SSBO first tries a direct
+// binding (the game uses BindStorageBuffer) and otherwise reads the address at c[cb_slot] + cb_offset, as res.json says.
+static int desc_buf_range(const vk_shader *sh, const vk_pipe_bind *b, uint64_t *addr, uint64_t *size) {
+    int stg = sh->stage >= 0 && sh->stage < 6 ? sh->stage : 0;
+    if (b->kind == VK_SPV_UBO) {
+        int slot = desc_cbuf_slot(sh, b->binding);
+        if (slot < 0 || slot >= 16) return 0;
+        *addr = g_rs.ubo[stg][slot].addr;
+        *size = g_rs.ubo[stg][slot].size;
+        return *addr != 0;
+    }
+    const vk_sbuf_ref *r = desc_sbuf_ref(sh, b->binding);
+    if (r) {
+        int slot = r->slot;
+        if (slot >= 0 && slot < 128 && g_rs.ssbo[stg][slot].addr) {
+            *addr = g_rs.ssbo[stg][slot].addr;
+            *size = g_rs.ssbo[stg][slot].size;
+            return 1;
+        }
+        // 地址在常量段里：c[cb_slot] 那段的开头 + cb_offset 处放着一个 64 位地址
+        // The address sits in the constant bank: a 64-bit address at the start of c[cb_slot] plus cb_offset
+        int cs = r->cb_slot;
+        if (cs >= 0 && cs < 16 && g_rs.ubo[stg][cs].addr && r->cb_offset + 8 <= g_rs.ubo[stg][cs].size) {
+            uint64_t a = 0;
+            memcpy(&a, (const void *)(uintptr_t)(g_rs.ubo[stg][cs].addr + (uint64_t)r->cb_offset), 8);
+            if (a) { *addr = a; *size = g_rs.ubo[stg][cs].size - (uint64_t)r->cb_offset; return 1; }
+        }
+    }
+    return 0;
+}
+
+// 写一个阶段的全部绑定。返回值是填入的动态偏移个数（-1 = 没法写，调用方跳过这次绘制）。
+// 动态偏移与 vk_pipe_binds 的表同序——这是 vkCmdBindDescriptorSets 的要求。
+// Write every binding for one set. The return value is how many dynamic offsets were filled in (-1 means it cannot
+// be written and the caller skips the draw). The dynamic offsets are in the same order as the vk_pipe_binds table,
+// which is what vkCmdBindDescriptorSets requires.
+static int desc_write(VkDescriptorSet set, const vk_shader *const *sh, int n,
+                      const vk_pipe_bind *b, int nb, uint32_t *dyn) {
+    // 一屏最多 64 条绑定，用静态数组（mtl_exec 递归，不能用大栈帧 | see the note on gfx_state_fill）
+    static VkDescriptorBufferInfo bi[VK_SPV_MAXB];
+    static VkDescriptorImageInfo ii[VK_SPV_MAXB];
+    static VkWriteDescriptorSet wr[VK_SPV_MAXB];
+    int nw = 0, nd = 0;
+    for (int i = 0; i < nb; i++) {
+        const vk_shader *st = desc_stage_of(sh, n, b[i].binding);
+        if (!st) continue;
+        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set, .dstBinding = b[i].binding, .descriptorCount = b[i].count ? b[i].count : 1 };
+        if (b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
+            uint64_t a = 0, sz = 0;
+            void *buf = NULL; uint64_t off = 0;
+            if (!desc_buf_range(st, &b[i], &a, &sz) || !mtl_addr(a, sz, &buf, &off)) {
+                // 空白回退：游戏没绑这一段（NVN 自己读 0），或地址不在任何池里
+                // Blank fallback: the game bound no such range (NVN reads 0 itself) or the address is in no pool
+                if (atomic_fetch_add(&g_desc_blank, 1) < 5)
+                    LOG("【黄】binding %u（%s）拿不到缓冲地址（地址 %llx、槽解析 %d）：写空白",
+                        b[i].binding, vk_spv_kind_name(b[i].kind), (unsigned long long)a, desc_cbuf_slot(st, b[i].binding));
+                VkBuffer dum = vk_pipe_dummy_buffer();
+                if (!dum) return -1;
+                bi[nw] = (VkDescriptorBufferInfo){ dum, 0, VK_WHOLE_SIZE };
+            } else {
+                // 动态偏移之和必须落在 minUniform/StorageBufferOffsetAlignment 的整数倍上，而规范保证这个
+                // 界限不超过 256，所以按 256 对齐一定成立；客体自己的缓冲地址本该对齐，没对齐就记一次。
+                // The sum of offset and dynamic offset must be a multiple of the alignment limit, which the spec
+                // guarantees to be at most 256, so aligning to 256 always works; the guest's own buffer addresses
+                // should be aligned and a misaligned one is reported once.
+                uint64_t al = off & 255u;
+                if (al) { static int said; if (!said++) LOG("【黄】缓冲地址没按 256 对齐（偏移 %llu）：按对齐下取整 + 动态偏移补", (unsigned long long)off); }
+                bi[nw] = (VkDescriptorBufferInfo){ (VkBuffer)buf, off - al, VK_WHOLE_SIZE };
+                dyn[nd++] = (uint32_t)al;
+            }
+            w.descriptorType = b[i].type;
+            w.pBufferInfo = &bi[nw];
+            nw++;
+        } else if (b[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+            // 贴图 / 图像：句柄的解析（贴图池 → 句柄号 → 序号）是 B 的下一小块，这一步先写空白并计数，
+            // 好让"第一次真绘制"不必等它——真机在用的那对着色器是纯 UBO。
+            // Textures / images: resolving the handle (texture pool -> handle number -> serial) is the next small
+            // piece of B, so this step writes a blank and counts it, which lets the first real draw happen without
+            // waiting for it -- the pair the device actually uses is UBO-only.
+            if (atomic_fetch_add(&g_desc_blank, 1) < 5)
+                LOG("【黄】binding %u（%s）的贴图句柄还没解析（贴图池那条路是下一步）：写空白",
+                    b[i].binding, vk_spv_kind_name(b[i].kind));
+            ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), vk_pipe_dummy_view(),
+                                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            w.descriptorType = b[i].type;
+            w.pImageInfo = &ii[nw];
+            nw++;
+        } else {
+            continue;   // VK_SPV_OTHER 之类：布局里没这条就走不到这里 | kinds such as VK_SPV_OTHER never reach here for a binding that is in the layout
+        }
+        wr[nw - 1] = w;   // nw 已经加过，所以回填的是刚写的那条 | nw was already incremented, so this fills in the entry just written
+    }
+    if (nw) vkUpdateDescriptorSets(vk_dev(), (uint32_t)nw, wr, 0, NULL);
+    return nd;
+}
+
 static void pass_begin(void) {
     if (g_rs.open || g_cur_slot < 0) return;
     if (!vk_have_dyn_render()) return;
@@ -870,29 +1056,94 @@ void mtl_exec(const uint8_t *p) {
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: {
             const p_draw *d = (const p_draw *)a;   // 两种绘制的载荷都以 prim/first 开头，按 p_draw 读拓扑是安全的 | both draw payloads start with prim/first, so reading the topology through p_draw is safe
             uint64_t k = atomic_fetch_add(&g_draw_skip, 1);
+            // 静态而不是栈上：mtl_exec 是递归的（OP_CALL），而它的栈是**客体的栈**——宿主在客体栈上展开
+            // 每多一个字节都可能把客体线程推过栈底。下面这些都放静态，且"填完立刻用、中间不再进 mtl_exec"。
+            // Static rather than on the stack: mtl_exec recurses (OP_CALL) and its stack is **the guest's stack** --
+            // every extra byte of host frame can push a guest thread past the bottom of its stack. Everything below
+            // is static, and each one is filled and used immediately with no re-entry into mtl_exec in between.
+            static vk_gfx_state stv;
+            static vk_pipe_bind binds[VK_SPV_MAXB];
+            static uint32_t dyn[VK_SPV_MAXB];
+            const vk_shader *shs[2] = { NULL, NULL }; int nsh = 0;
+            if (g_rs.prog) for (uint32_t i = 0; i < g_rs.prog->nstage && i < 6; i++) {
+                const vk_shader *sh = vk_shader_get(g_rs.prog->sd[i].control);
+                if (!sh) continue;
+                if (sh->stage == VK_STAGE_VS || sh->stage == VK_STAGE_CS) {
+                    if (!shs[0]) { shs[0] = sh; if (!nsh) nsh = 1; }
+                } else if (sh->stage == VK_STAGE_PS) { shs[1] = sh; nsh = 2; }
+            }
+            if (h.op == OP_DISPATCH) {   // 计算派发：图形先通，这一步只计数（计算管线+描述符是同一个套路，随后接）
+                if (k < 8) LOG("DISPATCH 第 %llu 次：着色器 %s（计算派发这一步先只计数）",
+                               (unsigned long long)(k + 1), shs[0] ? shs[0]->key : "无");
+                atomic_fetch_add(&g_shadow_n, 1);
+                break;
+            }
+            gfx_state_fill(&stv, d->prim);
+            VkPipeline pl = shs[0] ? vk_pipe_graphics(shs[0], shs[1], &stv) : VK_NULL_HANDLE;
+            int wrote = 0;
+            if (pl && g_rs.open && g_cur_slot >= 0) {
+                VkCommandBuffer cb = g_inf[g_cur_slot].cb;
+                VkDescriptorSetLayout dsl = vk_pipe_set_layout((const vk_shader *const *)shs, nsh);
+                VkPipelineLayout lay = vk_pipe_layout((const vk_shader *const *)shs, nsh);
+                VkDescriptorSet set = dsl ? desc_alloc(g_cur_slot, dsl) : VK_NULL_HANDLE;
+                int nb = set ? vk_pipe_binds((const vk_shader *const *)shs, nsh, binds, VK_SPV_MAXB) : -1;
+                int nd = nb >= 0 ? desc_write(set, (const vk_shader *const *)shs, nsh, binds, nb, dyn) : -1;
+                if (nd >= 0) {
+                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 1, &set, (uint32_t)nd, dyn);
+                    // 顶点流：只绑管线真的用到的那些；其余属性走常量回退，落在 VK_PIPE_DUMMY_BIND 上
+                    // Vertex streams: bind only the ones the pipeline really uses; the remaining attributes come
+                    // from the constant fallback that lives on VK_PIPE_DUMMY_BIND
+                    uint8_t used[16] = { 0 };
+                    for (int i2 = 0; i2 < 16; i2++) if (stv.attr[i2].valid) used[stv.attr[i2].stream & 15] = 1;
+                    for (int s2 = 0; s2 < 16; s2++) if (used[s2]) {
+                        void *bb = NULL; uint64_t bo = 0;
+                        if (mtl_addr(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size, &bb, &bo)) {
+                            VkBuffer vb = (VkBuffer)bb; VkDeviceSize vo = (VkDeviceSize)bo;
+                            vkCmdBindVertexBuffers(cb, (uint32_t)s2, 1, &vb, &vo);
+                        }
+                    }
+                    VkBuffer dum = vk_pipe_dummy_buffer();
+                    if (dum) { VkDeviceSize z = 0; vkCmdBindVertexBuffers(cb, VK_PIPE_DUMMY_BIND, 1, &dum, &z); }
+                    if (h.op == OP_DRAW_IDX) {
+                        const p_draw_idx *di = (const p_draw_idx *)a;
+                        void *ib = NULL; uint64_t io = 0;
+                        // NVN 的索引类型是 0 = 8 位、1 = 16 位、2 = 32 位（nvn.h 的 NVNindexType）。先前我按
+                        // "2/4 字节"猜过一次——真机上是 1，恰好读对了 16 位，但 32 位会被读成 16 位。8 位索引在
+                        // Vulkan 核心不支持（要 KHR 扩展），苹果侧同样是报出来不画。
+                        // NVN's index type is 0 = 8-bit, 1 = 16-bit, 2 = 32-bit (NVNindexType in nvn.h). I once
+                        // guessed it as "2/4 bytes" -- the device says 1, which happened to read correctly as 16-bit,
+                        // but 32-bit would have been read as 16-bit. 8-bit indices are not in core Vulkan (they need
+                        // a KHR extension) and the Apple side likewise reports them instead of drawing.
+                        int it_ok = 1;
+                        VkIndexType it = VK_INDEX_TYPE_UINT16;
+                        if (di->itype == 2) it = VK_INDEX_TYPE_UINT32;
+                        else if (di->itype != 1) {
+                            static int said;
+                            if (!said++) LOG("【红】索引类型 %d（NVN 的 0=8 位 / 1=16 位 / 2=32 位）这里只支持 16/32 位：这次绘制跳过", di->itype);
+                            it_ok = 0;
+                        }
+                        if (it_ok && mtl_addr(di->ibuf, 4, &ib, &io)) {
+                            vkCmdBindIndexBuffer(cb, (VkBuffer)ib, (VkDeviceSize)io, it);
+                            vkCmdDrawIndexed(cb, (uint32_t)di->count, di->instances ? (uint32_t)di->instances : 1,
+                                             0, di->base_vertex, di->base_instance > 0 ? (uint32_t)di->base_instance : 0);
+                            wrote = 1;
+                        } else atomic_fetch_add(&g_desc_skip, 1);
+                    } else {
+                        vkCmdDraw(cb, (uint32_t)d->count, 1, (uint32_t)d->first, 0);
+                        wrote = 1;
+                    }
+                } else atomic_fetch_add(&g_desc_skip, 1);
+            } else if (pl) atomic_fetch_add(&g_desc_skip, 1);
+            if (wrote) atomic_fetch_add(&g_desc_draws, 1);
             if (k < 8 || (k & 2047) == 2047) {
-                // 静态而不是栈上：mtl_exec 是递归的（OP_CALL），而它的栈是**客体的栈**——宿主在客体栈上展开
-                // 每多一个字节都可能把客体线程推过栈底。这个结构体 ~600 字节，放静态没有代价（用完即弃、
-                // 中间不重入：fill 与建管线之间没有别的 mtl_exec）。
-                // Static rather than on the stack: mtl_exec recurses (OP_CALL) and its stack is **the guest's stack** --
-                // every extra byte of host frame can push a guest thread past the bottom of its stack. This struct is
-                // about 600 bytes and costs nothing as a static (used and dropped immediately, with no re-entry between
-                // the fill and the pipeline build).
-                static vk_gfx_state stv;
-                gfx_state_fill(&stv, d->prim);
-                const vk_shader *vs = NULL, *ps = NULL;
-                if (g_rs.prog) for (uint32_t i = 0; i < g_rs.prog->nstage && i < 6; i++) {
-                    const vk_shader *sh = vk_shader_get(g_rs.prog->sd[i].control);
-                    if (!sh) continue;
-                    if (sh->stage == VK_STAGE_VS) vs = sh; else if (sh->stage == VK_STAGE_PS) ps = sh;
-                }
-                VkPipeline pl = vs ? vk_pipe_graphics(vs, ps, &stv) : VK_NULL_HANDLE;
                 uint64_t nlay = 0, nlay2 = 0, ncpso = 0, gpso = 0, nfail = 0;
                 vk_pipe_stats(&nlay, &nlay2, &ncpso, &gpso, &nfail);
-                LOG("%s 第 %llu 次：顶点 %s 片元 %s → 管线 %s；目标 %u 个、拓扑 %d、属性 %u 条；图形管线累计 %llu 条（失败 %llu）",
-                    g_opname[h.op], (unsigned long long)(k + 1), vs ? vs->key : "无", ps ? ps->key : "无",
-                    pl ? "建得成" : "建不出", stv.color_count, (int)stv.topo, vs ? vs->nin : 0,
-                    (unsigned long long)gpso, (unsigned long long)nfail);
+                LOG("%s 第 %llu 次：顶点 %s 片元 %s → 管线 %s；目标 %u 个、拓扑 %d、属性 %u 条；%s；图形管线累计 %llu 条（失败 %llu）；真下发 %llu 次",
+                    g_opname[h.op], (unsigned long long)(k + 1), shs[0] ? shs[0]->key : "无", shs[1] ? shs[1]->key : "无",
+                    pl ? "建得成" : "建不出", stv.color_count, (int)stv.topo, shs[0] ? shs[0]->nin : 0,
+                    wrote ? "已下发" : "未下发",
+                    (unsigned long long)gpso, (unsigned long long)nfail, (unsigned long long)atomic_load(&g_desc_draws));
             }
             break; }
 

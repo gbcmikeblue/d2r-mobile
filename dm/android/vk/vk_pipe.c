@@ -35,7 +35,7 @@
 // count：这条绑定的元素个数，直接来自 SPIR-V（见 vk_spv.h）——不写死 1，那会是个静默假设
 // count: how many elements this binding has, straight from the SPIR-V (see vk_spv.h) -- not hardcoded to 1, which
 // would be a silent assumption
-typedef struct { uint32_t binding, count; VkDescriptorType type; VkShaderStageFlags stage; int kind; } bind_t;
+typedef vk_pipe_bind bind_t;   // 与对外的那张表同一个结构（描述符写入要按同一顺序填动态偏移）| the same struct as the exported table (descriptor writing fills dynamic offsets in the same order)
 
 static uint64_t g_n_dsl, g_n_lay, g_n_cpso, g_n_gpso, g_n_fail;
 
@@ -124,6 +124,15 @@ static int merge_binds(const vk_shader *const *sh, int n, bind_t *out, int cap) 
     }
     qsort(out, (size_t)nb, sizeof *out, cmp_bind);
     return nb;
+}
+
+// 对外暴露同一张合并表：描述符写入要按**同一个顺序**填动态偏移数组（vkCmdBindDescriptorSets 按绑定号升序
+// 消费它们），所以两边不能各算一次——算两次迟早会漂。
+// Expose the same merged table: descriptor writing must fill its dynamic offset array in **the same order**
+// (vkCmdBindDescriptorSets consumes them in ascending binding order), so the two sides must not compute it
+// separately -- two computations will drift apart sooner or later.
+int vk_pipe_binds(const vk_shader *const *sh, int n, vk_pipe_bind *out, int cap) {
+    return merge_binds(sh, n, out, cap);
 }
 
 // 布局的键：把合并后的表写成稳定的字符串（按 binding 升序，所以同一条表必然同一个键）
@@ -635,6 +644,56 @@ VkBuffer vk_pipe_dummy_buffer(void) {
     else LOG("【红】哑顶点缓冲映射失败（内容可能非零，回退属性会读到垃圾）");
     g_dummy_vbuf = b;
     return b;
+}
+
+// 空白图像 / 采样器：描述符写入的回退（游戏绑了空槽，或句柄还没解析出来）。
+// Dummy image / sampler: the descriptor-writing fallback (the game bound an empty slot, or the handle cannot be
+// resolved yet).
+static VkImageView g_dummy_view;
+static VkSampler g_dummy_samp;
+
+VkImageView vk_pipe_dummy_view(void) {
+    if (g_dummy_view) return g_dummy_view;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { 1, 1, 1 },
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    VkImage im = VK_NULL_HANDLE;
+    if (vkCreateImage(vk_dev(), &ici, NULL, &im) != VK_SUCCESS) { LOG("【红】建空白图像失败"); return VK_NULL_HANDLE; }
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(vk_dev(), im, &mr);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, mr.memoryTypeBits) };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(vk_dev(), &mai, NULL, &mem) != VK_SUCCESS || vkBindImageMemory(vk_dev(), im, mem, 0) != VK_SUCCESS) {
+        LOG("【红】空白图像的内存分配 / 绑定失败");
+        vkDestroyImage(vk_dev(), im, NULL);
+        return VK_NULL_HANDLE;
+    }
+    VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkImageView v = VK_NULL_HANDLE;
+    if (vkCreateImageView(vk_dev(), &vci, NULL, &v) != VK_SUCCESS) { LOG("【红】建空白图像视图失败"); return VK_NULL_HANDLE; }
+    g_dummy_view = v;
+    return v;
+}
+
+VkSampler vk_pipe_dummy_sampler(void) {
+    if (g_dummy_samp) return g_dummy_samp;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0.0f };
+    VkSampler s = VK_NULL_HANDLE;
+    if (vkCreateSampler(vk_dev(), &sci, NULL, &s) != VK_SUCCESS) { LOG("【红】建空白采样器失败"); return VK_NULL_HANDLE; }
+    g_dummy_samp = s;
+    return s;
 }
 
 void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uint64_t *gpso, uint64_t *fail) {
