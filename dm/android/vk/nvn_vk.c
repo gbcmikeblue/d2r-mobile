@@ -609,6 +609,59 @@ static void pass_end(void) {
 // 开通道：把影子状态物化成 VkRenderingInfo（清除在 loadOp 上，与 NVN 的语义一致——清除发生在通道开头）
 // Open a pass, materialising the shadow state into a VkRenderingInfo (clears ride on loadOp, matching NVN's
 // semantics where a clear happens at the start of a pass)
+// ========== 贴图注册表：贴图号 → (tex_t, view) ==========
+// ========== Texture registry: texture id -> (tex_t, view) ==========
+// 为什么要有这一层：SPIR-V 里的贴图 binding 与 NVN 的贴图槽**不是一回事**——客体常常是把一个**句柄**（低 20 位是
+// 贴图号，高位是采样器号）放进自己的常量里，着色器拿这个句柄去取贴图。所以"binding → 哪张贴图"这条路上必须先有
+// 一张"贴图号 → 贴图对象"的表。宿主在游戏注册贴图时调 mtl_reg_tex（hle_nvn.c 的
+// nvnTexturePoolRegisterTexture），这里把它记下来——与苹果侧 g_treg 同一个做法（按值存副本：游戏会按值拷贝
+// NVNtexture，存指针会失效）。
+// Why this layer exists: a texture binding in the SPIR-V is **not** an NVN texture slot -- the guest often puts a
+// **handle** (low 20 bits = texture id, the high bits = sampler id) into its own constants and the shader fetches the
+// texture through that handle. So the path "binding -> which texture" needs a "texture id -> texture object" table
+// first. The host calls mtl_reg_tex when the game registers a texture (nvnTexturePoolRegisterTexture in hle_nvn.c) and
+// this records it -- the same shape as Apple's g_treg (a copy by value: the game copies NVNtexture by value and
+// storing a pointer would go stale).
+#define TREG_TAB (1 << 14)
+typedef struct { int used, tid, has_v; tex_t t; view_t v; } treg_e;
+static treg_e g_treg[TREG_TAB];
+static _Atomic uint64_t g_treg_n;
+
+void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
+    if (id <= 0 || !t) return;
+    unsigned h = ((unsigned)id * 2654435761u) & (TREG_TAB - 1);
+    for (unsigned k = 0; k < TREG_TAB; k++) {
+        treg_e *e = &g_treg[(h + k) & (TREG_TAB - 1)];
+        if (!e->used) {
+            e->used = 1; e->tid = id; e->t = *t;
+            if (v) { e->v = *v; e->has_v = 1; }
+            atomic_fetch_add(&g_treg_n, 1);
+            return;
+        }
+        if (e->tid == id) {   // 同一个号重新注册：按值刷新（游戏会重建对象）| re-registration of one id: refresh by value (the game rebuilds objects)
+            e->t = *t;
+            if (v) { e->v = *v; e->has_v = 1; }
+            return;
+        }
+    }
+    static int said;
+    if (!said++) LOG("【红】贴图注册表满了（%d 项）：后面的贴图句柄解析不出来", TREG_TAB);
+}
+
+// 句柄 → 注册项；低 20 位是贴图号（与苹果侧 h_ser 同一套取法）
+// handle -> registry entry; the low 20 bits are the texture id (the same extraction as Apple's h_ser)
+static const treg_e *treg_of(uint32_t handle) {
+    int tid = (int)(handle & 0xfffffu);
+    if (!tid) return NULL;
+    unsigned h = ((unsigned)tid * 2654435761u) & (TREG_TAB - 1);
+    for (unsigned k = 0; k < TREG_TAB; k++) {
+        const treg_e *e = &g_treg[(h + k) & (TREG_TAB - 1)];
+        if (!e->used) return NULL;
+        if (e->tid == tid) return e;
+    }
+    return NULL;
+}
+
 // ========== 描述符写入（M2-6d-3 的 B 步）==========
 // ========== Descriptor writing (step B of M2-6d-3) ==========
 // 三件事决定了这里的形状：
@@ -634,7 +687,7 @@ static void pass_end(void) {
 #define DESC_POOLS 2                      // 一个槽最多两池：满了再开一池，回收时一起销毁 | at most two pools per slot: a second one when full, both destroyed on reap
 static VkDescriptorPool g_dpool[MAX_INFLIGHT][DESC_POOLS];
 static uint8_t g_dpool_n[MAX_INFLIGHT];
-static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_draws, g_desc_skip;
+static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_draws, g_desc_skip, g_desc_tex_ok;
 
 static void desc_slot_reset(int slot) {
     for (int k = 0; k < DESC_POOLS; k++)
@@ -679,6 +732,10 @@ static int desc_cbuf_slot(const vk_shader *sh, uint32_t binding) {
 }
 static const vk_sbuf_ref *desc_sbuf_ref(const vk_shader *sh, uint32_t binding) {
     for (uint32_t i = 0; i < sh->nsbuf; i++) if (sh->sbuf[i].binding == binding) return &sh->sbuf[i];
+    return NULL;
+}
+static const vk_tex_ref *desc_tex_ref(const vk_shader *sh, uint32_t binding) {
+    for (uint32_t i = 0; i < sh->ntex; i++) if (sh->tex[i].binding == binding) return &sh->tex[i];
     return NULL;
 }
 // 声明了这条 binding 的着色器（合并表里的每条都要落到某个阶段上）
@@ -768,16 +825,47 @@ static int desc_write(VkDescriptorSet set, const vk_shader *const *sh, int n,
             w.pBufferInfo = &bi[nw];
             nw++;
         } else if (b[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
-            // 贴图 / 图像：句柄的解析（贴图池 → 句柄号 → 序号）是 B 的下一小块，这一步先写空白并计数，
-            // 好让"第一次真绘制"不必等它——真机在用的那对着色器是纯 UBO。
-            // Textures / images: resolving the handle (texture pool -> handle number -> serial) is the next small
-            // piece of B, so this step writes a blank and counts it, which lets the first real draw happen without
-            // waiting for it -- the pair the device actually uses is UBO-only.
-            if (atomic_fetch_add(&g_desc_blank, 1) < 5)
-                LOG("【黄】binding %u（%s）的贴图句柄还没解析（贴图池那条路是下一步）：写空白",
-                    b[i].binding, vk_spv_kind_name(b[i].kind));
-            ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), vk_pipe_dummy_view(),
-                                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            // 贴图 / 图像：句柄的来处分两种情况（res.json 的 cbuf_slot 与 handle）——
+            //   cbuf_slot < 0：句柄是着色器常量里 baked 的那个数，本身就是**贴图号** → 查注册表拿贴图；
+            //   cbuf_slot >= 0：句柄在客体的常量里（要从 c[..] 读），**编码还没定下来**（本地全库抽样 1205 条
+            //                   全是 0x30002，而 handle 是 0x101D815A 这类客体地址）→ 先写空白，并把现场
+            //                   （这一条 + 该阶段绑着的贴图句柄 + 常量段地址）打进日志，用真机的数把它定下来。
+            // Textures / images: where the handle comes from has two cases (cbuf_slot and handle in res.json) --
+            //   cbuf_slot < 0: the handle is the number baked into the shader's constants and is itself the
+            //   **texture id**, so the registry yields the texture;
+            //   cbuf_slot >= 0: the handle lives in the guest's constants (it has to be read from c[..]) and the
+            //   **encoding is not settled yet** (a library-wide sample of 1205 entries is all 0x30002 while the
+            //   handle is a guest address like 0x101D815A) -- a blank is written and the situation (this entry plus
+            //   the texture handles bound for that stage and the constant-bank addresses) goes into the log so the
+            //   device's numbers can settle it.
+            const vk_tex_ref *tr = desc_tex_ref(st, b[i].binding);
+            VkImageView texv = VK_NULL_HANDLE;
+            if (tr && tr->cbuf_slot < 0) {
+                const treg_e *e = treg_of((uint32_t)tr->handle);
+                if (e) texv = vk_tex_view(&e->t);
+            }
+            if (!texv) {
+                if (atomic_fetch_add(&g_desc_blank, 1) < 8) {
+                    int stg = st->stage >= 0 && st->stage < 6 ? st->stage : 0;
+                    LOG("【黄】binding %u（%s）贴图写空白：res.json 说 cbuf_slot=%d handle=0x%x；该阶段贴图句柄 %llx/%llx/%llx、常量段 %llx/%llx/%llx/%llx",
+                        b[i].binding, vk_spv_kind_name(b[i].kind), tr ? tr->cbuf_slot : -999, tr ? (unsigned)tr->handle : 0u,
+                        (unsigned long long)g_rs.tex[stg][0], (unsigned long long)g_rs.tex[stg][1], (unsigned long long)g_rs.tex[stg][2],
+                        (unsigned long long)g_rs.ubo[stg][0].addr, (unsigned long long)g_rs.ubo[stg][1].addr,
+                        (unsigned long long)g_rs.ubo[stg][2].addr, (unsigned long long)g_rs.ubo[stg][3].addr);
+                }
+                ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), vk_pipe_dummy_view(),
+                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            } else {
+                // 采样器暂时用空白：句柄高位（>> 20）是采样器号，而"按采样器号取对象"的那张表还没有
+                // （绑定形态的采样器在 res.json 的 samplers 里，那是下一步）。采样器不对会让过滤方式不对，
+                // 但贴图本身能出来——这一步的目标是让贴图先出现。
+                // The sampler is a blank for now: the handle's high bits (>> 20) are the sampler id and the table
+                // that turns a sampler id into an object does not exist yet (bound-form samplers live in res.json's
+                // samplers, the next step). A wrong sampler means wrong filtering, but the texture itself shows up,
+                // and showing textures is what this step is for.
+                ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), texv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                atomic_fetch_add(&g_desc_tex_ok, 1);
+            }
             w.descriptorType = b[i].type;
             w.pImageInfo = &ii[nw];
             nw++;
