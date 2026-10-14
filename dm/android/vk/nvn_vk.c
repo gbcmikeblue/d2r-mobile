@@ -1162,6 +1162,7 @@ static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_skip;
 // constants for at all", because a blank's situation shows only "this slot has no address" and not whether it was
 // bound under another stage or never bound.
 static _Atomic uint64_t g_ubo_binds[6], g_ubo_zero[6], g_ubo_out;
+static _Atomic uint64_t g_ssbo_binds[6];   // 同上，按阶段给 BIND_SSBO 计数（存储缓冲写空白的现场要看这个）| same for BIND_SSBO (needed by the storage-buffer blank's situation)
 
 static void desc_slot_reset(int slot) {
     for (int k = 0; k < DESC_POOLS; k++)
@@ -1301,7 +1302,19 @@ static int desc_buf_range(const vk_shader *sh, const vk_pipe_bind *b, uint64_t *
     }
     const vk_sbuf_ref *r = desc_sbuf_ref(sh, b->binding);
     if (r) {
+        // 存储缓冲的 NVN 槽号**不能直接用 res.json 的 slot**（那是 Ryujinx 自己的编号，与游戏绑的号不是一套）。
+        // 与苹果侧同源的做法是从 cb_offset 反推：存储缓冲地址表在各阶段的固定基址（顶点 0x110、像素 0x510、
+        // 计算 0x310，每槽 0x10 字节），所以 NVN 槽 = (cb_offset × 4 − 基址) ÷ 16。
+        // 真机取证：cb_offset 340/344 → 0x550/0x560 → 槽 4/5，而游戏绑的正是 4..7（位图 0xf0）。
+        // A storage buffer's NVN slot **cannot use res.json's slot directly** (that is Ryujinx's own numbering, a
+        // different space from the index the game binds). The Apple side derives it from cb_offset instead: the storage
+        // buffer address table sits at a fixed base per stage (vertex 0x110, pixel 0x510, compute 0x310, 0x10 bytes per
+        // slot), so NVN slot = (cb_offset x 4 - base) / 16. Device forensics: cb_offset 340/344 -> 0x550/0x560 -> slots
+        // 4/5, while the game binds exactly 4..7 (bitmap 0xf0).
+        static const uint32_t sb_base[6] = { 0x110, 0x510, 0, 0, 0, 0x310 };   // 0=顶点 1=像素 5=计算（其余阶段未实测）| 0 = vertex, 1 = pixel, 5 = compute (the other stages are unmeasured)
         int slot = r->slot;
+        uint32_t off = (uint32_t)r->cb_offset * 4, b0 = stg < 6 ? sb_base[stg] : 0;
+        if (b0 && r->cb_slot == 0 && off >= b0 && off < b0 + 0x100 && (off - b0) % 16 == 0) slot = (int)((off - b0) / 16);
         if (slot >= 0 && slot < 128 && g_rs.ssbo[stg][slot].addr) {
             *addr = g_rs.ssbo[stg][slot].addr;
             *size = g_rs.ssbo[stg][slot].size;
@@ -1437,6 +1450,22 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                     int sd = desc_cbuf_slot(st, b[i].binding);
                     uint64_t pa[6] = { 0, 0, 0, 0, 0, 0 };
                     if (sd >= 0 && sd < 16) for (int g2 = 0; g2 < 6; g2++) pa[g2] = g_rs.ubo[g2][sd].addr;
+                    if (b[i].kind == VK_SPV_SSBO) {
+                        // 存储缓冲：res.json 的三个数（Ryujinx 的槽号、地址表所在常量段、偏移）与**游戏实际绑的号**
+                        // 是不是一套，就看这一行（UBO 那边已经证过"res.json 的槽号要减 3 才是 NVN 的槽"）。
+                        // Storage buffer: this line shows whether res.json's three numbers (Ryujinx's slot, the constant
+                        // bank holding the address table, the offset) and **the index the game actually binds** are the
+                        // same space (the UBO side already proved that res.json's slot needs a minus 3 to be NVN's slot).
+                        const vk_sbuf_ref *r2 = desc_sbuf_ref(st, b[i].binding);
+                        LOG("【黄】binding %u（storage buffer）拿不到缓冲地址、声明者阶段 %d：res.json 槽 %d、cb_slot %d、cb_offset %d；已绑 SSBO 位图（阶段 0..5 的低 64 位）%llx/%llx/%llx/%llx/%llx/%llx；BIND_SSBO 各阶段计数 %llu/%llu/%llu/%llu/%llu/%llu",
+                            b[i].binding, st->stage, r2 ? r2->slot : -999, r2 ? r2->cb_slot : -999, r2 ? r2->cb_offset : -999,
+                            (unsigned long long)g_rs.ssbo_have[0][0], (unsigned long long)g_rs.ssbo_have[1][0],
+                            (unsigned long long)g_rs.ssbo_have[2][0], (unsigned long long)g_rs.ssbo_have[3][0],
+                            (unsigned long long)g_rs.ssbo_have[4][0], (unsigned long long)g_rs.ssbo_have[5][0],
+                            (unsigned long long)atomic_load(&g_ssbo_binds[0]), (unsigned long long)atomic_load(&g_ssbo_binds[1]),
+                            (unsigned long long)atomic_load(&g_ssbo_binds[2]), (unsigned long long)atomic_load(&g_ssbo_binds[3]),
+                            (unsigned long long)atomic_load(&g_ssbo_binds[4]), (unsigned long long)atomic_load(&g_ssbo_binds[5]));
+                    } else
                     LOG("【黄】binding %u（%s）拿不到缓冲地址（地址 %llx、槽解析 %d、声明者阶段 %d）：写空白；同一槽各阶段 %llx/%llx/%llx/%llx/%llx/%llx；已绑上的槽位图（按阶段）%#x/%#x/%#x/%#x/%#x/%#x；BIND_UBO 各阶段计数 %llu/%llu/%llu/%llu/%llu/%llu（地址 0 的 %llu/%llu/%llu/%llu/%llu/%llu）",
                         b[i].binding, vk_spv_kind_name(b[i].kind), (unsigned long long)a, sd, st->stage,
                         (unsigned long long)pa[0], (unsigned long long)pa[1], (unsigned long long)pa[2],
@@ -2000,7 +2029,7 @@ void mtl_exec(const uint8_t *p) {
                     atomic_fetch_add(&g_ubo_binds[stg], 1);
                     if (!b->addr) atomic_fetch_add(&g_ubo_zero[stg], 1);
                 } else atomic_fetch_add(&g_ubo_out, 1);
-            }
+            } else if (h.op == OP_BIND_SSBO && stg >= 0 && stg < 6) atomic_fetch_add(&g_ssbo_binds[stg], 1);
             if (stg >= 0 && stg < 6 && idx >= 0) {
                 if (h.op == OP_BIND_UBO && idx < 16) {
                     g_rs.ubo[stg][idx].addr = b->addr; g_rs.ubo[stg][idx].size = b->size;
