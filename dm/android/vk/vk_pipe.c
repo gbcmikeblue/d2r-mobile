@@ -726,6 +726,40 @@ VkImageView vk_pipe_dummy_view(void) {
     return v;
 }
 
+// 空白 texel 视图：缓冲区贴图那条绑定的回退（句柄还没解析出来、或那张贴图建不出视图）。
+// 描述符**必须写点什么**（不写的描述符内容不确定），而 NVN 在空槽上就是读 0，所以这里给 1 个全零元素。
+// A dummy texel view: the fallback for a buffer-texture binding (the handle is not resolved yet, or that texture
+// cannot produce a view). Something **must** be written to the descriptor (an unwritten one holds undefined
+// contents), and NVN reads 0 on an empty slot, so this is one all-zero element.
+static VkBufferView g_dummy_bv;
+VkBufferView vk_pipe_dummy_bufview(void) {
+    if (g_dummy_bv) return g_dummy_bv;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4,
+        .usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer b = VK_NULL_HANDLE;
+    if (vkCreateBuffer(vk_dev(), &bci, NULL, &b) != VK_SUCCESS) { LOG("【红】建空白 texel 缓冲失败"); return VK_NULL_HANDLE; }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(vk_dev(), b, &mr);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(vk_dev(), &mai, NULL, &mem) != VK_SUCCESS || vkBindBufferMemory(vk_dev(), b, mem, 0) != VK_SUCCESS) {
+        LOG("【红】空白 texel 缓冲的内存分配 / 绑定失败");
+        vkDestroyBuffer(vk_dev(), b, NULL);
+        return VK_NULL_HANDLE;
+    }
+    void *p = NULL;
+    if (vkMapMemory(vk_dev(), mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) memset(p, 0, 4);   // 全零元素；宿主可见且一致，映射一直留着 | an all-zero element; the memory is host-visible and coherent, so the mapping stays
+    VkBufferViewCreateInfo bvi = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .offset = 0, .range = 4 };
+    VkBufferView v = VK_NULL_HANDLE;
+    if (vkCreateBufferView(vk_dev(), &bvi, NULL, &v) != VK_SUCCESS) { LOG("【红】建空白 texel 视图失败"); return VK_NULL_HANDLE; }
+    g_dummy_bv = v;
+    return v;
+}
+
 VkSampler vk_pipe_dummy_sampler(void) {
     if (g_dummy_samp) return g_dummy_samp;
     vk_device_init();

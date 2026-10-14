@@ -619,19 +619,23 @@ The port is currently being driven from a Windows machine. These are the traps a
 
 ## 7. Next step
 
-Proceed in the order on this page; after each milestone, tick it off here and record the conclusion. **M2 is at step 14
-now**: descriptor writing and real draws ✓ (step 10), textures and samplers resolved by NVN slot ✓ (step 11), views and
-**the render targets' views** ✓ (steps 12 and 14), and **the present-screenshot instrument is in place and has been used
-to reach a conclusion** ✓ (steps 13 and 14). **M2's acceptance (a picture appears) is now blocked by the rendering chain
-itself** -- the GPU has written no colour content. What follows is ordered by value:
+Proceed in the order on this page; after each milestone, tick it off here and record the conclusion. **M3 is at step 3
+now**: the rendering chain's warnings have shrunk from "descriptors falling back to blanks" to a **single** one --
+`uniform buffer: no buffer address` / `storage buffer: no buffer address` / `combined image sampler: writing a blank
+texture` all went to **zero** on 2026-10-14 (the first two via the constant-slot number minus 3 and via deriving a storage
+buffer's slot from `cb_offset`, the third via **buffer textures**, a newly added resource kind -- see the "M3-2k" section).
+That one warning plus the two remaining items form the ladder. What follows is ordered by value:
 
 1. **Fix where the vertex data lands** -- the warning `vertex attribute N (... at position N) has a component type that
    disagrees with the shader: format NxN vs shader float` says the vertex stream and the format may be paired up wrongly;
    geometry collapsing entirely is the most likely reason for "draws issued, nothing lands" (pick the stream from the type
-   the shader declares first, then check the stride and offset);
-2. **Fix the descriptors falling back to blanks** -- `combined image sampler: writing a blank texture` (the handle source
-   that `res.json` calls `cbuf_slot=-N`) and `uniform buffer: no buffer address`; both leave the shader reading an empty
-   texture or empty constants;
+   the shader declares first, then check the stride and offset). **Do one piece of forensics first**: in `vk_spv.c`
+   `OP_TYPE_FLOAT = 21 / OP_TYPE_INT = 22` are **swapped** relative to the SPIR-V spec (see section six of "M3-2k"), so
+   the "shader float" half of that warning may itself come from an inverted test -- fix that first and run again, to see
+   whether the warning disappears, changes shape, or turns into a different one;
+2. **The descriptor shelf is now empty** (kept as a regression gauge): all three blank counters should read 0, and
+   `DM_NO_TEXEL=1` falls the buffer-texture path back to a blank, which is how one confirms the zeroes were bought by
+   this change;
 3. **Scan again once those are fixed** -- `DM_NVN_SHOT_SCAN` answers directly with "has content or not", so there is no
    more guessing (it is already the instrument for the "you look, I change" loop: pictures and the report land in the same
    directory);
@@ -679,7 +683,9 @@ itself** -- the GPU has written no colour content. What follows is ordered by va
 8. Views land ✓ (step 12 here);
 9. **The render targets' views** into the shadow state ✓ (step 14 here: sub-views 0 -> 33, 34,193 hits; the render area is clamped to the attachment);
 10. **Read one frame back offscreen** and write it to disk ✓ (step 13 here: the picture really lands on disk, a valid 5,761,403-byte PNG that opens after being pulled);
-11. Use it to ask "where is the picture" ✓ (step 14 here: **no colour content** -> the blocker becomes the rendering chain: where vertex data lands, and descriptors falling back to blanks).
+11. Use it to ask "where is the picture" ✓ (step 14 here: **no colour content** -> the blocker becomes the rendering chain: where vertex data lands, and descriptors falling back to blanks);
+12. **Descriptors falling back to blanks** cleared ✓ ("M3-2k": the UBO name number minus 3, the storage buffer derived from `cb_offset`, and **buffer textures** as a new resource kind; all three blank counters read zero on the device, and `DM_NO_TEXEL=1` brings them straight back);
+13. Buffer textures land ✓ ("M3-2k": `target 10` -> a texel buffer, the same idea as Apple's; **texture 701's registry entry really does have target 10**, the format is `R32G32B32A32_SFLOAT`, 65536 elements, built straight on the pool buffer).
 
 One **known latent issue** is recorded in the commit message: on Android `crash.c` always passes `is_write = 0`, and the dirty-page fault hook looks at that bit first, so a write to a write-protected page inside a pool walks into the crash path. The crash report already prints the faulting instruction encoding, which is what a correct read/write decision needs.
 
@@ -1041,3 +1047,81 @@ seconds of silence) -- a guest waiting on I/O would not stop the front end. The 
 `last svc 0x1a` (ArbitrateLock), `waiting: running/not waiting`, in-flight slots 1/8, **no pass open**, no crash. In other
 words **both threads stopped together inside some driver or lock wait**, and the next step is to give Android the PC /
 backtrace instrument before going further in.
+
+### M3-2k: buffer textures (texel buffers) land -- the hand-off's deciding action, and the proper fix, in one go (2026-10-14)
+
+The hand-off said: "**first confirm texture 701 really is `target 10`**, then choose between the proper fix (a new
+texel-buffer resource kind) and a stopgap (substitute a 2D texture, which must be recorded)". Both halves happened this
+round: the confirmation first, the **proper fix** second (the "2D texture instead" stopgap was never taken).
+
+**1. Measure before changing anything** (the order matters: before this round we did not even know whether the test
+existed). The classifier in `vk_spv.c` had **no test at all** that could produce `VK_SPV_TEXEL`: `OpTypeImage`'s `Dim` was
+never parsed, `OpTypeSampledImage` was always counted as a combined image sampler, and the descriptor pool had no
+`UNIFORM_TEXEL_BUFFER` quota (line 96 of `vk_pipe.c` had mapped that kind for a long time -- it simply had no producer).
+Three things were measured first, over the **6923 artifacts** on this machine:
+
+| Offline measurement (6923 `.spv` files plus their `.res.json`) | Reading |
+|---|---|
+| Bindings with `Dim = Buffer` | **2991**, all with `sampled = 1` and a sampled type of `float`, spread over 2991 shaders |
+| Texture bindings whose reflection says `cbuf_slot < 0` | Also exactly **2991**, every one with `handle = 0x6a` -- a **one-to-one** match with the line above |
+| Which bindings they are | `binding 2` 2836 times, `binding 1` 154, `binding 4` 1 (which fits the eight blanks in the log appearing only on bindings 1 and 2) |
+| Does the `OpTypeImage` an `OpTypeSampledImage` points at always precede it? | **12111 times, always earlier, 0 exceptions** |
+
+The first two lines together are the clincher: **"texture blank" and "missing resource kind" are the same thing** (the
+counts match exactly, which is not the same as "looks similar"). The fourth line is what keeps the implementation to one
+byte of storage: when the scanner sees an `OpTypeSampledImage` it can simply **copy the `Dim`** over from the image side
+instead of keeping a second mapping table -- and that copy is backed by a measurement rather than an assumption.
+
+**2. The fix** (five files, **the same idea as Apple's** `nvn_mtl.m:1204-1220`: build a texture-buffer view straight on
+the memory-pool buffer, zero copy, with the GPU reading the pool's current content at execution time):
+
+1. `vk_spv.c`: parse `OpTypeImage`'s `Dim` and classify `Dim = Buffer` (when it is not a storage image) as `VK_SPV_TEXEL`;
+   `OpTypeSampledImage` copies the `Dim` over;
+2. `vk_tex.c`: a new `vk_tex_bufview` -- the range is **bytes per element times element count**, the pool address goes
+   through `mtl_addr` to become (pool buffer, in-pool offset), and then a `VkBufferViewCreateInfo{offset, range, format}`.
+   **Two of these are Vulkan's rules rather than choices**: (a) there is no `bytesPerRow` (a texel buffer is a linear
+   array of elements to begin with) but the **offset has a hard alignment requirement** (`minTexelBufferOffsetAlignment`);
+   (b) the format must carry `VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT`, so compressed and depth/stencil formats are out.
+   Both are checked, and a failure is reported **once per cause**;
+3. `nvn_vk.c`: the descriptor write gains a branch (`pTexelBufferView`, one of three mutually exclusive forms alongside the
+   image and buffer ones); the pool buffer's usage gains `UNIFORM_TEXEL_BUFFER_BIT | STORAGE_TEXEL_BUFFER_BIT` (**the bits
+   cannot be added later**); the descriptor pool gains one quota entry;
+4. `vk_pipe.c`: a **dummy texel view of one all-zero element** (NVN itself reads 0 on an empty slot -- the same reasoning
+   as the image fallback);
+5. `vk_device.c/h`: expose the physical device (`vk_phys`), because a texel buffer's offset alignment can only be asked of
+   the device's limits.
+
+**3. Device readings** (Redmi K90 / Adreno 830, `DM_WIN_SRC=0` + `DM_WATCH_STALL=15`, the same environment as the run
+before it):
+
+| Reading | Before (`run-c0-driver-segment.log`) | After (`run-texel-buffer.log`) |
+|---|---|---|
+| `【黄】贴图 target 10 ... 暂不支持（缓冲区 / 多采样 / 线性布局）` | 1 line | **0 lines** |
+| `贴图写空白` | 8 lines (two on binding 1, six on binding 2) | **0 lines** |
+| Buffer texture | -- | 【绿】 lands: serial 22, **65536 elements x 16 bytes**, format `0x2e -> R32G32B32A32_SFLOAT(109)`, pool offset `0x112b2c0` (built straight on the pool buffer) |
+| The registry entry's target | -- | 【查】 **tid 701 -> the registry entry's target is 10**; bound as a texel buffer on `binding 1` and `binding 2` |
+| New failures | -- | **None**: the red lines are still the five old "shader `16479cc6d75c2b28`'s artifact is not in spv" plus the one watchdog line |
+
+**4. The reading the hand-off was missing came from an A/B.** The path got a one-flag fallback to a blank (`DM_NO_TEXEL=1`,
+**an instrument rather than a feature**, off by default). In group B (blank) the eight blank lines **come back exactly**,
+and they carry the three numbers the previous round never printed:
+`cbuf_slot=-1 handle=0x6a -> slot 8; the handle bound on that slot is 0x2bd (low 20 bits **701**, registry **found**)`.
+In other words **all three links -- slot decoding, handle, registry -- are sound**; the one thing missing was turning the
+registry entry into a view, which the image side can never do because the texture is `target 10`. That chain matches the
+hand-off's inference exactly, and now it has numbers behind it.
+
+**5. The A/B also removed a false suspicion** (worth recording so the next person does not doubt themselves too). Two runs
+after the change both stop at "58-61 presents / about 6200 draws" while the 21:47 run reached "340 presents / 370k draws",
+which looks like **this change slowed the run down**. So **only one environment variable** was changed (`DM_NO_TEXEL=1`,
+nothing else touched) and the two groups read **identically** (58 presents, 6208 draws, 61 submissions, the same stage and
+the same last line). Then the last heartbeat of **all nine historical runs** in `ab-viewer-off` was listed: **every one of
+them except the 21:47 run stops at 55-60 presents** -- so stopping at 60 is the norm and the 21:47 run is the outlier.
+**Conclusion: neither the frame rate nor where it stalls has anything to do with this change.**
+
+**6. One real bug fell out along the way (left for its own step, not fixed here)**: in `vk_spv.c`
+`OP_TYPE_FLOAT = 21 / OP_TYPE_INT = 22` are **swapped** relative to the SPIR-V spec (the spec has 21 = `OpTypeInt` and
+22 = `OpTypeFloat`; in the local artifacts `OpTypeInt %1 32 0` is four words and `OpTypeFloat %4 32` is three, so it is
+plain to see). It sits exactly on the judgment behind milestone A's other remaining item (**vertex attribute component
+class vs the shader's declaration**) -- which means the "shader float" half of the warning
+`顶点属性 2 ... 格式 0x27 vs 着色器 float` may itself come from an inverted test. Following the "change one thing at a
+time" rule, it is left as the next step.

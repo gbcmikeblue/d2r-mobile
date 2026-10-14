@@ -46,6 +46,10 @@ VkInstance vk_instance(void) { return g_inst; }
 VkDevice vk_dev(void) { return g_dev; }
 VkQueue vk_queue(void) { return g_queue; }
 uint32_t vk_queue_family(void) { return g_qfi; }
+// 物理设备：给需要查"设备限制/格式能力"的层用（目前是 texel buffer 的偏移对齐，见 vk_tex.c）。
+// The physical device: for layers that need to query device limits or format support (currently the texel buffer's
+// offset alignment, see vk_tex.c).
+VkPhysicalDevice vk_phys(void) { return g_phys; }
 
 // 队列的外部同步（说明见 vk_device.h）：一把进程内的锁，提交 / 等队列空闲 / 取图像 / 上屏都走它。
 // 做成普通互斥量即可：临界区里只有一次驱动调用，不在里面做别的活。

@@ -60,8 +60,14 @@ void mtl_init(void) { vk_device_init(); }
 // count that class of pool -- whatever is inside such a pool cannot reach the GPU yet.
 static VkBuffer make_pool_buffer(uint64_t size, int *fell_back) {
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+        // texel buffer 的两个位是**缓冲区贴图**要的：VkBufferView 要求缓冲在创建时就带这两个用法位之一，
+        // 而缓冲区贴图的存储就是池里的一段（见 vk_tex_bufview）——位不能事后补，所以一开始就给。
+        // The two texel-buffer bits are for **buffer textures**: a VkBufferView requires the buffer to have been
+        // created with one of them, and a buffer texture's storage is a stretch of the pool (see vk_tex_bufview).
+        // The bits cannot be added later, so they go in from the start.
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
@@ -363,6 +369,12 @@ static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途
 // These two counters are used by the periodic stats line in the submission section while they belong to the
 // descriptor section (defined further down), so they are declared here first.
 static _Atomic uint64_t g_desc_draws, g_desc_tex_ok, g_desc_tex_blank, g_desc_tex_nosamp, g_desc_tex_emptysamp;
+// 缓冲区贴图（texel buffer）两条：**绑上**与"注册项有、但视图建不出来"。分开计是为了让"空白降下来了没有"
+// 这件事有确定的读数——它们是同一类绑定的两种结局。
+// Two counters for buffer textures (texel buffers): **bound** and "the registry has it but no view could be built".
+// They are the two outcomes of one kind of binding, and keeping them apart gives "did the blanks go down" a definite
+// reading.
+static _Atomic uint64_t g_desc_texel_ok, g_desc_texel_fail;
 
 #define GPU_RING 1024        // 与苹果侧同一个环大小 | the same ring size as Apple
 #define GPU_PASS_MAX 64      // 一次提交最多记这么多通道；超了就不再写时间戳（那一次的量会偏小） | at most this many passes per submission; beyond it no more timestamps are written (that submission reads low)
@@ -982,6 +994,11 @@ uint64_t mtl_sub_commit(void) {
             (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank),
             (unsigned long long)atomic_load(&g_desc_tex_emptysamp), (unsigned long long)atomic_load(&g_desc_tex_nosamp),
             pok, pbad);
+        // 缓冲区贴图单独一行：它是新补的一种资源（texel buffer），"绑上多少、建不出多少"直接说明它有没有生效
+        // Buffer textures get their own line: this is a newly added resource kind (a texel buffer), and "how many
+        // bound, how many could not be built" says directly whether it works
+        LOG("[vk] 缓冲区贴图（texel buffer）：绑上 %llu 条、建不出视图 %llu 条",
+            (unsigned long long)atomic_load(&g_desc_texel_ok), (unsigned long long)atomic_load(&g_desc_texel_fail));
         uint64_t vb = 0, vh = 0, vm = 0;
         vk_tex_view_stats(&vb, &vh, &vm);
         LOG("[vk] 视图：底视图 %llu 次、命中子视图 %llu 次、新建子视图 %llu 张",
@@ -1173,14 +1190,20 @@ static void desc_slot_reset(int slot) {
 static VkDescriptorPool desc_pool_at(int slot, int idx) {
     if (g_dpool[slot][idx]) return g_dpool[slot][idx];
     if (idx >= DESC_POOLS) return VK_NULL_HANDLE;
-    VkDescriptorPoolSize ps[4] = {
+    // UNIFORM_TEXEL_BUFFER 是**缓冲区贴图**那一类绑定要的：描述符集布局里出现了它，池里就必须有对应的额度，
+    // 否则 vkAllocateDescriptorSets 会失败（一个 set 也开不出来），而失败是静默的——每帧都从头再来一遍。
+    // UNIFORM_TEXEL_BUFFER is for **buffer textures**: once the descriptor set layout contains that type the pool
+    // must carry a matching quota, or vkAllocateDescriptorSets fails (not a single set can be opened) and the failure
+    // is silent -- every frame would start over from square one.
+    VkDescriptorPoolSize ps[5] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, DESC_POOL_SETS },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, DESC_POOL_SETS },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DESC_POOL_SETS },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, DESC_POOL_SETS },
     };
     VkDescriptorPoolCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = DESC_POOL_SETS, .poolSizeCount = 4, .pPoolSizes = ps };
+        .maxSets = DESC_POOL_SETS, .poolSizeCount = 5, .pPoolSizes = ps };
     VkDescriptorPool p = VK_NULL_HANDLE;
     if (vkCreateDescriptorPool(vk_dev(), &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     if (g_dpool_n[slot] < idx + 1) g_dpool_n[slot] = (uint8_t)(idx + 1);
@@ -1439,11 +1462,28 @@ static void desc_tex_probe(const vk_shader *st, const vk_tex_ref *tr) {
     }
 }
 
+// A/B 开关（DM_NO_TEXEL）：缓冲区贴图这条路是照苹果侧移植过来的，装上真机之后必须能**一键退回空白**，
+// 才能把"帧率 / 卡在哪里变了"判给这条改动，而不是判给手机自己（真机不稳是这个项目的常态）。
+// 环境变量只在第一次读，之后一直用同一个答案。
+// The A/B switch (DM_NO_TEXEL): the buffer-texture path is a port of the Apple one, and once it is on a real device it
+// must be possible to **fall back to a blank with one flag**, so that "did the frame rate, or where it stalls, move"
+// can be attributed to this change rather than to the phone itself (an unstable device is normal in this project).
+// The variable is read once and the same answer is used thereafter.
+static int texel_off_by_env(void) {
+    static int once = -1;
+    if (once < 0) { const char *v = getenv("DM_NO_TEXEL"); once = (v && *v && *v != '0') ? 1 : 0; }
+    return once;
+}
+
 static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n,
                       const vk_pipe_bind *b, int nb, uint32_t *dyn) {
     // 一屏最多 64 条绑定，用静态数组（mtl_exec 递归，不能用大栈帧 | see the note on gfx_state_fill）
     static VkDescriptorBufferInfo bi[VK_SPV_MAXB];
     static VkDescriptorImageInfo ii[VK_SPV_MAXB];
+    // 缓冲区贴图（texel buffer）那一类写的是**视图句柄**（pTexelBufferView），与图像/缓冲三选一，不能混用
+    // A buffer texture (a texel buffer) is written as a **view handle** (pTexelBufferView), one of three mutually
+    // exclusive forms alongside the image and buffer ones
+    static VkBufferView bvr[VK_SPV_MAXB];
     static VkWriteDescriptorSet wr[VK_SPV_MAXB];
     int nw = 0, nd = 0;
     for (int i = 0; i < nb; i++) {
@@ -1457,6 +1497,12 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
         if (!st) continue;
         VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = sets[b[i].set], .dstBinding = b[i].binding, .descriptorCount = b[i].count ? b[i].count : 1 };
+        // 这条绑定是缓冲区贴图吗（SPIR-V 的 Dim = Buffer → 见 vk_spv.c 的 kind_of）：它走的是 texel buffer，
+        // 句柄→注册表那一段与图像共用，但"注册项 → 视图"那一步换成 VkBufferView。
+        // Is this binding a buffer texture (the SPIR-V's Dim = Buffer -> see kind_of in vk_spv.c)? It goes through a
+        // texel buffer: the handle-to-registry step is shared with images, but the "registry entry -> view" step
+        // becomes a VkBufferView.
+        int is_texel = (b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
         if (b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
             uint64_t a = 0, sz = 0;
             void *buf = NULL; uint64_t off = 0;
@@ -1524,7 +1570,8 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
             w.descriptorType = b[i].type;
             w.pBufferInfo = &bi[nw];
             nw++;
-        } else if (b[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+        } else if (b[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                   b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
             // 贴图 / 图像：句柄的来处分两种情况（res.json 的 cbuf_slot 与 handle）——
             //   cbuf_slot < 0：句柄是着色器常量里 baked 的那个数，本身就是**贴图号** → 查注册表拿贴图；
             //   cbuf_slot >= 0：句柄在客体的常量里（要从 c[..] 读），**编码还没定下来**（本地全库抽样 1205 条
@@ -1542,6 +1589,7 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
             int stg_t = st->stage >= 0 && st->stage < 6 ? st->stage : 0;
             VkImageView texv = VK_NULL_HANDLE;
             VkSampler texs = VK_NULL_HANDLE;
+            VkBufferView texbv = VK_NULL_HANDLE;   // 缓冲区贴图那一支的产物 | what the buffer-texture branch produces
             // 槽由接口描述表配对而来（见 vk_shader.c 那一节）。有了槽，就该阶段"绑在第几号"有了答案：
             // **贴图与采样器都按同一个槽取**——NVN 里这两者就是按槽号配对绑定的（分开绑的两个数组，同一号成对）。
             // The slot comes from the interface table (see the section in vk_shader.c). With a slot there is an
@@ -1552,6 +1600,40 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 if (h) {
                     const treg_e *e = treg_of((uint32_t)h);
                     if (e) {
+                        if (is_texel && texel_off_by_env()) {
+                            // A/B 开关（DM_NO_TEXEL=1）：把缓冲区贴图退回空白，用来判定"帧率变化"是不是这条新路带来的。
+                            // 它是量具不是功能：默认关，只有把环境变量设上才生效。
+                            // An A/B switch (DM_NO_TEXEL=1): fall a buffer texture back to a blank so that "did the frame
+                            // rate change" can be settled. It is an instrument rather than a feature: off by default, and
+                            // it only bites when the variable is set.
+                            atomic_fetch_add(&g_desc_texel_fail, 1);
+                        } else if (is_texel) {
+                            // 缓冲区贴图：这一支**不碰图像视图**。那类贴图的 target 是 10（缓冲），图像那一侧
+                            // 永远建不出东西——真机上"贴图写空白"里正有这一批（离线统计：反射里 cbuf_slot<0 且
+                            // handle=0x6a 的绑定 2991 条，其 SPIR-V 维度全是 Buffer）。
+                            // 成功这条日志同时回答交接单里那条判定动作："注册项的目标确实是 10 吗"。
+                            // A buffer texture: this branch **never touches an image view**. Such a texture's target
+                            // is 10 (buffer) and the image side can never build anything -- and on the device this
+                            // batch is exactly part of the "texture blank" lines (offline count: 2991 bindings in the
+                            // reflection have cbuf_slot < 0 and handle 0x6a, all with an SPIR-V Dim of Buffer).
+                            // The success line also answers the hand-off's deciding question: "is the registry
+                            // entry's target really 10?"
+                            texbv = vk_tex_bufview(&e->t);
+                            if (texbv) {
+                                atomic_fetch_add(&g_desc_tex_ok, 1);
+                                if (atomic_fetch_add(&g_desc_texel_ok, 1) < 4)
+                                    LOG("【查】缓冲区贴图：binding %u（%s）tid %u → 注册项目标 %d、格式 %#x、元素 %u：texel buffer 已绑上",
+                                        b[i].binding, vk_spv_kind_name(b[i].kind), (unsigned)(h & 0xfffffu),
+                                        e->t.d.target, e->t.d.format, e->t.d.width);
+                            } else if (atomic_fetch_add(&g_desc_texel_fail, 1) < 4) {
+                                LOG("【黄】缓冲区贴图：binding %u（%s）tid %u 建不出视图（注册项目标 %d、格式 %#x、元素 %u）：原因见纹理层那几行报红",
+                                    b[i].binding, vk_spv_kind_name(b[i].kind), (unsigned)(h & 0xfffffu),
+                                    e->t.d.target, e->t.d.format, e->t.d.width);
+                            }
+                        } else {
+                        // 图像 / 图像视图那一支（原来的路；块里不另行缩进，为的是让这回的差异只落在"缓冲区贴图"这一支上）。
+                        // The image / image-view branch (the original path; its body is left unindented so that this
+                        // round's diff lands only on the buffer-texture branch).
                         // 注册时存下的 view 在这里**第一次被用上**（以前存了却从没读过）：它可能限定 mip/层范围、
                         // 重解释格式或目标类型——也就是"按游戏的意思采样"这一步。
                         // The view stored at registration time is **used here for the first time** (it used to be stored
@@ -1579,11 +1661,15 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                                         tr->nvn_sslot, sid, (unsigned long long)sh_, (unsigned long long)atomic_load(&g_sreg_n));
                             }
                         }
+                        }
                     }
                 }
             }
-            if (!texv && tr) desc_tex_probe(st, tr);   // 配不上时取证（前三次）| forensics when unpaired (first three)
-            if (!texv) {
+            // 配不上时取证（前三次）：缓冲区贴图那一支的"有产物"以 texbv 计——不然它每次都会被当成"配不上"
+            // Forensics when unpaired (first three): the buffer-texture branch counts texbv as a product, or it would
+            // be treated as unpaired every time
+            if (!texv && !texbv && tr) desc_tex_probe(st, tr);
+            if (!texv && !texbv) {
                 // 用**自己的**计数器：早先和图"拿不到缓冲地址"共用 g_desc_blank，前 8 条被 UBO 的空白占掉，
                 // 于是贴图这条诊断在真机上一行都没打出来（查了半天）。
                 // Its **own** counter: it used to share g_desc_blank with the "buffer address unavailable" case, so
@@ -1608,8 +1694,14 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                         (unsigned long long)g_rs.ubo[stg][0].addr, (unsigned long long)g_rs.ubo[stg][1].addr,
                         (unsigned long long)g_rs.ubo[stg][2].addr, (unsigned long long)g_rs.ubo[stg][3].addr);
                 }
-                ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), vk_pipe_dummy_view(),
-                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                // 缓冲区贴图的空白：给一个全零元素（NVN 在空槽上就是读 0），别的走图像 + 采样器那一对
+                // A buffer texture's blank: one all-zero element (NVN reads 0 on an empty slot); everything else gets
+                // the image-plus-sampler pair
+                if (is_texel) bvr[nw] = vk_pipe_dummy_bufview();
+                else ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), vk_pipe_dummy_view(),
+                                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            } else if (is_texel) {
+                bvr[nw] = texbv;
             } else {
                 // 采样器来自**同一个槽**的采样器句柄高位（>> 20）；取不到才退回空白并计数——贴图照常绑上。
                 // 注：早先这里写着"res.json 的 samplers 数组"是**错的**，res.json 没有那个数组（已核实）。
@@ -1623,7 +1715,10 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 // above (empty versus missing, separately); not counted again here
             }
             w.descriptorType = b[i].type;
-            w.pImageInfo = &ii[nw];
+            // 三种"视图"各自只填一个成员（见 VkWriteDescriptorSet 的说明）：texel buffer 用 pTexelBufferView
+            // Exactly one member is filled per form (see VkWriteDescriptorSet): a texel buffer uses pTexelBufferView
+            if (is_texel) w.pTexelBufferView = &bvr[nw];
+            else w.pImageInfo = &ii[nw];
             nw++;
         } else {
             continue;   // VK_SPV_OTHER 之类：布局里没这条就走不到这里 | kinds such as VK_SPV_OTHER never reach here for a binding that is in the layout

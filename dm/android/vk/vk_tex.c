@@ -6,6 +6,10 @@
 #include "vk_region.h"
 #include "nvn_tex.h"
 #include "nvn_deswizzle.h"
+// mtl_addr：池地址 → (池缓冲, 池内偏移)。缓冲区贴图的视图直接建在池缓冲上，所以要它（见 vk_tex_bufview）。
+// mtl_addr: pool address -> (pool buffer, in-pool offset). A buffer texture's view is built straight on the pool
+// buffer, so it is needed here (see vk_tex_bufview).
+#include "nvn_mtl.h"
 #include "dm.h"
 #include <math.h>
 #include <pthread.h>
@@ -281,6 +285,7 @@ static _Atomic uint64_t g_vw_base, g_vw_hit, g_vw_made;
 typedef struct {
     uint64_t serial;
     VkImage img; VkImageView view; VkDeviceMemory mem;
+    VkBufferView bv;          // 缓冲区贴图（target 10）的 texel buffer 视图：它与 img/view 互斥 | the texel-buffer view of a buffer texture (target 10): mutually exclusive with img/view
     VkFormat fmt; uint32_t w, h, d, levels, layers;
     int depth_like, dsa;      // dsa：深度模板合并（D24S8 / D32FS8）| dsa: combined depth-stencil
     int dirty;                // 池被 CPU 改过，下次取用前重传 | pool changed on the CPU; re-upload before the next use
@@ -1103,6 +1108,110 @@ static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *asp
 VkImage vk_tex_image(const tex_t *t) { return tex_of(t, NULL, NULL, NULL); }
 VkImageView vk_tex_view(const tex_t *t, const view_t *v) { VkImageView view; return tex_of(t, &view, NULL, v) ? view : VK_NULL_HANDLE; }
 
+// ---------- 缓冲区贴图（TARGET_BUFFER）→ VkBufferView ----------
+// NVN 的缓冲区贴图把一段缓冲当"一维元素数组"采样：`width` 是元素个数、格式给每元素字节数。
+// Vulkan 的对应物是 texel buffer：`VkBufferView` + `VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER`。
+// 与苹果侧**同源**（nvn_mtl.m 的 tex_mtl 里那一支：直接在内存池缓冲上建贴图缓冲视图，零拷贝，
+// GPU 执行时读池里的当前内容），但有两处不一样，都是 Vulkan 的规矩而不是选择：
+//   ① 没有 bytesPerRow 的概念（texel buffer 本来就是一维元素数组），但**偏移有对齐硬要求**
+//      （minTexelBufferOffsetAlignment），不满足时 vkCreateBufferView 直接失败（真机没有校验层，失败只看返回值）；
+//   ② 可用格式受 VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT 约束，压缩格式与深度/模板格式一概不行。
+// 为什么它必须单独一条路：`ent_build` 会拒掉 target 10（没有 VkImage 可言），所以这类贴图走图像那一侧
+// 永远是空指针 —— 真机上的表现就是"贴图写空白"，而查找链其实是好的。
+// ---------- buffer texture (TARGET_BUFFER) -> VkBufferView ----------
+// An NVN buffer texture samples a stretch of a buffer as a one-dimensional array of elements: `width` is the element
+// count and the format gives the bytes per element. Vulkan's counterpart is a texel buffer: a `VkBufferView` plus
+// `VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER`. It is **the same idea** as the Apple side (the tex_mtl branch in
+// nvn_mtl.m: build a texture-buffer view straight on the memory-pool buffer, zero copy, and the GPU reads the pool's
+// current content at execution time), with two differences that are Vulkan's rules rather than choices:
+//   1. there is no bytesPerRow (a texel buffer is a linear array of elements to begin with), but the **offset has a
+//      hard alignment requirement** (minTexelBufferOffsetAlignment) and vkCreateBufferView simply fails otherwise
+//      (the device has no validation layers, so the return code is all we get);
+//   2. the format must carry VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT; compressed and depth/stencil formats cannot.
+// Why it needs a path of its own: `ent_build` rejects target 10 (there is no VkImage to speak of), so going through
+// the image side always yields a null handle -- which on the device shows up as a "texture blank" even though the
+// lookup chain is perfectly sound.
+static _Atomic uint64_t g_texel_made;
+VkBufferView vk_tex_bufview(const tex_t *t) {
+    if (!t || !t->serial || t->d.target != 10) return VK_NULL_HANDLE;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_mu);
+    ent_t *e = find_slot(t->serial, 1);
+    if (e->bv) { VkBufferView v = e->bv; pthread_mutex_unlock(&g_mu); return v; }
+
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    uint32_t elems = t->d.width ? t->d.width : 1;
+    VkFormat fmt = VK_FORMAT_UNDEFINED;
+    void *pbuf = NULL; uint64_t poff = 0;
+    static int said_fmt, said_mem, said_align, said_feat, said_create;
+    if (bpb <= 0 || bw != 1 || bh != 1) {
+        if (!said_fmt++) LOG("【红】缓冲区贴图：格式 %#x 不能当线性元素数组（每块字节 %d、块 %dx%d）", t->d.format, bpb, bw, bh);
+        goto fail;
+    }
+    if (!vk_fmt_to_vk(t->d.format, &fmt)) {
+        if (!said_fmt++) LOG("【红】缓冲区贴图：格式 %#x 在 Vulkan 这边没有对应", t->d.format);
+        goto fail;
+    }
+    if (fmt == VK_FORMAT_UNDEFINED || (fmt >= VK_FORMAT_D16_UNORM && fmt <= VK_FORMAT_D32_SFLOAT_S8_UINT)) {
+        if (!said_fmt++) LOG("【红】缓冲区贴图：格式 %#x 是不透明的深度/模板格式", t->d.format);
+        goto fail;
+    }
+    if (vk_phys()) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(vk_phys(), fmt, &fp);
+        if (!(fp.bufferFeatures & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT)) {
+            if (!said_feat++) LOG("【红】缓冲区贴图：本设备的 %d 格式不支持 texel buffer（bufferFeatures %#x）", (int)fmt, (unsigned)fp.bufferFeatures);
+            goto fail;
+        }
+    }
+    // 存储必须落在某个内存池里——缓冲区贴图**没有副本**，视图指的就是池里的那份（与 NVN 语义一致）
+    // The storage has to sit in one of the memory pools: a buffer texture has **no copy**, the view points straight at
+    // the pool's data (which is what NVN means by it)
+    if (!t->mem || !mtl_addr((uint64_t)(uintptr_t)t->mem, (uint64_t)bpb * elems, &pbuf, &poff) || !pbuf) {
+        if (!said_mem++) LOG("【红】缓冲区贴图：存储 %p +%llu 字节不在任何内存池里（序号 %llu）",
+                             t->mem, (unsigned long long)((uint64_t)bpb * elems), (unsigned long long)t->serial);
+        goto fail;
+    }
+    {
+        VkPhysicalDeviceProperties pp;
+        uint64_t al = 0;
+        if (vk_phys()) { vkGetPhysicalDeviceProperties(vk_phys(), &pp); al = pp.limits.minTexelBufferOffsetAlignment; }
+        if (al && (poff % al)) {
+            if (!said_align++) LOG("【黄】缓冲区贴图：池内偏移 %#llx 不是 %llu 的整数倍（序号 %llu）：本张建不出视图，按空白回退",
+                                   (unsigned long long)poff, (unsigned long long)al, (unsigned long long)t->serial);
+            goto fail;
+        }
+    }
+    {
+        VkBufferViewCreateInfo bvi = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+            .buffer = (VkBuffer)pbuf, .format = fmt, .offset = poff, .range = (uint64_t)bpb * elems };
+        VkBufferView v = VK_NULL_HANDLE;
+        VkResult r = vkCreateBufferView(vk_dev(), &bvi, NULL, &v);
+        if (r != VK_SUCCESS) {
+            // 最常见的两种原因是池缓冲没带 UNIFORM_TEXEL_BUFFER 用法位、或 range 超了 maxTexelBufferElements
+            // The two usual causes are a pool buffer without the UNIFORM_TEXEL_BUFFER usage bit, or a range beyond
+            // maxTexelBufferElements
+            if (!said_create++) LOG("【红】建缓冲区贴图视图失败（VkResult %d）：格式 %d、偏移 %#llx、范围 %llu 字节、%u 个元素",
+                                    (int)r, (int)fmt, (unsigned long long)poff, (unsigned long long)((uint64_t)bpb * elems), elems);
+            goto fail;
+        }
+        e->bv = v;
+        pthread_mutex_unlock(&g_mu);
+        if (atomic_fetch_add(&g_texel_made, 1) < 4)
+            LOG("【绿】缓冲区贴图落地（序号 %llu）：%u 个元素 × %d 字节、格式 %#x→%d、池偏移 %#llx（直接建在池缓冲上，零拷贝）",
+                (unsigned long long)t->serial, elems, bpb, t->d.format, (int)fmt, (unsigned long long)poff);
+        return v;
+    }
+fail:
+    // 与 ent_build 失败同一套收尾：只清"本来就是为它开的"那个槽，别动已有图像/视图的条目
+    // The same cleanup as an ent_build failure: clear only a slot opened for this texture, never one that already
+    // holds an image or a view
+    if (!e->img && !e->bv) { e->serial = 0; g_n--; }
+    pthread_mutex_unlock(&g_mu);
+    return VK_NULL_HANDLE;
+}
+
 void vk_tex_invalidate(uint64_t serial) {
     pthread_mutex_lock(&g_mu);
     ent_t *e = find_slot(serial, 0);
@@ -1117,9 +1226,10 @@ void vk_tex_drop(uint64_t serial) {
         for (int i = 0; i < ENT_VIEWS; i++)
             if (e->vw[i].used && e->vw[i].iv) { vkDestroyImageView(vk_dev(), e->vw[i].iv, NULL); e->vw[i].used = 0; e->vw[i].iv = VK_NULL_HANDLE; }
         if (e->view) vkDestroyImageView(vk_dev(), e->view, NULL);
+        if (e->bv) vkDestroyBufferView(vk_dev(), e->bv, NULL);
         if (e->img) vkDestroyImage(vk_dev(), e->img, NULL);
         if (e->mem) vkFreeMemory(vk_dev(), e->mem, NULL);
-        e->img = VK_NULL_HANDLE; e->view = VK_NULL_HANDLE; e->mem = VK_NULL_HANDLE;
+        e->img = VK_NULL_HANDLE; e->view = VK_NULL_HANDLE; e->bv = VK_NULL_HANDLE; e->mem = VK_NULL_HANDLE;
         e->serial = 0;   // 开放寻址的删除：直接清键，查找会在下一个空位停住（同键后又插入时会重建表）| clearing the key is enough for open addressing here; lookups stop at the next empty slot
         g_n--;
     }

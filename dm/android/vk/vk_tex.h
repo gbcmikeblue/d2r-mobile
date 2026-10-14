@@ -44,6 +44,15 @@ int vk_fmt_to_vk(int nvn_fmt, VkFormat *out);
 VkImage vk_tex_image(const tex_t *t);
 VkImageView vk_tex_view(const tex_t *t, const view_t *v);
 
+// 缓冲区贴图（NVN target 10 = TARGET_BUFFER）→ VkBufferView（texel buffer）。**不是** VkImage 那条路：
+// 这类贴图的存储就是内存池里的一段（width = 元素个数、格式给每元素字节），视图直接建在池缓冲上、零拷贝，
+// 描述符那一侧要写 VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER。非缓冲区贴图或建不出来时返回 VK_NULL_HANDLE。
+// A buffer texture (NVN target 10 = TARGET_BUFFER) -> a VkBufferView (a texel buffer). This is **not** the VkImage
+// path: such a texture's storage is a stretch of a memory pool (width is the element count, the format gives the
+// bytes per element), the view is built straight on the pool buffer with no copy, and the descriptor side has to
+// write VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER. Returns VK_NULL_HANDLE for anything else or on failure.
+VkBufferView vk_tex_bufview(const tex_t *t);
+
 // 取（必要时建）这个采样器的 VkSampler；失败返回 VK_NULL_HANDLE。按参数内容缓存——游戏会按值拷贝
 // NVNsampler 对象，同一个参数组合可能有多个对象，所以键是参数而不是对象。
 // Get (creating if needed) this sampler's VkSampler; VK_NULL_HANDLE on failure. Cached by the parameters: the game

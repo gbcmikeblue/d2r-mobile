@@ -31,6 +31,13 @@ VkDevice vk_dev(void);
 VkQueue vk_queue(void);
 uint32_t vk_queue_family(void);
 
+// 物理设备（没建起来时为 VK_NULL_HANDLE）：查设备限制与格式能力用——目前只有 texel buffer
+// （缓冲区贴图）需要它：VkBufferView 的偏移必须落在 minTexelBufferOffsetAlignment 的整数倍上。
+// The physical device (VK_NULL_HANDLE when bring-up failed): for querying device limits and format support -- today
+// only the texel buffer (a buffer texture) needs it: a VkBufferView's offset must be a multiple of
+// minTexelBufferOffsetAlignment.
+VkPhysicalDevice vk_phys(void);
+
 // 窗口（前端）那条队列：能呈现的族上多要一条，取不到就退回主队列。
 // 为什么要分开：Vulkan 要求同一条队列上的提交/等待/取图/上屏由调用方串行化，而客体（后台线程）与前端（主线程）
 // 天然是两个线程。只加一把锁实测会**互相堵死**：客体在队列调用里等驱动时仍持锁，前端就卡在取锁上（真机现场：

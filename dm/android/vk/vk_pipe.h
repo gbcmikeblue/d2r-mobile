@@ -111,6 +111,9 @@ VkBuffer vk_pipe_dummy_buffer(void);
 // slot.
 VkImageView vk_pipe_dummy_view(void);
 VkSampler vk_pipe_dummy_sampler(void);
+// 空白 texel 视图：缓冲区贴图（texel buffer）那条绑定的回退，见 vk_pipe.c。
+// A dummy texel view: the fallback for a buffer-texture (texel-buffer) binding, see vk_pipe.c.
+VkBufferView vk_pipe_dummy_bufview(void);
 
 // 合并后的绑定表（**布局顺序 = binding 升序**）。描述符写入必须按同一个顺序填动态偏移数组，
 // 所以这张表要能取出来，而不是在两边各算一次。

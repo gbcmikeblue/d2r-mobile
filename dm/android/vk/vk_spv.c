@@ -24,6 +24,12 @@ enum { OP_TYPE_IMAGE = 25, OP_TYPE_SAMPLER = 26, OP_TYPE_SAMPLED_IMAGE = 27, OP_
        OP_TYPE_FLOAT = 21, OP_TYPE_INT = 22, OP_TYPE_VECTOR = 23, OP_CONSTANT = 43,
        OP_DECORATE = 71, OP_VARIABLE = 59, OP_FUNCTION = 54 };
 
+// OpTypeImage 的 Dim 里我们只关心这一个：Buffer = 缓冲区贴图（Vulkan 那边是 texel buffer）。
+// 取值来自 SPIR-V 规范（Dim 枚举：1D 0 / 2D 1 / 3D 2 / Cube 3 / 2DArray 4 / Buffer 5 / …），不猜。
+// Of OpTypeImage's Dim we care about exactly one: Buffer = a buffer texture (a texel buffer in Vulkan).
+// The value is from the SPIR-V spec (the Dim enum: 1D 0 / 2D 1 / 3D 2 / Cube 3 / 2DArray 4 / Buffer 5 / ...), not guessed.
+enum { SPV_DIM_BUFFER = 5 };
+
 enum { DEC_BLOCK = 2, DEC_BUFFER_BLOCK = 3, DEC_BINDING = 33, DEC_SET = 34, DEC_LOCATION = 30 };
 
 // 输入变量（顶点属性）暂存：Location、结果类型 id，以及该类型是标量还是向量（分量类型取自标量声明）
@@ -42,6 +48,13 @@ typedef struct {
     uint32_t const_val[MAX_IDS];     // OpConstant 的值（32 位）| OpConstant value (32-bit)
     uint8_t has_const[MAX_IDS];
     uint8_t image_sampled[MAX_IDS];  // 图像类型 id -> sampled 字段
+    // 图像类型 id -> Dim 字段。**缓冲区贴图**（Dim = Buffer）全靠它认出来：
+    // 只按 OpTypeImage 的 sampled 判会把这种绑定当成普通的"合并采样器图像"，于是描述符写成
+    // 图像视图、管线布局也要图像——而驱动要的是 texel buffer（见下面的 kind_of）。
+    // Image type id -> its Dim operand. The **buffer texture** (Dim = Buffer) is recognised only through it: judging by
+    // OpTypeImage's sampled alone makes such a binding an ordinary "combined image sampler", so the descriptor and the
+    // pipeline layout would both ask for an image while the driver wants a texel buffer (see kind_of below).
+    uint8_t image_dim[MAX_IDS];
     uint8_t var_sc[MAX_IDS];         // 变量 id -> 存储类
     uint32_t var_type[MAX_IDS];      // 变量 id -> 结果类型
     uint8_t is_block[MAX_IDS], is_buffer_block[MAX_IDS];
@@ -54,7 +67,7 @@ typedef struct {
     int32_t in_loc[MAX_IDS];         // 输入变量 id -> Location（-1 = 没有，比如内建）
     uint8_t has_in[MAX_IDS];
 } spv_tab;
-static spv_tab t;   // 静态（约 80 KB）：扫描器只在装载时用，进程内一次一个 | static (~80 KB): the scanner runs at load time only, one module at a time
+static spv_tab t;   // 静态（约 145 KB）：扫描器只在装载时用，进程内一次一个 | static (~145 KB): the scanner runs at load time only, one module at a time
 
 static int kind_of(uint32_t type_id, uint32_t *count_out) {
     uint32_t t0 = type_id, count = 1;
@@ -78,8 +91,22 @@ static int kind_of(uint32_t type_id, uint32_t *count_out) {
             if (t.is_block[t0]) return VK_SPV_UBO;
             return VK_SPV_OTHER;
         }
-        if (op == OP_TYPE_IMAGE) return t.image_sampled[t0] == 2 ? VK_SPV_STORAGE_IMAGE : VK_SPV_IMAGE;
-        if (op == OP_TYPE_SAMPLED_IMAGE) return VK_SPV_SAMPLED_IMAGE;
+        // 缓冲贴图先判：Dim = Buffer 且只取样（sampled = 1）时，Vulkan 那边要的是 **texel buffer**
+        // （VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER + VkBufferView），不是图像视图。全库实测 2991 条这种绑定，
+        // sampled 全是 1（见 .work 的离线统计与提交说明），所以这一条判据不会有别的分支被它抢走。
+        // Buffer textures come first: with Dim = Buffer and sample-only (sampled = 1) Vulkan wants a **texel buffer**
+        // (VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER + VkBufferView) rather than an image view. Measured across the whole
+        // library, all 2991 such bindings have sampled = 1 (see the offline count in .work and the commit message), so
+        // this test steals no other case.
+        if (op == OP_TYPE_IMAGE) {
+            if (t.image_dim[t0] == SPV_DIM_BUFFER && t.image_sampled[t0] != 2) return VK_SPV_TEXEL;
+            return t.image_sampled[t0] == 2 ? VK_SPV_STORAGE_IMAGE : VK_SPV_IMAGE;
+        }
+        // OpTypeSampledImage 的 Dim 由下面解析时从它指向的那张图像**抄过来**（同一个字段），所以这里同样判得出来。
+        // OpTypeSampledImage's Dim is **copied over** from the image it points at while parsing below (same field), so
+        // it is just as easy to judge here.
+        if (op == OP_TYPE_SAMPLED_IMAGE)
+            return t.image_dim[t0] == SPV_DIM_BUFFER ? VK_SPV_TEXEL : VK_SPV_SAMPLED_IMAGE;
         if (op == OP_TYPE_SAMPLER) return VK_SPV_SAMPLER;
         return VK_SPV_OTHER;
     }
@@ -186,10 +213,25 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap,
             break;
         case OP_TYPE_IMAGE:
             // 结果 id、取样类型、维度、深度、数组、多重采样、sampled、格式 | result, sampled type, dim, depth, arrayed, ms, sampled, format
-            if (wc >= 8 && o[1] < MAX_IDS) { t.type_op[o[1]] = OP_TYPE_IMAGE; t.image_sampled[o[1]] = (uint8_t)o[7]; }
+            if (wc >= 8 && o[1] < MAX_IDS) {
+                t.type_op[o[1]] = OP_TYPE_IMAGE; t.image_sampled[o[1]] = (uint8_t)o[7];
+                t.image_dim[o[1]] = (uint8_t)o[3];      // Dim：Buffer(=5) 就是缓冲区贴图 | Dim: Buffer (=5) means a buffer texture
+            }
             break;
         case OP_TYPE_SAMPLED_IMAGE:
-            if (wc >= 2 && o[1] < MAX_IDS) t.type_op[o[1]] = OP_TYPE_SAMPLED_IMAGE;
+            // 结果 id、图像类型 id。把图像那一侧的 Dim 抄到这个 id 上——于是"samplerBuffer"这种
+            // OpTypeSampledImage 也能在 kind_of 里一眼认出是 texel buffer，不必再存一张映射表。
+            // **实测这条抄法安全**：全库 6923 份产物里 OpTypeSampledImage 指向的 OpTypeImage 共 12111 次、
+            // **全部先于它出现**（0 次例外），所以扫到这里时那个 Dim 一定已经在了（离线统计，见提交说明）。
+            // Result id, image type id. The image side's Dim is copied onto this id, so even an OpTypeSampledImage
+            // ("samplerBuffer") is recognisable as a texel buffer in kind_of without keeping a second mapping table.
+            // **Measured safe**: across all 6923 artifacts the OpTypeImage an OpTypeSampledImage points at occurs
+            // 12111 times and **always earlier** (0 exceptions), so the Dim is guaranteed to be there when we get here
+            // (offline count; see the commit message).
+            if (wc >= 3 && o[1] < MAX_IDS) {
+                t.type_op[o[1]] = OP_TYPE_SAMPLED_IMAGE;
+                if (o[2] < MAX_IDS) t.image_dim[o[1]] = t.image_dim[o[2]];
+            }
             break;
         case OP_TYPE_SAMPLER:
             if (wc >= 2 && o[1] < MAX_IDS) t.type_op[o[1]] = OP_TYPE_SAMPLER;
