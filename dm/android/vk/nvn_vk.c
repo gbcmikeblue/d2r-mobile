@@ -1237,7 +1237,8 @@ static const vk_shader *desc_stage_of(const vk_shader *const *sh, int n, uint32_
 // support_buf in nvn_mtl.m): render_scale must be 1, or the shader scales by 0 and not a pixel lands.
 #define BANK_BYTES (64u << 10)
 #define SUPPORT_RENDER_SCALE_OFF 192   // MSL 布局实测（与苹果侧注释同源）：render_scale float4[73]，取 .x | measured MSL layout (same source as Apple's note): render_scale float4[73], take .x
-static VkBuffer g_bank[2];             // 0 = support_buffer、1 = 全零（c1 与驱动段）| 0 = support_buffer, 1 = all zero (c1 and the driver bank)
+static VkBuffer g_bank[3];             // 0 = support_buffer、1 = c1/c2（暂全零）、2 = 驱动段 c0（存储缓冲地址表，活的）| 0 = support_buffer, 1 = c1/c2 (all zero for now), 2 = driver segment c0 (the live storage-buffer address table)
+static uint8_t *g_bank_map[3];         // c0 的长期映射（见 bank_get）| c0's long-lived mapping (see bank_get)| 0 = support_buffer, 1 = all zero (c1 and the driver bank)
 static VkBuffer bank_get(int which) {
     if (g_bank[which]) return g_bank[which];
     vk_device_init();
@@ -1261,12 +1262,32 @@ static VkBuffer bank_get(int which) {
     if (vkMapMemory(vk_dev(), m, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
         memset(p, 0, BANK_BYTES);
         if (!which) for (int i = 0; i < 73; i++) *(float *)((uint8_t *)p + SUPPORT_RENDER_SCALE_OFF + 16 * i) = 1.0f;
-        vkUnmapMemory(vk_dev(), m);
+        // c0 是**活的表**（游戏每绑一个存储缓冲就要往里写地址），所以它长期保留映射；其余两块建好即封存。
+        // c0 is a **live table** (an address is written into it whenever the game binds a storage buffer), so it keeps its
+        // mapping; the other two are sealed once filled.
+        if (which == 2) g_bank_map[which] = (uint8_t *)p; else vkUnmapMemory(vk_dev(), m);
     }
     g_bank[which] = b;
-    LOG("[vk] 特殊常量段 %s 就绪（%u 字节）：%s", which ? "c1 / 驱动段" : "support_buffer", (unsigned)BANK_BYTES,
-        which ? "c1 的真实数据在控制段里，暂以全零代替" : "render_scale = 1");
+    const char *nm = which == 2 ? "驱动段 c0（存储缓冲地址表）" : (which ? "c1 / c2（常量与句柄段）" : "support_buffer");
+    LOG("[vk] 特殊常量段 %s 就绪（%u 字节）：%s", nm, (unsigned)BANK_BYTES,
+        which == 2 ? "按阶段基址 0x110/0x510/0x310 填已绑存储缓冲的地址" : (which ? "暂以全零代替" : "render_scale = 1"));
     return b;
+}
+
+// 把某个阶段某个槽的存储缓冲地址写进驱动段 c0 的地址表。
+// 为什么需要：着色器不直接拿"存储缓冲槽 N"，而是从 c0 的表里读地址（表在各阶段的固定基址：顶点 0x110、像素 0x510、
+// 计算 0x310，每槽 0x10 字节）。不填这张表，读到的就是 0 —— 现场里 `binding 25（uniform buffer）槽解析 0` 就是它。
+// Write a stage/slot storage-buffer address into driver segment c0's address table.
+// Why it is needed: a shader does not get "storage buffer slot N" directly, it reads the address out of c0's table (which sits
+// at a fixed base per stage: vertex 0x110, pixel 0x510, compute 0x310, 0x10 bytes per slot). Leave it unfilled and the shader
+// reads 0 -- which is exactly the `binding 25 (uniform buffer) slot 0` case on the device.
+static void drv_c0_set(int stg, int idx, uint64_t addr) {
+    static const uint32_t c0_base[6] = { 0x110, 0x510, 0, 0, 0, 0x310 };   // 0=顶点 1=像素 5=计算（其余阶段未实测）| 0 = vertex, 1 = pixel, 5 = compute (the rest unmeasured)
+    if (stg < 0 || stg >= 6 || !c0_base[stg] || idx < 0 || idx >= 16) return;
+    if (!g_bank_map[2] && !bank_get(2)) return;
+    uint8_t *p = g_bank_map[2];
+    if (!p) return;
+    memcpy(p + c0_base[stg] + (size_t)idx * 16, &addr, 8);
 }
 
 // 缓冲类绑定的地址与长度：UBO 直接来自 c 槽，SSBO 先看有没有直接绑（游戏用 BindStorageBuffer），
@@ -1287,9 +1308,12 @@ static int desc_buf_range(const vk_shader *sh, const vk_pipe_bind *b, uint64_t *
         // no cbuf entry at all means Ryujinx's support_buffer. The rule comes from where Apple gets it: reflect() in
         // dm/gfx/tools/dmsh_build.py.
         int slot = desc_cbuf_slot(sh, b->binding);
-        if (slot < 0 || slot == 2 || slot == 1) {
+        // 名字号 0 → 驱动段 c0（存储缓冲地址表）、1 → c1、2 → c2；没有 cbuf 条目 → support_buffer。都不是"游戏绑的 UBO"。
+        // A name number of 0 is driver segment c0 (the storage-buffer address table), 1 is c1 and 2 is c2; no cbuf entry at
+        // all is support_buffer. None of them is a UBO the game binds.
+        if (slot <= 2) {
             if (!host_buf) return 0;
-            *host_buf = bank_get(slot == 2 ? 1 : (slot == 1 ? 1 : 0));
+            *host_buf = bank_get(slot == 0 ? 2 : (slot >= 1 ? 1 : 0));
             if (!*host_buf) return 0;
             *addr = 0; *size = BANK_BYTES;
             return 1;
@@ -2037,6 +2061,7 @@ void mtl_exec(const uint8_t *p) {
                 } else if (h.op == OP_BIND_SSBO && idx < 128) {
                     g_rs.ssbo[stg][idx].addr = b->addr; g_rs.ssbo[stg][idx].size = b->size;
                     g_rs.ssbo_have[stg][idx >> 6] |= 1ull << (idx & 63);
+                    drv_c0_set(stg, idx, b->addr);   // 同时写进驱动段 c0 的地址表（着色器是从那张表里读地址的）| also write it into driver segment c0's address table (shaders read the address from there)
                 }
             }
             atomic_fetch_add(&g_shadow_n, 1);
