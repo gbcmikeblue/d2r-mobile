@@ -602,8 +602,10 @@ After each milestone, tick it off here and record the conclusion.
 1. Turn the bind ops into **shadow state** ✓ (70% of the stream; binds only record state and cost almost nothing);
 2. The texture layer ✓ (format table, serial-keyed table, deswizzle upload, direct CPU read);
 3. Render-state shadow plus the pass machinery ✓ (`CLEAR` reaches the GPU for the first time);
-4. Shader loading ✓ (step 8 below) -> next, land `DRAW` / `DRAW_IDX` as real pipelines (pipeline layout, descriptor sets, vertex input);
-5. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it).
+4. Shader loading ✓ (step 8 below);
+5. The pipeline layer ✓ (step 9 below: descriptor set layouts, pipeline layouts, compute pipelines, graphics pipelines);
+6. The replay layer's shadow binding storage plus the state interpretation -> really issuing `DRAW` / `DRAW_IDX` (**next**);
+7. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it).
 
 One **known latent issue** is recorded in the commit message: on Android `crash.c` always passes `is_write = 0`, and the dirty-page fault hook looks at that bit first, so a write to a write-protected page inside a pool walks into the crash path. The crash report already prints the faulting instruction encoding, which is what a correct read/write decision needs.
 
@@ -658,3 +660,78 @@ about 7x faster** (122 vs 17.9 MB/s), so a tar pays off only when deploying **re
 (13,848 files in 1.9 s, f2fs plus toybox tar). The two ways are indistinguishable at run time -- both end up as ordinary
 files with the same names -- so **no packing or indexing code was written for either**. The cached tar lives at
 `.work/spv.tar` (covered by `.gitignore`; it contains shaders and must never enter the repository).
+
+### M2 step 9: the pipeline layer (descriptor set layouts + compute pipelines + graphics pipelines)
+
+**What this step really produced is three decisions about who is authoritative**:
+
+- **A descriptor set layout must cover every binding a shader uses, and `<key>.res.json` does not necessarily list them
+  all** -- it says where a resource's data comes from, not which type a binding has in the SPIR-V. Evidence: 3 of 22
+  compute pipelines failed to build (`VkResult -13` = `VK_ERROR_UNKNOWN`); reading the bindings **declared** in the
+  failing shaders' `.spv` and comparing showed all three additionally declare a uniform block at `set0/b0` that is
+  **actually used** and that res.json has no entry for; the counter-example is a passing shader from the same batch that
+  also declares an extra b0 but never uses it, so it builds. What was missing is **coverage**, not validation (the driver
+  does not compare layout types entry by entry).
+- So a **SPIR-V declaration scanner** was added, `dm/android/vk/vk_spv.{h,c}`: it walks declarations only (annotations /
+  types / variables, stopping at the first `OpFunction`) and reads each descriptor variable's set, binding and **kind**.
+  `vk_shader.c` scans once **at load time** and keeps the list (the SPIR-V bytes are dropped right after, which is the
+  only moment it can be done); layouts are built **from that list**, and res.json returns to its role of saying where the
+  data comes from.
+- The cross-check produced a tidy number: **6923 bindings present in the SPIR-V but absent from res.json, exactly one
+  per shader** -- the b0 block the translator injects.
+
+**Two bugs, both surfaced by two independent implementations disagreeing** (worth recording: that route proved far more
+effective than reading logs):
+
+- The word count of `OpDecorate` **varies**: `Binding` / `DescriptorSet` carry one operand (4 words) while
+  **`Block` / `BufferBlock` do not** (3 words). Requiring 4 everywhere skipped both decorations wholesale -- on the device
+  that showed up as "every struct kind unrecognised" (uniform / storage buffers -> other) while image kinds were all
+  correct (they come from the type declarations, not from decorations), and that combination is what exposed it.
+- In SPIR-V 1.0-1.2 a storage buffer is the `Uniform` storage class with the `BufferBlock` decoration, not
+  `StorageBuffer` (from 1.3 on) -- the first scanner labelled every SSBO in the library as a UBO, and the first
+  conclusion drawn from those wrong labels was wrong.
+
+**Mappings** (the same semantics as Apple's): uniform buffer -> `UNIFORM_BUFFER_DYNAMIC`, storage buffer ->
+`STORAGE_BUFFER_DYNAMIC` (the data already sits in the zero-copy pools and only the offset changes per draw, which is what
+Apple's `setBuffer:offset:` means), texture -> `COMBINED_IMAGE_SAMPLER`, writable image -> `STORAGE_IMAGE`; there are no
+array bindings in the library (all 44,156 measured `array` fields are 1), so `descriptorCount` is 1.
+
+**The vertex attribute correspondence**: a graphics pipeline must supply an attribute for **every** input a shader
+declares (one missing and creation fails), and that information is in neither `.res.json` nor `shader_map.tsv`. The route
+taken is to read the **input variables** out of the SPIR-V too (Location plus component count/type) and then check whether
+"slot number" and "NVN attribute number" share a domain: in `shader_facts.tsv` (the translator's answer table, which gives
+component types per slot) the library has **11,166 attributes and the largest slot number that appears is 7**, inside the
+NVN attribute range (0..15) -> proceed on **location == NVN attribute number**, with a **runtime format cross-check** (the
+guest's vertex format against the answer table's component type) so that a wrong assumption is reported at the first draw.
+
+**On the device** (`dm/android/vk/vk_pipe_probe.c`):
+
+```
+descriptor set layouts / pipeline layouts: 6923 succeeded, 0 failed (334 distinct after deduplication by content)
+compute pipelines: 22 succeeded, 0 failed
+graphics pipelines (one per vertex shader, attributes via the constant fallback): 60 tried, 60 succeeded
+cross-check: 6923 bindings present in the SPIR-V but absent from res.json
+took 4.2 s
+```
+
+**Known gaps (handled in layers, all logged, none silent)**:
+
+| gap | status | evidence and impact |
+|---|---|---|
+| non-solid polygon modes | **closed** | the core feature `fillModeNonSolid` is asked for and enabled (present on the device) and the mode passes through; wireframe-like draws only, ordinary rendering is solid anyway |
+| per-instance vertex stream step > 1 | **closed** | `VK_EXT_vertex_attribute_divisor` is enabled (present on the device, and with `divisor=0`), so the step passes through and NVN's "constant stream" (stride 0) finally has its correct expression (one element per instance, not advancing per vertex) instead of borrowing the constant fallback |
+| `descriptorCount` hardcoded to 1 | **closed** | now reads the element count the SPIR-V declares (an `OpTypeArray`'s length constant); the library has **0 array bindings** measured so behaviour is unchanged, but "it happens not to be an array" became "we can tell whether it is" |
+| silent graphics pipeline cache eviction | **closed** | eviction warns once; frequent eviction means the state combinations are too scattered and worth a second look |
+| vertex attribute component class | **fallback added** | when a pipeline is built, the shadow format's component class (float/uint/sint) is compared with the input type the shader declares and a mismatch warns once -- "location == attribute number" above is an **assumption**, and if it is wrong the vertex data attaches to the wrong slots **without any error**, so this check makes it visible at the first draw |
+| dummy buffer for the constant fallback | **in place** | `vk_pipe_dummy_buffer()` lazily creates a 64 KB all-zero vertex buffer, bound at `VK_PIPE_DUMMY_BIND` by a draw (a fallback attribute advances one element per instance and the instance count is the game's, so 16 bytes would not do) |
+| four primitives without counterparts | **measured before deciding** | `vk_topo_of` accumulates a draw count per primitive number (`vk_pipe_prim_counts`) so the device answers whether they appear, and the expansion is decided then; the counters are read-only and change nothing |
+| only set 0 layouts | unchanged | every binding in the library is in set 0 (all 6923 pass); another set would be reported in red and the multi-set machinery waits until it is needed |
+| stencil masks in the pipeline key | unchanged | Apple's `pso_key` carries `vm`/`wm` the same way, so the behaviour matches and is not a defect |
+
+The device-ready line gained two capabilities along with it (Adreno 830): `non-solid fill: yes; per-instance vertex
+step: yes (with 0)`.
+
+**Next**: the replay layer's shadow binding storage (`vattr/vstream/vbuf/ubo/ssbo/tex/samp`) and the state interpretation
+(the `color/chmask/ms/poly/ds` bit-field groups -> `vk_gfx_state`, with blend stored per target via `blend_st.target`),
+then really issuing `DRAW` / `DRAW_IDX` (descriptor writes plus vertex buffer binding), and then **reading one frame back
+offscreen** to look at it.
