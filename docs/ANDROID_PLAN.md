@@ -299,6 +299,23 @@ the rewriter's output are pushed with `adb push` to `/data/local/tmp/dm/{dmhost,
 `./dmhost ./patched main sdk` is run from `/data/local/tmp/dm`. Packaging an APK waits until after M2, when
 there is something to show.
 
+**Where the game resources (the 8.3 GB RomFS) live**: not inside the workspace. The Android entry point
+`main_android.c` **probes candidates in order**, uses the first hit and logs the chosen path (`romfs: <path>`);
+the caller can still point at it directly with `DM_ROMFS`. Order (earlier wins):
+
+1. **`/data/local/d2rm/romfs`** -- the intended spot, but **measured unusable on this device**: `/data/local` is
+   `drwxr-x--x root:root` and the `shell` user cannot create a subdirectory in it (`mkdir: Permission denied`).
+   Android has locked down `/data/local`, which is exactly why `/data/local/tmp` exists.
+2. **`<root>/romfs`, `<root>/data/romfs`** -- the early convention, with resources inside the workspace.
+3. **`/sdcard/d2rm/romfs`, `/sdcard/Download/d2rm/romfs`** -- the **only place that both survives a reboot and is
+   writable by `shell`** (`/sdcard` -> `/storage/self/primary`, `mkdir` succeeds in testing); the cost is going
+   through FUSE, so loading is a bit slower.
+
+"Probe in order, use the first hit" rather than hard-coding one path is what makes a directory change a matter of
+**moving files only, with no host change**. Moving between directories on the same partition (e.g. `<root>/romfs`
+to elsewhere on it) is a rename and takes no time; between `/data/local/tmp` and `/sdcard` it is a real copy
+(8.3 GB, about 2-4 minutes on the device, still faster than re-pushing from the computer).
+
 **M1 conclusion**: the acceptance criterion -- "the host runs and the log shows the game's `UNIMPL` lines" --
 is met, and exceeded all the way to `nnMain`. Next comes M2.
 
@@ -546,3 +563,37 @@ The port is currently being driven from a Windows machine. These are the traps a
 
 Proceed in the order on this page: finish the rest of M0 (SDK/NDK + device), then Recon A and Recon B, then M1.
 After each milestone, tick it off here and record the conclusion.
+
+---
+
+## 8. Progress log
+
+**M0 / M1 -- done**
+
+| Milestone | Conclusion |
+|---|---|
+| M0 SDK/NDK + device | Toolchain and device ready (Redmi K90 / Adreno 830 / Android 16 / arm64-v8a) |
+| M1 host compiles | The `dm/android` project with the NDK toolchain -> host layer at **0 errors**, 88 object files, `libdmhost_android.a` |
+| M1 device acceptance | Loads the rewritten output, applies the service-layer take-overs, finishes SDK initialisation, enters `nnMain`, and the log shows the game's `UNIMPL` lines |
+
+**M2 -- in progress (Vulkan replay layer); every line below was measured on the real device**
+
+| Step | Conclusion |
+|---|---|
+| 1 Vulkan path and memory model | Adreno 830 / Vulkan 1.3.284 / zero-copy memory type 4, working CPU<->GPU both ways |
+| 2 Zero-copy memory pool, both directions | **Risk number one** of the feasibility analysis, the "unified memory" assumption, verified on a device |
+| 3 Pool design settled | This device has **no `VK_EXT_external_memory_host`**, so Vulkan backs the guest address space instead: exportable memory -> fd -> `mmap(MAP_FIXED)` back at the same address. The per-allocation limit is 3968 MB > the 3728 MB guest heap, commit is lazy, and binding buffers at page-aligned offsets works both ways |
+| 3 Overlay implemented | The 3968 MB heap and 512 MB alias region are directly GPU-visible; `SetHeapSize 3728 MB` still succeeds and boot reaches `nnMain` |
+| Replay layer, first batch | Pool registration plus address lookup (pools #1..#7 all registered on the device, no failures) |
+| Three start-up defects | (1) the NVN implementation table registered nothing on ELF (Mach-O section name) -> **0 semantic to 203**; (2) the xattr name broke Linux's rules -> `user.` prefix; (3) the `clonefile` stand-in copied single files -> recursive (with xattrs) |
+| Front-end sig=11 | Root cause: a **96 KB guest thread stack**, sized for the original libc, was overrun by the host's bionic (the push landed on the PROT_NONE page below the stack) -> `MapMemory` opens a 1 MB margin on the side the stack grows. After the fix: **5285 frames over 177 seconds with no crash**, and the graceful SIGTERM shutdown completes |
+| Replay submission machinery | Eight rotating slots with fences and a command stream interpreter (a small program shaped like the Metal one); CPU-visible effects fire in fence order. 4179 frames on the device with no crash |
+| Op distribution, measured | About 8 million ops per window: `BIND_STATE` 27.8% / `BIND_UBO` 21.9% / `STENCIL` 10.3% / `BIND_TEX` 5.3% / `BIND_VBUF` 5.2% (the top five are 70.5%, all of them state and resource binds) |
+
+**Next, in the order the measurements dictate**
+
+1. Turn the bind ops into **shadow state** (70% of the stream; binds only record state and cost almost nothing);
+2. Land `SET_RT` / `CLEAR` / `DRAW` / `DRAW_IDX` as real render passes (low frequency, but they decide the picture);
+3. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it).
+
+One **known latent issue** is recorded in the commit message: on Android `crash.c` always passes `is_write = 0`, and the dirty-page fault hook looks at that bit first, so a write to a write-protected page inside a pool walks into the crash path. The crash report already prints the faulting instruction encoding, which is what a correct read/write decision needs.

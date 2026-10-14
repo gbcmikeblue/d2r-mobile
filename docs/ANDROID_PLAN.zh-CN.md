@@ -295,6 +295,20 @@ nninitInitializeSdkModule
 `/data/local/tmp/dm/{dmhost, patched/}`，然后在 `/data/local/tmp/dm` 下执行 `./dmhost ./patched main sdk`。
 打成 APK 留到 M2 之后（那时才有画面）。
 
+**游戏资源（8.3 GB RomFS）放哪**：不进工作区，由安卓入口 `main_android.c` **按候选顺序自动探测**，找到即用并把
+选中的路径打进日志（`romfs: <路径>`）；调用方仍可用 `DM_ROMFS` 直接指定。候选顺序（前面的优先）：
+
+1. **`/data/local/d2rm/romfs`** —— 本想要的位置，但**实测本机不可用**：`/data/local` 是 `drwxr-x--x root:root`，
+   `shell` 用户建不了子目录（`mkdir: Permission denied`）。安卓已经把 `/data/local` 收紧，这也正是
+   `/data/local/tmp` 存在的原因。
+2. **`<根>/romfs`、`<根>/data/romfs`** —— 早期约定（资源放在工作区里）。
+3. **`/sdcard/d2rm/romfs`、`/sdcard/Download/d2rm/romfs`** —— **唯一「重启不丢且 shell 可写」的位置**
+   （`/sdcard` → `/storage/self/primary`，实测 `mkdir` 成功）；代价是走 FUSE，加载稍慢。
+
+做成「按顺序找、找到即用」而不是写死一个路径，就是为了换目录时**只管搬文件、宿主不用改**。搬动同分区的
+（如 `<根>/romfs` → 别处同分区）是改名、秒级完成；`/data/local/tmp` 与 `/sdcard` 之间是不同文件系统，
+只能实拷（8.3 GB，设备内拷约 2～4 分钟，比从电脑重推快）。
+
 **M1 结论**：验收判据「宿主跑起来、日志出现游戏的 `UNIMPL`」已达成，并超出到 `nnMain`。下一步进入 M2。
 
 ### M2 第 1 步：Vulkan 通路与内存模型实测（2026-10-14）
@@ -519,3 +533,37 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
 
 按本页顺序推进：先把 M0 剩下的部分（SDK/NDK + 真机）补齐，再做探路 A、探路 B，然后进 M1。
 每完成一个里程碑，在这里回勾并记录结论。
+
+---
+
+## 八、进度记录
+
+**M0 / M1 —— 已完成**
+
+| 里程碑 | 结论 |
+|---|---|
+| M0 SDK/NDK + 真机 | 工具链与真机就绪（Redmi K90 / Adreno 830 / Android 16 / arm64-v8a） |
+| M1 宿主编译 | `dm/android` 工程 + NDK 工具链 → 宿主层 **0 错误**，88 个目标文件，`libdmhost_android.a` |
+| M1 真机验收 | 装载改写产物、接管服务层、跑完 SDK 初始化、进 `nnMain`，日志出现游戏的 `UNIMPL` |
+
+**M2 —— 进行中（Vulkan 回放层），以下每条都有真机实测**
+
+| 步骤 | 结论 |
+|---|---|
+| 1 Vulkan 通路与内存模型 | Adreno 830 / Vulkan 1.3.284 / 零拷贝内存类型 4，CPU↔GPU 双向通 |
+| 2 零拷贝内存池双向验证 | 可行性分析里的**头号风险**「统一内存」在真机上验完 |
+| 3 内存池落法定型 | 本机**没有 `VK_EXT_external_memory_host`** → 改成由 Vulkan 铺客体地址空间：可导出内存 → 取 fd → `mmap(MAP_FIXED)` 压回原地址。单次分配上限 3968 MB > 客体堆 3728 MB ✓，惰性提交、页对齐偏移绑缓冲双向通 |
+| 3 内存换轨落地 | 堆 3968 MB、别名区 512 MB 已是 GPU 直接可见；`SetHeapSize 3728 MB` 照旧，引导进 `nnMain` |
+| 回放层第一批 | 池子登记 + 地址反查（真实池子 #1…#7 全部登记、零报红） |
+| 启动缺陷三个 | ① NVN 实现表在 ELF 上登记不上（Mach-O 段名）→ **语义 0 → 203**；② xattr 名不合 Linux 规矩 → 加 `user.` 前缀；③ `clonefile` 替身只拷单文件 → 改递归（含 xattr） |
+| 前端 sig=11 | 根因：客体按原版 libc 量的 **96 KB 线程栈**被宿主 bionic 压穿（压栈落进栈底 PROT_NONE 页）→ `MapMemory` 在栈长一侧多放开 1 MB。修复后 **5285 帧 / 177 秒无崩溃**，SIGTERM 优雅退出走完 |
+| 回放层提交机制 | 提交槽（8 个轮转）+ 栅栏 + 命令流解释器（与 Metal 侧同形的小程序）；CPU 可见副作用按栅栏时序生效。真机 4179 帧无崩溃 |
+| op 分布实测 | 每窗口约 800 万条：`BIND_STATE` 27.8% / `BIND_UBO` 21.9% / `STENCIL` 10.3% / `BIND_TEX` 5.3% / `BIND_VBUF` 5.2%（前五合计 70.5%，全是状态与资源绑定） |
+
+**下一步（按实测频次排序）**
+
+1. 绑定类 op 做成**影子状态**（占 70%，绑定只是记状态、几乎免费）；
+2. `SET_RT` / `CLEAR` / `DRAW` / `DRAW_IDX` 落到真正的渲染通道（频次低但决定画面）；
+3. **离屏读回**一帧写盘确认画面（当前没有窗口，这是唯一能"看见"的办法）。
+
+另有一处**已知潜伏**（已记在提交说明里）：安卓 `crash.c` 的 `is_write` 恒为 0，而脏页跟踪的缺页钩子先看这一位，所以池内被写保护的页一旦被写会走崩溃路径；现场诊断已能读出出错指令编码，据此可正确判读读/写。

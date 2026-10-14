@@ -53,12 +53,35 @@ int main(int argc, char **argv) {
     snprintf(buf, sizeof buf, "%s/save", root); mkdir_if_needed(buf);
     snprintf(buf, sizeof buf, "%s/temp", root); mkdir_if_needed(buf);
 
-    // RomFS：调用方可以自己用 DM_ROMFS 指；否则看 <根>/romfs 在不在
-    // RomFS: the caller may point at it with DM_ROMFS; otherwise look for <root>/romfs
+    // RomFS：调用方可以自己用 DM_ROMFS 指；否则按候选顺序自动探测，**前面的优先**，并把选中的那个打出来。
+    //   ① /data/local/d2rm/romfs    首选：与 /data/local/tmp 同分区（快），而且不是 /data/local/tmp 那种
+    //                               可能被系统清理的临时目录，重启也不丢
+    //   ② <根>/romfs、<根>/data/romfs   早期约定：资源放在工作区里
+    //   ③ /sdcard/d2rm/romfs、/sdcard/Download/d2rm/romfs   最保险的持久位置、手机文件管理器里能直接看到
+    //                                （走 FUSE，加载会稍慢）
+    // 目录约定会随部署方式变（见 docs/ANDROID_PLAN 的部署一节），所以这里做成"按顺序找、找到即用"，
+    // 换目录时只管搬文件，宿主不用改。
+    // RomFS: the caller may point at it with DM_ROMFS; otherwise candidates are probed in this order (earlier
+    // ones win) and the chosen one is printed.
+    //   1. /data/local/d2rm/romfs      preferred: same partition as /data/local/tmp (fast), and not a temp-style
+    //                                 directory like /data/local/tmp that the system may clean, so it survives a reboot
+    //   2. <root>/romfs, <root>/data/romfs   the early convention, where resources live inside the workspace
+    //   3. /sdcard/d2rm/romfs, /sdcard/Download/d2rm/romfs   the safest persistent places, visible in the phone's
+    //                                 file manager (over FUSE, so loading is a bit slower)
+    // The convention follows the deployment method (see the deployment section of docs/ANDROID_PLAN), so this
+    // looks them up in order and uses the first hit: changing directories only means moving files, with no host
+    // change needed.
     if (!getenv("DM_ROMFS")) {
-        snprintf(buf, sizeof buf, "%s/romfs", root);
-        if (exists(buf)) { setenv("DM_ROMFS", buf, 1); fprintf(stderr, "romfs: %s\n", buf); }
-        else fprintf(stderr, "romfs: 【黄】没找到 %s，也没有 DM_ROMFS——资源读不到（先跑通到 UNIMPL 不受影响）\n", buf);
+        char c_ws[4096], c_wsdata[4096];
+        snprintf(c_ws, sizeof c_ws, "%s/romfs", root);
+        snprintf(c_wsdata, sizeof c_wsdata, "%s/data/romfs", root);
+        const char *cands[] = { "/data/local/d2rm/romfs", c_ws, c_wsdata,
+                                "/sdcard/d2rm/romfs", "/sdcard/Download/d2rm/romfs" };
+        for (unsigned i = 0; i < sizeof cands / sizeof cands[0]; i++)
+            if (exists(cands[i])) { setenv("DM_ROMFS", cands[i], 1); fprintf(stderr, "romfs: %s\n", cands[i]); break; }
+        if (!getenv("DM_ROMFS"))
+            fprintf(stderr, "romfs: 【黄】候选目录都没有（/data/local/d2rm/romfs、%s、/sdcard/d2rm/romfs…），"
+                            "也没有 DM_ROMFS——资源读不到（先跑通到 UNIMPL 不受影响）\n", c_ws);
     }
 
     // 存档：宿主不设 DM_SAVE 会报红中止（它必须指向本局可写的那份），这里给 <根>/save 作缺省——
