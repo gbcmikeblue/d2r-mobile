@@ -278,6 +278,7 @@ Download our prebuilt "shell" package (`D2RMobile-shell.ipa`), which contains no
 | [docs/MAC.md](docs/MAC.md) | Playing on a Mac: building the macOS App, key mapping, known gaps |
 | [docs/ANDROID.md](docs/ANDROID.md) | Porting to Android: is it feasible, what can be reused, what has to be redone, the risks and the suggested path |
 | [docs/ANDROID_PLAIN.md](docs/ANDROID_PLAIN.md) | The same analysis in plain language, for readers who do not work with code |
+| [docs/ANDROID_PLAN.md](docs/ANDROID_PLAN.md) | The Android port implementation plan: milestones and a checkable task list |
 | [docs/DERIVED.md](docs/DERIVED.md) | Game-related material in this repository: what is here, what is not, and why |
 
 ## Legal

@@ -171,5 +171,6 @@ In one sentence: **feasibility is high and the reuse rate is high, but the core 
 - The graphics layer and the shader translation chain: [../dm/gfx/README.md](../dm/gfx/README.md).
 - Building without a Mac (the existing precedent for cross-platform packaging): [NO_XCODE.md](NO_XCODE.md).
 - The plain-language explanation: [ANDROID_PLAIN.md](ANDROID_PLAIN.md).
+- How to start, in which stages, and what each stage verifies: [ANDROID_PLAN.md](ANDROID_PLAN.md).
 
 The conclusions here come from a source-code review of `dm/host`, `dm/gfx`, `dm/ios` and `dm/third_party`; when it comes to implementation, the header comments of each file and [DERIVED.md](DERIVED.md) are authoritative.

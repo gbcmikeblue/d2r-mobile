@@ -278,6 +278,7 @@ dm/tools/mac_app.sh        # 产出 ~/dm-work/out/macapp/D2R Mobile.app
 | [docs/MAC.zh-CN.md](docs/MAC.zh-CN.md) | 在 Mac 上玩：构建 macOS App、键位、已知不足 |
 | [docs/ANDROID.zh-CN.md](docs/ANDROID.zh-CN.md) | 安卓移植：是否可行、能复用什么、要重做什么、风险与建议路线 |
 | [docs/ANDROID_PLAIN.zh-CN.md](docs/ANDROID_PLAIN.zh-CN.md) | 上面那份分析的通俗版，给不写代码的读者 |
+| [docs/ANDROID_PLAN.zh-CN.md](docs/ANDROID_PLAN.zh-CN.md) | 安卓移植的实施计划：里程碑与可勾选的任务清单 |
 | [docs/DERIVED.zh-CN.md](docs/DERIVED.zh-CN.md) | 仓库里与游戏有关的东西：有什么、没有什么、为什么 |
 
 ## 声明

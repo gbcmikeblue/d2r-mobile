@@ -171,5 +171,6 @@ Switch 原版着色器包
 - 图形层与着色器翻译链：见 [../dm/gfx/README.zh-CN.md](../dm/gfx/README.zh-CN.md)。
 - 无 Mac 的构建路线（跨平台打包的既有先例）：见 [NO_XCODE.zh-CN.md](NO_XCODE.zh-CN.md)。
 - 想看通俗解释：见 [ANDROID_PLAIN.zh-CN.md](ANDROID_PLAIN.zh-CN.md)。
+- 想知道具体怎么开工、分几步、每步验收什么：见 [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md)。
 
 本页的结论基于对 `dm/host`、`dm/gfx`、`dm/ios` 与 `dm/third_party` 的源码核查；具体到实现时，请以各文件开头的注释与 [DERIVED.zh-CN.md](DERIVED.zh-CN.md) 的说明为准。
