@@ -56,6 +56,7 @@ add_library(dmhost_android STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_tex.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_spv.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
@@ -126,7 +127,7 @@ target_include_directories(t_digest PRIVATE ${COMPAT})
 # Self-check of the shader artifacts: create a VkShaderModule for every <key>.spv and parse the matching
 # res.json. These are the only two things verifiable independently before pipelines exist -- whether the driver
 # accepts the SPIR-V and whether the reflection parses.
-add_executable(vk_shader_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c)
+add_executable(vk_shader_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_spv.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c)
 target_link_libraries(vk_shader_probe PRIVATE vulkan)
 target_link_options(vk_shader_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk_shader_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DM}/host ${COMPAT})
@@ -137,7 +138,7 @@ target_include_directories(vk_shader_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} $
 # library (handing the reading of "which type is this binding number, which stage owns it" to the driver) and a
 # compute pipeline for every compute shader (needing no render state, which makes this the only place the chain can
 # be closed before the shadow state is complete).
-add_executable(vk_pipe_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c)
+add_executable(vk_pipe_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_spv.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c)
 target_link_libraries(vk_pipe_probe PRIVATE vulkan)
 target_link_options(vk_pipe_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk_pipe_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DM}/host ${COMPAT})

@@ -36,6 +36,7 @@ int main(void) {
     DIR *d = opendir(dir);
     if (!d) { printf("【红】打不开目录\n"); return 2; }
     uint32_t nsh = 0, ncs = 0, nlay = 0, npipe = 0;
+    uint32_t miss_total = 0, miss_shown = 0;   // 交叉核对：SPIR-V 有、res.json 没有的绑定数 | cross-check: bindings in the SPIR-V but not in res.json
     uint32_t fail_dsl = 0, fail_pipe = 0;
     char first_dsl_bad[32] = "", first_pipe_bad[32] = "";
     uint64_t binds = 0;
@@ -55,10 +56,43 @@ int main(void) {
             if (!first_dsl_bad[0]) snprintf(first_dsl_bad, sizeof first_dsl_bad, "%s", key);
         } else nlay++;
         binds += sh->ncbuf + sh->nsbuf + sh->ntex;
+
+        // 交叉核对：SPIR-V 里声明了、而 res.json 里没有对应条目的绑定。真机上就是这类绑定把管线挡掉的
+        //（res.json 只说数据从哪来，不保证列全 SPIR-V 的绑定，见 vk_spv.h）。
+        // Cross-check: bindings the SPIR-V declares that res.json has no entry for. These are exactly what blocked
+        // pipeline creation on the device (res.json says only where the data comes from and need not list every
+        // binding, see vk_spv.h).
+        for (uint32_t k = 0; k < sh->nspv; k++) {
+            const vk_spv_bind *b = &sh->spv[k];
+            int have = 0;
+            for (uint32_t j = 0; j < sh->ncbuf && !have; j++) if (sh->cbuf[j].binding == b->binding) have = 1;
+            for (uint32_t j = 0; j < sh->nsbuf && !have; j++) if (sh->sbuf[j].binding == b->binding) have = 1;
+            for (uint32_t j = 0; j < sh->ntex && !have; j++) if (sh->tex[j].binding == b->binding) have = 1;
+            if (have) continue;
+            miss_total++;
+            if (miss_shown < 4) {
+                miss_shown++;
+                printf("  交叉核对：%s 的 set%u/b%u（%s）在 res.json 里没有条目\n",
+                       sh->key, b->set, b->binding, vk_spv_kind_name(b->kind));
+            }
+        }
         if (sh->stage == VK_STAGE_CS) {
             ncs++;
             if (vk_pipe_compute(sh) != VK_NULL_HANDLE) npipe++;
-            else { fail_pipe++; if (!first_pipe_bad[0]) snprintf(first_pipe_bad, sizeof first_pipe_bad, "%s", key); }
+            else {
+                fail_pipe++;
+                if (!first_pipe_bad[0]) snprintf(first_pipe_bad, sizeof first_pipe_bad, "%s", key);
+                // 失败时把四个诊断变体各试一次：哪个建得成，就说明差的是哪一样（见 vk_pipe.h）
+                // On failure try each of the four diagnostic variants: whichever succeeds says what was missing
+                static const char *vn[4] = { "加 push constant", "补缺失号(uniform)", "补缺失号(存储)", "补缺失号(贴图)" };
+                char tried[128] = "";
+                for (int v = 1; v <= 4; v++) {
+                    if (vk_pipe_compute_variant(sh, v) == VK_NULL_HANDLE) continue;
+                    size_t l = strlen(tried);
+                    snprintf(tried + l, sizeof tried - l, "%s%s", l ? "、" : "", vn[v - 1]);
+                }
+                printf("  诊断：%s 被哪种变体救活 → %s\n", key, tried[0] ? tried : "（四种都不行）");
+            }
         }
     }
     closedir(d);
@@ -74,6 +108,7 @@ int main(void) {
     printf("计数：描述符集布局 %llu、管线布局 %llu、计算管线 %llu、图形管线 %llu、失败 %llu\n",
            (unsigned long long)dsl, (unsigned long long)lay, (unsigned long long)cpso,
            (unsigned long long)gpso, (unsigned long long)fail);
+    printf("交叉核对：SPIR-V 有而 res.json 没有的绑定共 %u 条（布局以 SPIR-V 为准，所以这不影响建管线）\n", miss_total);
     printf("耗时 %.1f 秒（布局按键去重，所以句柄数少于着色器数）\n", now_s() - t0);
     printf("%s\n", (fail_dsl || fail_pipe) ? "✗ 有失败：先看上面的键与 VkResult" : "✓ 全库布局与全部计算管线都被驱动收下");
     return (int)(fail_dsl + fail_pipe);

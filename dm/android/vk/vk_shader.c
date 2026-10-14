@@ -290,6 +290,7 @@ static void free_ref(vk_shader *sh) {
     sh->cbuf = NULL; sh->sbuf = NULL; sh->tex = NULL;
     sh->ncbuf = sh->nsbuf = sh->ntex = 0;
 }
+static void free_spv(vk_shader *sh) { free(sh->spv); sh->spv = NULL; sh->nspv = 0; }
 
 // ---------- 装载 ----------
 static vk_shader *load(const char *key, int stage) {
@@ -338,6 +339,23 @@ static vk_shader *load(const char *key, int stage) {
     }
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = n, .pCode = (const uint32_t *)code };
     VkResult r = vkCreateShaderModule(vk_dev(), &ci, NULL, &sh->mod);
+
+    // 趁字节还在：把 SPIR-V 声明的绑定抄下来（描述符集布局的唯一权威来源，见 vk_spv.h）。
+    // res.json 只讲"数据从哪来"，不保证列全 SPIR-V 里的绑定——真机上 3 条计算管线就是这么失败的。
+    // While the bytes are still here, copy out the bindings the SPIR-V declares (the only authoritative source for
+    // descriptor set layouts, see vk_spv.h). res.json says only where the data comes from and does not necessarily
+    // list every binding in the SPIR-V -- which is exactly how 3 compute pipelines failed on the device.
+    if (r == VK_SUCCESS) {
+        sh->spv = calloc(VK_SPV_MAXB, sizeof *sh->spv);
+        int nb = sh->spv ? vk_spv_scan((const uint32_t *)code, n, sh->spv, VK_SPV_MAXB) : -1;
+        if (nb < 0) {
+            if (g_red_bad++ < 5) LOG("【红】着色器 %s 的 SPIR-V 绑定读不出来（%zu 字节）", key, n);
+            free(code); free_ref(sh); free_spv(sh); free(sh);
+            g_bad++;
+            return NULL;
+        }
+        sh->nspv = (uint32_t)nb;
+    }
     free(code);
     if (r != VK_SUCCESS) {
         if (g_red_bad++ < 5) LOG("【红】着色器 %s 的 SPIR-V 建不出模块：VkResult %d（%zu 字节）", key, (int)r, n);

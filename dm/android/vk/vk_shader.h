@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 #include <vulkan/vulkan.h>
+#include "vk_spv.h"
 
 // NVN 阶段号，取值与 nvn_mtl.m 的 stage_of 一致——那边从映射表的中文列名翻出来（顶点/像素/计算/外壳/域），
 // 安卓这边直接从 res.json 的 stage 列（vs/ps/cs）翻，两个来源指向同一组阶段号。
@@ -34,6 +35,10 @@ enum { VK_STAGE_VS = 0, VK_STAGE_PS = 1, VK_STAGE_HS = 3, VK_STAGE_DS = 4, VK_ST
 // 控制段长度与键长度（键是 16 位十六进制，刚好是字段名里那串的样子）| control segment length and key length
 #define VK_SHADER_CTL_LEN 0x880
 #define VK_SHADER_KEY_LEN 16
+
+// 一个着色器最多记多少条 SPIR-V 绑定（实测最复杂的那条是 17 条，留足余量）
+// How many SPIR-V bindings one shader records (the most complex one measured has 17; plenty of margin)
+#define VK_SPV_MAXB 64
 
 // uniform 缓冲：SPIR-V binding ↔ 客体常量段槽号（机器码里的 c[3 + slot]）| uniform buffer: SPIR-V binding <-> guest constant slot (c[3 + slot] in the machine code)
 typedef struct { uint32_t binding; int32_t slot; } vk_cbuf_ref;
@@ -49,6 +54,12 @@ typedef struct { uint32_t binding, type, array, separate, flags, writable; int32
 typedef struct {
     char key[VK_SHADER_KEY_LEN + 1];
     int stage;                       // VK_STAGE_* | one of VK_STAGE_*
+    // 描述符集布局的**权威来源**：SPIR-V 里声明的每一条绑定（set / binding / 种类）。装载时扫一次就丢掉
+    // SPIR-V 字节，所以这份清单必须在那时留下来——见 vk_spv.h 的文件头（res.json 不全）。
+    // The **authoritative source** for descriptor set layouts: every binding the SPIR-V declares (set / binding /
+    // kind). The SPIR-V bytes are dropped right after loading, so this list has to be kept then -- see the header
+    // of vk_spv.h (res.json is incomplete).
+    vk_spv_bind *spv; uint32_t nspv;
     vk_cbuf_ref *cbuf; uint32_t ncbuf;
     vk_sbuf_ref *sbuf; uint32_t nsbuf;
     vk_tex_ref  *tex;  uint32_t ntex;

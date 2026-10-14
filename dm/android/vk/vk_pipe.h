@@ -41,6 +41,14 @@ VkPipelineLayout vk_pipe_layout(const vk_shader *const *sh, int n);
 // (Graphics pipelines wait for the shadow state to be completed; see the header of vk_pipe.c.)
 VkPipeline vk_pipe_compute(const vk_shader *cs);
 
+// 诊断变体（不进缓存，只为分辨建管线失败是哪一种不匹配）：
+//   1 = 加一段 push constant（0..255，计算阶段）；2/3/4 = 把表里 0..15 中缺的 binding 号分别补成
+//   uniform 缓冲 / 存储缓冲 / 组合图像采样器。
+// Diagnostic variants (not cached; they exist only to tell which kind of mismatch makes pipeline creation fail):
+//   1 adds a push-constant range (0..255, compute stage); 2/3/4 add every binding number in 0..15 missing from
+//   the table as a uniform buffer / storage buffer / combined image sampler respectively.
+VkPipeline vk_pipe_compute_variant(const vk_shader *cs, int variant);
+
 // 计数：建了多少个描述符集布局 / 管线布局 / 计算管线 / 图形管线，以及失败次数
 // Counters: descriptor set layouts, pipeline layouts, compute pipelines and graphics pipelines created, plus failures
 void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uint64_t *gpso, uint64_t *fail);
