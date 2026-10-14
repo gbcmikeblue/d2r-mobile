@@ -30,7 +30,12 @@ enum {
     VK_SPV_OTHER
 };
 
-typedef struct { uint32_t set, binding; int kind; } vk_spv_bind;
+// count：这条绑定在 SPIR-V 里声明的**元素个数**（不是数组就是 1）。描述符集布局的 descriptorCount 直接用它——
+// 早先固定写 1 是个静默假设（实测全库 44,156 条都不是数组，但那是"碰巧"而不是"保证"）。
+// count: how many elements this binding declares in the SPIR-V (1 when it is not an array). A descriptor set
+// layout's descriptorCount uses it directly -- hardcoding 1 was a silent assumption (measured: none of the
+// library's 44,156 bindings is an array, but that was a coincidence rather than a guarantee).
+typedef struct { uint32_t set, binding, count; int kind; } vk_spv_bind;
 
 // 输入变量（顶点属性）：Location 与分量个数/类型。图形管线必须为着色器声明的**每一个**输入都配上顶点属性，
 // 否则建管线直接失败；而"哪些属性"这件事只在 SPIR-V 里（res.json 只有资源绑定，实测顶点属性一条都没有）。

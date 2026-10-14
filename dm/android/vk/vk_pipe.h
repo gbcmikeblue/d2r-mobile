@@ -97,3 +97,13 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
 // NVN 图元 → VkPrimitiveTopology（没有对应物的那几个报一次黄并退化，见 vk_pipe.c）
 // NVN primitive -> VkPrimitiveTopology (the few without a counterpart warn once and degrade; see vk_pipe.c)
 VkPrimitiveTopology vk_topo_of(int nvn_prim);
+
+// 常量回退属性所在的绑定号：绘制时要把 vk_pipe_dummy_buffer() 绑到它上面
+// The binding the constant-fallback attributes live on: a draw must bind vk_pipe_dummy_buffer() to it
+#define VK_PIPE_DUMMY_BIND 31
+VkBuffer vk_pipe_dummy_buffer(void);
+
+// 按 NVN 图元号的累计绘制次数（out 至少 16 项）：用来看那四种没有对应物的图元到底会不会出现
+// Cumulative draw count per NVN primitive number (out needs at least 16 entries): shows whether those four
+// primitives without counterparts ever appear
+void vk_pipe_prim_counts(uint64_t *out, int n);

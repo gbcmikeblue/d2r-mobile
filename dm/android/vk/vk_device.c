@@ -23,6 +23,8 @@ static VkPhysicalDeviceMemoryProperties g_mem;
 static uint32_t g_zero_copy = UINT32_MAX;
 static int g_tried;
 static int g_dyn_render;                       // 动态渲染可用（回放层开通道的前提）| dynamic rendering available (the replay layer's precondition for opening passes)
+static int g_fill_non_solid;                   // 非实心多边形模式（线框等）| non-solid polygon modes (wireframe and such)
+static int g_attr_divisor, g_attr_divisor_zero; // 顶点流每实例步进 > 1 / 可为 0 | per-instance vertex stream step > 1 / may be 0
 static VkExtensionProperties *g_exts; static uint32_t g_nexts;
 
 VkInstance vk_instance(void) { return g_inst; }
@@ -38,6 +40,9 @@ int vk_have_ext(const char *name) {
 }
 
 int vk_have_dyn_render(void) { return g_dyn_render; }
+int vk_have_fill_non_solid(void) { return g_fill_non_solid; }
+int vk_have_attr_divisor(void) { return g_attr_divisor; }
+int vk_have_attr_divisor_zero(void) { return g_attr_divisor_zero; }
 
 // 安卓的桩库只到 1.1：1.3 的入口从设备上取（见 vk_device.h 的说明）
 // Android's stub library stops at 1.1, so the 1.3 entry points are fetched from the device (see vk_device.h)
@@ -89,11 +94,13 @@ void vk_device_init(void) {
     free(qf);
     if (g_qfi == UINT32_MAX) { LOG("【红】没有图形队列族"); return; }
 
-    const char *want[] = { "VK_KHR_external_memory_fd" };   // 内存换轨（把 Vulkan 内存摆到客体地址上）要用 | needed by the memory overlay (placing Vulkan memory at guest addresses)
-    const char *en[4]; uint32_t nec = 0;
+    const char *want[] = { "VK_KHR_external_memory_fd",        // 内存换轨（把 Vulkan 内存摆到客体地址上）要用 | needed by the memory overlay (placing Vulkan memory at guest addresses)
+                           "VK_EXT_vertex_attribute_divisor" };   // 顶点流每实例步进 > 1（有则开，没有就退化，见第 9 步的已知缺口）| per-instance vertex stream step > 1 (enabled when present, degraded when not; see the known gaps in step 9)
+    const char *en[8]; uint32_t nec = 0;
     for (unsigned i = 0; i < sizeof want / sizeof want[0]; i++)
         if (vk_have_ext(want[i])) en[nec++] = want[i];
-        else LOG("【红】设备没有扩展 %s：内存换轨会走不通", want[i]);
+        else if (i == 0) LOG("【红】设备没有扩展 %s：内存换轨会走不通", want[i]);
+        else LOG("【黄】设备没有扩展 %s：顶点流的每实例步进 > 1 只能按 1 处理", want[i]);
 
     // 动态渲染（Vulkan 1.3 核心）：回放层开渲染通道用它——比 VkRenderPass/VkFramebuffer 少一整套对象，
     // 而 NVN 的命令流本来就是"设目标 + 清除 + 绘制"的自由序列，与它正好对得上。
@@ -103,15 +110,47 @@ void vk_device_init(void) {
     // draw", which matches it exactly. Ask before enabling: if it is unsupported the replay layer falls back to
     // "record state, open no pass" rather than failing device creation.
     VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
-    { VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13 };
-      vkGetPhysicalDeviceFeatures2(g_phys, &f2); }
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vdf = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT };
+    int have_vd = vk_have_ext("VK_EXT_vertex_attribute_divisor");
+    VkPhysicalDeviceFeatures core = { 0 };
+    {
+        VkPhysicalDeviceFeatures2 q = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        void *tail = &f13;
+        if (have_vd) { vdf.pNext = &f13; tail = &vdf; }   // 扩展不在链上时不挂它的结构 | the extension's struct is not chained when the extension is absent
+        q.pNext = tail;
+        vkGetPhysicalDeviceFeatures2(g_phys, &q);
+        core = q.features;
+    }
     g_dyn_render = f13.dynamicRendering ? 1 : 0;
     if (!g_dyn_render) LOG("【黄】设备不支持动态渲染（Vulkan 1.3）：渲染通道这一层退回只记状态");
+    // 非实心多边形模式（线框）与顶点流的每实例步进：先问再开，没有就由管线层退化并报黄
+    // Non-solid polygon modes (wireframe) and per-instance vertex stream steps: asked for before being enabled;
+    // when absent the pipeline layer degrades and warns
+    g_fill_non_solid = core.fillModeNonSolid ? 1 : 0;
+    g_attr_divisor = have_vd && vdf.vertexAttributeInstanceRateDivisor ? 1 : 0;
+    g_attr_divisor_zero = have_vd && vdf.vertexAttributeInstanceRateZeroDivisor ? 1 : 0;
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = g_qfi, .queueCount = 1, .pQueuePriorities = &prio };
-    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = g_dyn_render ? &f13 : NULL,
+    // 开特性：核心特性走 VkPhysicalDeviceFeatures2，扩展特性走各自的特性结构，一条链挂起来
+    // Enabling features: core features ride VkPhysicalDeviceFeatures2 and extension features their own structures,
+    // all chained together
+    VkPhysicalDeviceFeatures2 feats = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    feats.features = core;
+    feats.features.fillModeNonSolid = g_fill_non_solid ? VK_TRUE : VK_FALSE;
+    f13.dynamicRendering = g_dyn_render ? VK_TRUE : VK_FALSE;
+    {
+        void *tail = &f13;
+        if (have_vd) {
+            vdf.vertexAttributeInstanceRateDivisor = g_attr_divisor ? VK_TRUE : VK_FALSE;
+            vdf.vertexAttributeInstanceRateZeroDivisor = g_attr_divisor_zero ? VK_TRUE : VK_FALSE;
+            vdf.pNext = &f13;
+            tail = &vdf;
+        }
+        feats.pNext = tail;
+    }
+    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &feats,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = nec,
                                .ppEnabledExtensionNames = en };
     r = vkCreateDevice(g_phys, &dci, NULL, &g_dev);
@@ -138,9 +177,10 @@ void vk_device_init(void) {
             p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
             VK_API_VERSION_PATCH(p.apiVersion), g_qfi, vk_have_ext("VK_KHR_external_memory_fd") ? "有" : "无");
     else
-        LOG("【绿】Vulkan 设备就绪：%s（Vulkan %u.%u.%u）队列族 %u；零拷贝内存类型 %u；扩展 fd=%s；动态渲染 %s",
+        LOG("【绿】Vulkan 设备就绪：%s（Vulkan %u.%u.%u）队列族 %u；零拷贝内存类型 %u；扩展 fd=%s；动态渲染 %s；非实心填充 %s；顶点每实例步进 %s%s",
             p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
             VK_API_VERSION_PATCH(p.apiVersion), g_qfi, g_zero_copy, vk_have_ext("VK_KHR_external_memory_fd") ? "有" : "无",
-            g_dyn_render && dm_vkCmdBeginRendering ? "有" : "无");
+            g_dyn_render && dm_vkCmdBeginRendering ? "有" : "无", g_fill_non_solid ? "有" : "无",
+            g_attr_divisor ? (g_attr_divisor_zero ? "有（含 0）" : "有") : "无", "");
     if (g_zero_copy == UINT32_MAX) LOG("【红】没有 DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT 的内存类型：零拷贝内存池做不了");
 }

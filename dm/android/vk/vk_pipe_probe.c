@@ -37,6 +37,7 @@ int main(void) {
     if (!d) { printf("【红】打不开目录\n"); return 2; }
     uint32_t nsh = 0, ncs = 0, nlay = 0, npipe = 0;
     uint32_t miss_total = 0, miss_shown = 0;   // 交叉核对：SPIR-V 有、res.json 没有的绑定数 | cross-check: bindings in the SPIR-V but not in res.json
+    uint32_t arr_total = 0, arr_shown = 0;     // 数组绑定数（descriptorCount 不再是写死的 1）| array bindings (descriptorCount is no longer hardcoded to 1)
     uint32_t fail_dsl = 0, fail_pipe = 0;
     char first_dsl_bad[32] = "", first_pipe_bad[32] = "";
     uint64_t binds = 0;
@@ -78,6 +79,14 @@ int main(void) {
             for (uint32_t j = 0; j < sh->ncbuf && !have; j++) if (sh->cbuf[j].binding == b->binding) have = 1;
             for (uint32_t j = 0; j < sh->nsbuf && !have; j++) if (sh->sbuf[j].binding == b->binding) have = 1;
             for (uint32_t j = 0; j < sh->ntex && !have; j++) if (sh->tex[j].binding == b->binding) have = 1;
+            if (b->count != 1) {   // 数组绑定：descriptorCount 应当等于它（早先写死 1 是个静默假设）| an array binding: descriptorCount should equal this (hardcoding 1 was a silent assumption)
+                arr_total++;
+                if (arr_shown < 3) {
+                    arr_shown++;
+                    printf("  数组绑定：%s 的 set%u/b%u 有 %u 个元素（%s）\n",
+                           sh->key, b->set, b->binding, b->count, vk_spv_kind_name(b->kind));
+                }
+            }
             if (have) continue;
             miss_total++;
             if (miss_shown < 4) {
@@ -141,6 +150,7 @@ int main(void) {
            (unsigned long long)dsl, (unsigned long long)lay, (unsigned long long)cpso,
            (unsigned long long)gpso, (unsigned long long)fail);
     printf("交叉核对：SPIR-V 有而 res.json 没有的绑定共 %u 条（布局以 SPIR-V 为准，所以这不影响建管线）\n", miss_total);
+    printf("数组绑定：%u 条（descriptorCount 取自 SPIR-V，不再是写死的 1）\n", arr_total);
     printf("图形管线（顶点着色器各建一条、属性走常量回退）：试 %u、成功 %u%s\n", ngfx_try, ngfx_ok,
            ngfx_try && ngfx_ok != ngfx_try ? "  ← 有失败，看上面的【红】" : "");
     printf("耗时 %.1f 秒（布局按键去重，所以句柄数少于着色器数）\n", now_s() - t0);

@@ -32,6 +32,17 @@ uint32_t vk_zero_copy_type(void);
 // 这一段设备是否开了某个扩展 | whether this device enabled a given extension
 int vk_have_ext(const char *name);
 
+// 两处"能力缺口"的开关（都是先问再开，没开就由管线层退化并报黄，见 docs/ANDROID_PLAN 第 9 步）：
+//   vk_have_fill_non_solid：非实心多边形模式可用（不然只能按实心画）
+//   vk_have_attr_divisor：顶点流的每实例步进可大于 1（不然 divisor > 1 只能按 1 处理）
+// The two capability switches behind the "known gaps" (both asked for before being enabled; when absent the
+// pipeline layer degrades and warns, see step 9 of docs/ANDROID_PLAN):
+//   vk_have_fill_non_solid: non-solid polygon modes are usable (otherwise only solid can be drawn)
+//   vk_have_attr_divisor: a vertex stream's per-instance step may exceed 1 (otherwise divisor > 1 is treated as 1)
+int vk_have_fill_non_solid(void);
+int vk_have_attr_divisor(void);
+int vk_have_attr_divisor_zero(void);   // divisor 可为 0（NVN 的"常量流"正好能用这个表达）| divisor may be 0 (exactly what NVN's "constant stream" needs)
+
 // 动态渲染是否可用（回放层开渲染通道的前提；不可用时那一层退回只记状态）
 // Whether dynamic rendering is available (the replay layer's precondition for opening passes; without it that
 // layer falls back to recording state only)

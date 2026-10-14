@@ -21,7 +21,7 @@
 
 enum { OP_TYPE_IMAGE = 25, OP_TYPE_SAMPLER = 26, OP_TYPE_SAMPLED_IMAGE = 27, OP_TYPE_ARRAY = 28,
        OP_TYPE_RUNTIME_ARRAY = 29, OP_TYPE_STRUCT = 30, OP_TYPE_POINTER = 32,
-       OP_TYPE_FLOAT = 21, OP_TYPE_INT = 22, OP_TYPE_VECTOR = 23,
+       OP_TYPE_FLOAT = 21, OP_TYPE_INT = 22, OP_TYPE_VECTOR = 23, OP_CONSTANT = 43,
        OP_DECORATE = 71, OP_VARIABLE = 59, OP_FUNCTION = 54 };
 
 enum { DEC_BLOCK = 2, DEC_BUFFER_BLOCK = 3, DEC_BINDING = 33, DEC_SET = 34, DEC_LOCATION = 30 };
@@ -38,6 +38,9 @@ typedef struct {
     uint8_t ptr_sc[MAX_IDS];         // OpTypePointer 的结果 id -> 存储类
     uint8_t type_op[MAX_IDS];        // 类型 id -> opcode（只记我们关心的几种）
     uint32_t elem_of[MAX_IDS];       // 数组类型 id -> 元素类型
+    uint32_t arr_len[MAX_IDS];       // 数组类型 id -> 元素个数（0 = 不是编译期常量）| array type id -> element count (0 = not a compile-time constant)
+    uint32_t const_val[MAX_IDS];     // OpConstant 的值（32 位）| OpConstant value (32-bit)
+    uint8_t has_const[MAX_IDS];
     uint8_t image_sampled[MAX_IDS];  // 图像类型 id -> sampled 字段
     uint8_t var_sc[MAX_IDS];         // 变量 id -> 存储类
     uint32_t var_type[MAX_IDS];      // 变量 id -> 结果类型
@@ -53,14 +56,23 @@ typedef struct {
 } spv_tab;
 static spv_tab t;   // 静态（约 80 KB）：扫描器只在装载时用，进程内一次一个 | static (~80 KB): the scanner runs at load time only, one module at a time
 
-static int kind_of(uint32_t type_id, int *guard_p) {
-    uint32_t t0 = type_id;
+static int kind_of(uint32_t type_id, uint32_t *count_out) {
+    uint32_t t0 = type_id, count = 1;
     int sc = -1;
     for (int guard = 0; guard < 8; guard++) {
         if (t0 >= MAX_IDS) return VK_SPV_OTHER;
         if (t.ptr_pointee[t0] || t.ptr_sc[t0]) { sc = t.ptr_sc[t0]; t0 = t.ptr_pointee[t0]; continue; }
         uint8_t op = t.type_op[t0];
-        if (op == OP_TYPE_ARRAY || op == OP_TYPE_RUNTIME_ARRAY) { t0 = t.elem_of[t0]; continue; }
+        // 指针与最终类型之间的数组就是**描述符数组**（结构体内部的运行期数组不在这条链上），它的长度就是 descriptorCount
+        // An array between the pointer and the final type is a **descriptor array** (a runtime array inside a struct is
+        // not on this chain); its length is the descriptorCount
+        if (op == OP_TYPE_ARRAY || op == OP_TYPE_RUNTIME_ARRAY) {
+            uint32_t len = t.arr_len[t0];
+            if (op != OP_TYPE_RUNTIME_ARRAY && len) count *= len;   // 不定长（或长度不是常量）按 1，调用方另作处理 | unbounded (or a non-constant length) stays 1; the caller handles it
+            t0 = t.elem_of[t0];
+            continue;
+        }
+        if (count_out) *count_out = count;
         if (op == OP_TYPE_STRUCT) {
             if (sc == 12 || t.is_buffer_block[t0]) return VK_SPV_SSBO;
             if (t.is_block[t0]) return VK_SPV_UBO;
@@ -71,7 +83,7 @@ static int kind_of(uint32_t type_id, int *guard_p) {
         if (op == OP_TYPE_SAMPLER) return VK_SPV_SAMPLER;
         return VK_SPV_OTHER;
     }
-    (void)guard_p;
+    if (count_out) *count_out = count;
     return VK_SPV_OTHER;
 }
 
@@ -137,8 +149,17 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap,
             if (wc >= 4 && o[1] < MAX_IDS) { t.ptr_sc[o[1]] = (uint8_t)o[2]; t.ptr_pointee[o[1]] = o[3]; }
             break;
         case OP_TYPE_ARRAY:
+            // 结果 id、元素类型、长度（一个 OpConstant 的 id）| result id, element type, length (the id of an OpConstant)
+            if (wc >= 4 && o[1] < MAX_IDS) {
+                t.type_op[o[1]] = (uint8_t)op; t.elem_of[o[1]] = o[2];
+                if (o[3] < MAX_IDS && t.has_const[o[3]]) t.arr_len[o[1]] = t.const_val[o[3]];
+            }
+            break;
         case OP_TYPE_RUNTIME_ARRAY:
             if (wc >= 3 && o[1] < MAX_IDS) { t.type_op[o[1]] = (uint8_t)op; t.elem_of[o[1]] = o[2]; }
+            break;
+        case OP_CONSTANT:   // 结果类型、结果 id、值（64 位宽的会有两个值字，这里只取低位，够表达数组长度）| result type, result id, value (64-bit ones carry two value words; the low one is enough for array lengths)
+            if (wc >= 4 && o[2] < MAX_IDS) { t.const_val[o[2]] = o[3]; t.has_const[o[2]] = 1; }
             break;
         case OP_TYPE_STRUCT:
             if (wc >= 2 && o[1] < MAX_IDS) t.type_op[o[1]] = OP_TYPE_STRUCT;
@@ -172,7 +193,8 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap,
         if (n >= cap) return -1;
         out[n].set = (uint32_t)t.set_of[id];
         out[n].binding = (uint32_t)t.binding_of[id];
-        out[n].kind = kind_of(t.var_type[id], NULL);
+        out[n].count = 1;
+        out[n].kind = kind_of(t.var_type[id], &out[n].count);
         n++;
     }
     // 按 set、binding 升序（插入排序：条数很少）| sort by set then binding (insertion sort: few entries)

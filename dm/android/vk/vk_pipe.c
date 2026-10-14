@@ -18,13 +18,24 @@
 #include "vk_pipe.h"
 #include "vk_device.h"
 #include "dm.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+// 常量回退属性用的哑顶点缓冲的大小：4096 个实例 × 16 字节。为什么不是 16 字节——回退属性的步进是
+// "每实例一个元素"，实例数由游戏定，缓冲太小就会读到界外（真机开了 robustness 也不该指望它）。
+// Size of the dummy vertex buffer behind the constant-fallback attributes: 4096 instances x 16 bytes. Why not 16
+// bytes -- a fallback attribute advances one element per instance, the instance count is the game's to choose, and
+// a buffer that small would be read out of bounds (robustness on the device is not something to rely on).
+#define DUMMY_VBUF_SIZE (64u << 10)
+
 #define MAX_B 160
 
-typedef struct { uint32_t binding; VkDescriptorType type; VkShaderStageFlags stage; } bind_t;
+// count：这条绑定的元素个数，直接来自 SPIR-V（见 vk_spv.h）——不写死 1，那会是个静默假设
+// count: how many elements this binding has, straight from the SPIR-V (see vk_spv.h) -- not hardcoded to 1, which
+// would be a silent assumption
+typedef struct { uint32_t binding, count; VkDescriptorType type; VkShaderStageFlags stage; } bind_t;
 
 static uint64_t g_n_dsl, g_n_lay, g_n_cpso, g_n_gpso, g_n_fail;
 
@@ -42,18 +53,19 @@ static VkShaderStageFlags stage_flag(int st) {
 // 往合并表里加一条：同号则并入阶段（类型不一致要报红——同一号两种类型是翻译产物本身有问题）
 // Add one entry to the merged table: an existing number merges its stages (a type mismatch is reported as a
 // failure -- one number with two types means the translated artifacts themselves are inconsistent)
-static int add_bind(bind_t *b, int *nb, int cap, uint32_t binding, VkDescriptorType type, VkShaderStageFlags sf) {
+static int add_bind(bind_t *b, int *nb, int cap, uint32_t binding, uint32_t count, VkDescriptorType type, VkShaderStageFlags sf) {
     for (int i = 0; i < *nb; i++) {
         if (b[i].binding != binding) continue;
         if (b[i].type != type) {
             static int said;
             if (!said++) LOG("【红】binding %u 的类型不一致（%d 与 %d）：按先见到的那个建布局", binding, (int)b[i].type, (int)type);
         }
+        if (count > b[i].count) b[i].count = count;   // 两个阶段各声明一个数组时取大的那个 | when both stages declare an array, keep the larger count
         b[i].stage |= sf;
         return 0;
     }
     if (*nb >= cap) return -1;
-    b[*nb].binding = binding; b[*nb].type = type; b[*nb].stage = sf;
+    b[*nb].binding = binding; b[*nb].count = count ? count : 1; b[*nb].type = type; b[*nb].stage = sf;
     (*nb)++;
     return 0;
 }
@@ -100,7 +112,7 @@ static int merge_binds(const vk_shader *const *sh, int n, bind_t *out, int cap) 
                 static int said2;
                 if (!said2++) LOG("【黄】着色器 %s 的 binding %u 种类认不出来：按存储缓冲建（可能要改 vk_spv.c）", s->key, b->binding);
             }
-            if (add_bind(out, &nb, cap, b->binding, desc_type_of(b->kind), sf) < 0) return -1;
+            if (add_bind(out, &nb, cap, b->binding, b->count, desc_type_of(b->kind), sf) < 0) return -1;
         }
     }
     qsort(out, (size_t)nb, sizeof *out, cmp_bind);
@@ -111,8 +123,8 @@ static int merge_binds(const vk_shader *const *sh, int n, bind_t *out, int cap) 
 // Layout key: write the merged table into a stable string (sorted by binding, so one table always yields one key)
 static void key_of_binds(const bind_t *b, int nb, char *out, size_t n) {
     size_t o = 0;
-    for (int i = 0; i < nb && o + 32 < n; i++)
-        o += (size_t)snprintf(out + o, n - o, "%u:%d:%x;", b[i].binding, (int)b[i].type, (unsigned)b[i].stage);
+    for (int i = 0; i < nb && o + 40 < n; i++)
+        o += (size_t)snprintf(out + o, n - o, "%u:%u:%d:%x;", b[i].binding, b[i].count, (int)b[i].type, (unsigned)b[i].stage);
     out[o] = 0;
 }
 
@@ -142,14 +154,14 @@ static int build_layout(const bind_t *b, int nb, int variant, VkDescriptorSetLay
         for (uint32_t num = 0; num < 16 && n < MAX_B * 2; num++) {
             int have = 0;
             for (int i = 0; i < nb; i++) if (b[i].binding == num) { have = 1; break; }
-            if (!have) { bb[n].binding = num; bb[n].type = t; bb[n].stage = VK_SHADER_STAGE_COMPUTE_BIT; n++; }
+            if (!have) { bb[n].binding = num; bb[n].count = 1; bb[n].type = t; bb[n].stage = VK_SHADER_STAGE_COMPUTE_BIT; n++; }
         }
     }
     VkDescriptorSetLayoutBinding lb[MAX_B * 2];
     for (int i = 0; i < n; i++) {
         lb[i].binding = bb[i].binding;
         lb[i].descriptorType = bb[i].type;
-        lb[i].descriptorCount = 1;      // 全库没有数组绑定（44,156 条实测都是 1）| no array bindings anywhere (all 44,156 measured are 1)
+        lb[i].descriptorCount = bb[i].count ? bb[i].count : 1;   // 元素个数取自 SPIR-V，见 vk_spv.h | the element count comes from the SPIR-V, see vk_spv.h
         lb[i].stageFlags = bb[i].stage;
         lb[i].pImmutableSamplers = NULL;
     }
@@ -293,7 +305,18 @@ VkPipeline vk_pipe_compute_variant(const vk_shader *cs, int variant) {
 // NVN primitive -> VkPrimitiveTopology. Line loops / quads / polygons have no Vulkan counterpart; warn once and
 // degrade to the closest one (D2R's real draws use triangles and triangle strips only, so this degradation path
 // exists mainly to not be silent).
+// 按 NVN 图元号计数：**那四种没有对应物的图元到底会不会出现，交给真机回答**（出现了再决定要不要做转化，
+// 而不是先写一堆展开代码）。回放层每次绘制都会经过这里，所以这就是全量统计。
+// Counted by NVN primitive number: **whether those four without counterparts ever appear is answered by the
+// device** (if they do, decide then whether to write the conversion, rather than writing a pile of expansion code
+// first). Every draw passes through here, so this is the full count.
+static _Atomic uint64_t g_prim_n[16];
+void vk_pipe_prim_counts(uint64_t *out, int n) {
+    for (int i = 0; i < n && i < 16; i++) out[i] = atomic_load(&g_prim_n[i]);
+}
+
 VkPrimitiveTopology vk_topo_of(int p) {
+    if (p >= 0 && p < 16) atomic_fetch_add(&g_prim_n[p], 1);
     switch (p) {
         case 0x0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
         case 0x1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
@@ -334,6 +357,18 @@ static const VkFormat g_attr_fmt[4][12] = {
       VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT, VK_FORMAT_R32G32B32A32_SFLOAT,
       VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT },
 };
+// 分量类别（0 = float 系、1 = uint 系、2 = sint 系）：用来与着色器声明的输入类型对照，见下面在建管线处的核对
+// Component class (0 = float-like, 1 = uint-like, 2 = sint-like): used when cross-checking against the input type a
+// shader declares, see the check where the pipeline is built)
+static int attr_fmt_class(uint32_t f) {
+    if (f >= 0x01 && f <= 0x30) {
+        uint32_t k = (f - 1) % 12;
+        if (k == 2 || k == 7 || k == 10) return 1;
+        if (k == 3 || k == 8 || k == 11) return 2;
+        return 0;
+    }
+    return 0;   // 三个特例都是归一化浮点 | the three specials are all normalized floats
+}
 static int attr_fmt_vk(uint32_t f, VkFormat *out) {
     if (f >= 0x01 && f <= 0x30) {
         uint32_t n = (f - 1) / 12, k = (f - 1) % 12;
@@ -359,7 +394,7 @@ static VkFormat fallback_fmt(uint32_t ctype, uint32_t comps) {
     return f[ctype][comps - 1];
 }
 
-#define DUMMY_BIND 31   // 常量回退属性挂在这一号绑定上（1 个元素、每实例推进）| the constant-fallback attributes ride on this binding (one element, advancing per instance)
+#define DUMMY_BIND VK_PIPE_DUMMY_BIND   // 常量回退属性挂在这一号绑定上（每实例一个元素）| the constant-fallback attributes ride on this binding (one element per instance)
 
 // 非实心填充要开 fillModeNonSolid 特性（设备侧没开就建不出管线），所以退回实心并只报一次
 // Non-solid fill needs the fillModeNonSolid feature (not enabled on the device, so creation would fail), so fall
@@ -409,7 +444,8 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
     // "constant stream"), or whose format is unrecognised, rides on the constant-fallback binding.
     VkVertexInputBindingDescription vbind[17];
     VkVertexInputAttributeDescription vatt[VK_SPV_MAXIN];
-    uint32_t nb = 0, na = 0, dummies = 0;
+    VkVertexInputBindingDivisorDescriptionEXT vdiv[16];
+    uint32_t nb = 0, na = 0, dummies = 0, ndiv = 0;
     uint8_t stream_used[16];
     memset(stream_used, 0, sizeof stream_used);
     for (uint32_t i = 0; i < vs->nin && na < VK_SPV_MAXIN; i++) {
@@ -424,12 +460,33 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         }
         const uint32_t st_ = st->attr[loc].stream < 16 ? st->attr[loc].stream : 0;
         VkFormat f = VK_FORMAT_UNDEFINED;
-        int ok = st->attr[loc].valid && attr_fmt_vk(st->attr[loc].nvn_fmt, &f) && st->stream[st_].stride;
-        if (!ok) {   // 回退：常量属性（全零的小缓冲，每个实例一个元素）| fallback: a constant attribute (a small zeroed buffer, one element per instance)
+        int mapped = st->attr[loc].valid && attr_fmt_vk(st->attr[loc].nvn_fmt, &f);
+        // 兜底核对（第 9 步的"待实现"）：这条属性的**分量类型**要与着色器声明的输入类型同类
+        //（float / uint / sint）。不成立就报一次黄——若"location == NVN 属性号"这条假设错了，就会在这里现形，
+        // 而不是等画面错了再回头找。
+        // Fallback cross-check (the "to be implemented" of step 9): this attribute's **component class**
+        // (float / uint / sint) must agree with the type the shader declares for that input. A mismatch warns once --
+        // if the "location == NVN attribute number" assumption is wrong it shows up here rather than as a wrong
+        // picture later.
+        if (mapped) {
+            int want = vs->in[i].ctype == VK_SPV_I32 ? 2 : vs->in[i].ctype == VK_SPV_U32 ? 1 : 0;
+            if (attr_fmt_class(st->attr[loc].nvn_fmt) != want) {
+                static int saidc;
+                if (!saidc++) LOG("【黄】顶点属性 %u（%s 位置 %u）的分量类型与着色器声明不符：格式 %#x vs 着色器 %s（若这条假设错了，顶点数据接的槽就不对）",
+                                  loc, vs->key, loc, st->attr[loc].nvn_fmt,
+                                  vs->in[i].ctype == VK_SPV_I32 ? "sint" : vs->in[i].ctype == VK_SPV_U32 ? "uint" : "float");
+            }
+        }
+        // NVN 的"常量流"（步长 0）：有 divisor 可为 0 的扩展就用它表达（每个实例一个元素、不随顶点推进），
+        // 这才是它的正确语义 | NVN's "constant stream" (stride 0): expressed with the zero-divisor extension when
+        // available (one element per instance, not advancing per vertex), which is its correct meaning
+        int const_stream = st->stream[st_].stride == 0;
+        if (mapped && const_stream && !vk_have_attr_divisor_zero()) mapped = 0;
+        if (!mapped) {   // 回退：常量属性（全零的小缓冲，每个实例一个元素）| fallback: a constant attribute (a small zeroed buffer, one element per instance)
             vatt[na].location = loc; vatt[na].format = fallback_fmt(vs->in[i].ctype, vs->in[i].comps);
             vatt[na].offset = 0; vatt[na].binding = DUMMY_BIND;
             na++; dummies++;
-            if (st->attr[loc].valid && st->attr[loc].nvn_fmt) {
+            if (st->attr[loc].valid && st->attr[loc].nvn_fmt && st->stream[st_].stride) {
                 static int said2;
                 if (!said2++) LOG("【黄】顶点属性格式 %#x 未映射：用常量回退", st->attr[loc].nvn_fmt);
             }
@@ -441,12 +498,17 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         if (!stream_used[st_]) {
             stream_used[st_] = 1;
             vbind[nb].binding = 16 + st_;
-            vbind[nb].stride = st->stream[st_].stride;
+            vbind[nb].stride = const_stream ? 16 : st->stream[st_].stride;
             vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-            if (st->stream[st_].divisor) {   // 每实例：Vulkan 的 divisor 需要扩展，暂按 1（见提交说明）| per instance: Vulkan's divisor needs an extension, so 1 for now (see the commit message)
+            uint32_t div = st->stream[st_].divisor;
+            if (const_stream) { vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE; vdiv[ndiv].binding = 16 + st_; vdiv[ndiv].divisor = 0; ndiv++; }
+            else if (div) {
                 vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
-                static int said3;
-                if (st->stream[st_].divisor > 1 && !said3++) LOG("【黄】顶点流 %u 的 divisor=%u：暂按 1 处理（缺 VK_EXT_vertex_attribute_divisor）", st_, st->stream[st_].divisor);
+                if (vk_have_attr_divisor()) { vdiv[ndiv].binding = 16 + st_; vdiv[ndiv].divisor = div; ndiv++; }
+                else {
+                    static int said3;
+                    if (div > 1 && !said3++) LOG("【黄】顶点流 %u 的 divisor=%u：设备不支持 VK_EXT_vertex_attribute_divisor，按 1 处理", st_, div);
+                }
             }
             nb++;
         }
@@ -456,8 +518,12 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
         nb++;
     }
+    VkPipelineVertexInputDivisorStateCreateInfoEXT vds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
+        .vertexBindingDivisorCount = ndiv, .pVertexBindingDivisors = vdiv };
 
+    void *vi_divisor = ndiv ? (void *)&vds : NULL;   // divisor 状态只在真用到时挂上去（挂了就必须与绑定一一对应）| the divisor state is chained only when it is really used (once chained it must match the bindings)
     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .pNext = vi_divisor,
         .vertexBindingDescriptionCount = nb, .pVertexBindingDescriptions = nb ? vbind : NULL,
         .vertexAttributeDescriptionCount = na, .pVertexAttributeDescriptions = na ? vatt : NULL };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -467,8 +533,8 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
         // 没有片元阶段时规范要求丢弃光栅化（探针用顶点着色器单独验管线时走这条）| the spec requires rassterizer discard when there is no fragment stage (the probe exercises a pipeline with the vertex shader alone)
         .rasterizerDiscardEnable = nsh == 1 ? VK_TRUE : VK_FALSE,
-        .polygonMode = st->poly == VK_POLYGON_MODE_FILL ? VK_POLYGON_MODE_FILL
-                     : (poly_warn_once(st->poly), VK_POLYGON_MODE_FILL),
+        .polygonMode = (st->poly == VK_POLYGON_MODE_FILL || vk_have_fill_non_solid())
+                     ? st->poly : (poly_warn_once(st->poly), VK_POLYGON_MODE_FILL),
         .cullMode = st->cull, .frontFace = st->front,
         .depthBiasEnable = st->bias_en ? VK_TRUE : VK_FALSE,
         .depthBiasConstantFactor = st->bias_factor, .depthBiasClamp = st->bias_clamp, .depthBiasSlopeFactor = st->bias_units,
@@ -522,10 +588,46 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
     // 存进缓存（满了就丢掉最老的那个槽，只求不无限增长）| store in the cache (when full, drop the oldest slot rather than grow without bound)
     uint32_t slot = 0;
     for (uint32_t k = 0; k < GPSO_TAB; k++) { slot = (h + k) & (GPSO_TAB - 1); if (!g_gpso[slot].used) break; }
-    if (g_gpso[slot].used) vkDestroyPipeline(vk_dev(), g_gpso[slot].p, NULL);
+    if (g_gpso[slot].used) {   // 满了要淘汰：报一次，别静默（频繁出现说明状态组合太散，值得再看）| eviction when full: report once, never silently (frequent eviction means the state combinations are too scattered)
+        static int said;
+        if (!said++) LOG("【黄】图形管线缓存满（%d 项）：开始淘汰最旧的", GPSO_TAB);
+        vkDestroyPipeline(vk_dev(), g_gpso[slot].p, NULL);
+    }
     g_gpso[slot].st = *st; g_gpso[slot].p = p; g_gpso[slot].used = 1;
     g_n_gpso++;
     return p;
+}
+
+// 常量回退属性要绑的哑缓冲（全零）。绘制时把它绑到 VK_PIPE_DUMMY_BIND 上——不绑的话，用了回退属性的
+// 那次绘制是无效的：管线里已经声明了这条绑定，但没有任何缓冲挂上去。
+// The dummy (all-zero) buffer the constant-fallback attributes bind to. A draw binds it at VK_PIPE_DUMMY_BIND --
+// without that, a draw using a fallback attribute is invalid: the pipeline declares the binding but nothing is
+// attached to it.
+static VkBuffer g_dummy_vbuf;
+VkBuffer vk_pipe_dummy_buffer(void) {
+    if (g_dummy_vbuf) return g_dummy_vbuf;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = DUMMY_VBUF_SIZE,
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer b = VK_NULL_HANDLE;
+    if (vkCreateBuffer(vk_dev(), &bci, NULL, &b) != VK_SUCCESS) { LOG("【红】建哑顶点缓冲失败"); return VK_NULL_HANDLE; }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(vk_dev(), b, &mr);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(vk_dev(), &mai, NULL, &mem) != VK_SUCCESS ||
+        vkBindBufferMemory(vk_dev(), b, mem, 0) != VK_SUCCESS) {
+        LOG("【红】哑顶点缓冲的内存分配/绑定失败");
+        vkDestroyBuffer(vk_dev(), b, NULL);
+        return VK_NULL_HANDLE;
+    }
+    void *p = NULL;
+    if (vkMapMemory(vk_dev(), mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) memset(p, 0, DUMMY_VBUF_SIZE);
+    else LOG("【红】哑顶点缓冲映射失败（内容可能非零，回退属性会读到垃圾）");
+    g_dummy_vbuf = b;
+    return b;
 }
 
 void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uint64_t *gpso, uint64_t *fail) {
