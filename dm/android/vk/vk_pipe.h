@@ -52,3 +52,48 @@ VkPipeline vk_pipe_compute_variant(const vk_shader *cs, int variant);
 // 计数：建了多少个描述符集布局 / 管线布局 / 计算管线 / 图形管线，以及失败次数
 // Counters: descriptor set layouts, pipeline layouts, compute pipelines and graphics pipelines created, plus failures
 void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uint64_t *gpso, uint64_t *fail);
+
+// ---------- 图形管线 ----------
+// ---------- Graphics pipelines ----------
+// 一次绘制需要的图形管线状态。由回放层从**影子状态**解释出来（位域对象 → Vulkan 枚举，照苹果侧同一套映射），
+// 调用方先 memset 再逐字段填，所以可以按内容比较与缓存。拓扑也在里面：Vulkan 里它是管线状态，
+// 而 NVN 把它放在绘制命令上，所以同一条着色器会因拓扑不同而有多条管线。
+// The graphics pipeline state one draw needs. The replay layer interprets it from the **shadow state** (packed
+// bit-field objects -> Vulkan enums, following the same mappings as the Apple side), and the caller memsets it
+// first and fills it field by field so it can be compared and cached by content. The topology is in here too: in
+// Vulkan it is pipeline state while NVN puts it on the draw command, so one shader pair can have several
+// pipelines, one per topology.
+typedef struct {
+    char vs_key[VK_SHADER_KEY_LEN + 1], ps_key[VK_SHADER_KEY_LEN + 1];
+    VkPrimitiveTopology topo;
+    uint32_t color_count; VkFormat color[8];
+    uint32_t write_mask[8];                    // 每目标：r=1 g=2 b=4 a=8 | per target: r=1 g=2 b=4 a=8
+    uint8_t blend_en[8];
+    VkBlendFactor src_rgb[8], dst_rgb[8], src_a[8], dst_a[8];
+    VkBlendOp eq_rgb[8], eq_a[8];
+    VkFormat depth_fmt, stencil_fmt;
+    uint32_t samples, a2c;
+    uint8_t depth_test, depth_write; VkCompareOp depth_op;
+    uint8_t stencil_en; VkCompareOp stencil_func[2]; uint32_t stencil_vmask[2], stencil_wmask[2];
+    VkStencilOp stencil_fail[2], stencil_zfail[2], stencil_zpass[2];
+    VkCullModeFlags cull; VkFrontFace front; VkPolygonMode poly;
+    uint8_t bias_en; float bias_factor, bias_units, bias_clamp;
+    // 顶点属性：按 NVN 属性号索引（= 着色器的 Location，见第 6 步的说明）；valid=0 表示这条属性游戏没绑，
+    // 管线里给它一个常量回退（否则着色器用到它就直接建不出管线）。
+    // Vertex attributes, indexed by NVN attribute number (= the shader's Location, see step 6's note); valid=0
+    // means the game bound no such attribute and the pipeline supplies a constant fallback for it (without one,
+    // creation fails outright the moment the shader uses it).
+    struct { uint8_t valid; uint32_t nvn_fmt, offset, stream; } attr[16];
+    struct { uint32_t stride, divisor; } stream[16];
+} vk_gfx_state;
+
+// 按状态与一对着色器建（或取缓存的）图形管线；失败返回 VK_NULL_HANDLE 并已报红计数。
+// 顶点输入以**着色器声明的输入**为准（每一个都要有属性），格式/偏移/流来自影子属性表。
+// Build (or fetch from cache) a graphics pipeline for a state and a shader pair; returns VK_NULL_HANDLE on
+// failure, already logged and counted. The vertex input follows the **inputs the shader declares** (each needs an
+// attribute) while format/offset/stream come from the shadow attribute table.
+VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_gfx_state *st);
+
+// NVN 图元 → VkPrimitiveTopology（没有对应物的那几个报一次黄并退化，见 vk_pipe.c）
+// NVN primitive -> VkPrimitiveTopology (the few without a counterpart warn once and degrade; see vk_pipe.c)
+VkPrimitiveTopology vk_topo_of(int nvn_prim);

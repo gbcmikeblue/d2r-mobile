@@ -40,6 +40,9 @@ enum { VK_STAGE_VS = 0, VK_STAGE_PS = 1, VK_STAGE_HS = 3, VK_STAGE_DS = 4, VK_ST
 // How many SPIR-V bindings one shader records (the most complex one measured has 17; plenty of margin)
 #define VK_SPV_MAXB 64
 
+// 一个着色器最多记多少个顶点输入（实测全库最多 8 个，留足余量）| how many vertex inputs one shader records (8 at most across the library; plenty of margin)
+#define VK_SPV_MAXIN 32
+
 // uniform 缓冲：SPIR-V binding ↔ 客体常量段槽号（机器码里的 c[3 + slot]）| uniform buffer: SPIR-V binding <-> guest constant slot (c[3 + slot] in the machine code)
 typedef struct { uint32_t binding; int32_t slot; } vk_cbuf_ref;
 // 存储缓冲：地址不在常量段里、而在 c[cb_slot][cb_offset] 指向的全局内存里 | storage buffer: its address is not in the constant segment but in global memory pointed at by c[cb_slot][cb_offset]
@@ -60,6 +63,9 @@ typedef struct {
     // kind). The SPIR-V bytes are dropped right after loading, so this list has to be kept then -- see the header
     // of vk_spv.h (res.json is incomplete).
     vk_spv_bind *spv; uint32_t nspv;
+    // 顶点输入（图形管线必须为每一个都配上属性）：Location 与分量个数/类型
+    // Vertex inputs (a graphics pipeline must supply an attribute for every one): Location plus component count/type
+    vk_spv_in *in; uint32_t nin;
     vk_cbuf_ref *cbuf; uint32_t ncbuf;
     vk_sbuf_ref *sbuf; uint32_t nsbuf;
     vk_tex_ref  *tex;  uint32_t ntex;

@@ -32,13 +32,25 @@ enum {
 
 typedef struct { uint32_t set, binding; int kind; } vk_spv_bind;
 
-// 扫描一个 SPIR-V 模块里所有描述符变量（存储类 UniformConstant / Uniform），按 set、binding 升序返回。
-// 返回条数；不是 SPIR-V、或结果超过 cap 时返回 -1（调用方报红）。
+// 输入变量（顶点属性）：Location 与分量个数/类型。图形管线必须为着色器声明的**每一个**输入都配上顶点属性，
+// 否则建管线直接失败；而"哪些属性"这件事只在 SPIR-V 里（res.json 只有资源绑定，实测顶点属性一条都没有）。
+// 分量类型用于格式认不出来时的回退（与苹果侧的 NVN_CT_* 一套：Float4 / SInt4 / UInt4）。
+// Input variables (vertex attributes): the Location and the component count/type. A graphics pipeline must supply
+// a vertex attribute for **every** input a shader declares or creation fails outright; and "which attributes" is
+// only in the SPIR-V (res.json has resource bindings only and, measured, no vertex attributes at all). The
+// component type serves as the fallback when the format is unrecognised (the same set as Apple's NVN_CT_*:
+// Float4 / SInt4 / UInt4).
+enum { VK_SPV_F32 = 0, VK_SPV_I32, VK_SPV_U32 };
+typedef struct { uint32_t loc, comps, ctype; } vk_spv_in;
+
+// 扫描一个 SPIR-V 模块：描述符变量写进 out（最多 cap 条），输入变量写进 ins（最多 incap 条，可为 NULL）。
+// 返回描述符条数；不是 SPIR-V、结果超限、或模块头的 id 上界超过表容量时返回 -1（调用方报红）。
 // max: the module's words. Only declarations are read (everything precedes the first OpFunction).
-// Scans every descriptor variable (UniformConstant / Uniform storage class) of a SPIR-V module and returns them
-// sorted by set then binding. Returns the count, or -1 when the module is not SPIR-V or the result exceeds cap
-// (the caller reports a failure). The scan reads declarations only (everything precedes the first OpFunction).
-int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap);
+// Scans a SPIR-V module: descriptor variables go into out (at most cap) and input variables into ins (at most
+// incap; may be NULL). Returns the descriptor count, or -1 when the module is not SPIR-V, the result exceeds a
+// cap, or the header's id bound exceeds the table capacity (the caller reports a failure).
+int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap,
+                vk_spv_in *ins, int incap, int *nins_out);
 
 // 种类名（日志用）| a kind's name (for logs)
 const char *vk_spv_kind_name(int kind);

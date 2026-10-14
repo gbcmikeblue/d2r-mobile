@@ -285,6 +285,249 @@ VkPipeline vk_pipe_compute_variant(const vk_shader *cs, int variant) {
     return p;
 }
 
+// ========== 图形管线 ==========
+// ========== Graphics pipelines ==========
+
+// NVN 图元 → VkPrimitiveTopology。线环 / 四边形 / 多边形在 Vulkan 里没有对应物，报一次黄并退化成最接近的那个
+//（D2R 的实际绘制只用三角形与三角形带，所以这条退化路径先只保证"不静默"）。
+// NVN primitive -> VkPrimitiveTopology. Line loops / quads / polygons have no Vulkan counterpart; warn once and
+// degrade to the closest one (D2R's real draws use triangles and triangle strips only, so this degradation path
+// exists mainly to not be silent).
+VkPrimitiveTopology vk_topo_of(int p) {
+    switch (p) {
+        case 0x0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        case 0x1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        case 0x2: { static int said; if (!said++) LOG("【黄】图元 LINE_LOOP 在 Vulkan 里没有对应物：按 LINE_STRIP 画"); return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; }
+        case 0x3: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+        case 0x4: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        case 0x5: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        case 0x6: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+        case 0x7: { static int said; if (!said++) LOG("【黄】图元 QUADS 在 Vulkan 里没有对应物：按 TRIANGLE_LIST 画"); return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; }
+        case 0x8: { static int said; if (!said++) LOG("【黄】图元 QUAD_STRIP 在 Vulkan 里没有对应物：按 TRIANGLE_STRIP 画"); return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; }
+        case 0x9: { static int said; if (!said++) LOG("【黄】图元 POLYGON 在 Vulkan 里没有对应物：按 TRIANGLE_FAN 画"); return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; }
+        case 0xA: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+        case 0xB: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+        case 0xC: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+        case 0xD: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+        case 0xE: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+        default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
+
+// NVN 顶点属性格式（0x01..0x30）→ VkFormat。编号是有规律的：每 12 个一组（分量数 1..4），组内顺序是
+// {UCharN, CharN, UChar, Char, Half, UShortN, ShortN, UShort, Short, Float, UInt, Int}
+//（与苹果侧 vfmt 的表同一套编号，只是目标语言不同）。0x3D/0x3F/0x9A 是三个特例。
+// NVN vertex attribute format (0x01..0x30) -> VkFormat. The numbering is regular: groups of 12 (component counts
+// 1..4) with the order {UCharN, CharN, UChar, Char, Half, UShortN, ShortN, UShort, Short, Float, UInt, Int} inside
+// a group (the same numbering as Apple's vfmt table, only a different target language). 0x3D/0x3F/0x9A are specials.
+static const VkFormat g_attr_fmt[4][12] = {
+    { VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT, VK_FORMAT_R16_SFLOAT,
+      VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SNORM, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT, VK_FORMAT_R32_SFLOAT,
+      VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT },
+    { VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SINT, VK_FORMAT_R16G16_SFLOAT,
+      VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT, VK_FORMAT_R32G32_SFLOAT,
+      VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_SINT },
+    { VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8_SNORM, VK_FORMAT_R8G8B8_UINT, VK_FORMAT_R8G8B8_SINT, VK_FORMAT_R16G16B16_SFLOAT,
+      VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16_UINT, VK_FORMAT_R16G16B16_SINT, VK_FORMAT_R32G32B32_SFLOAT,
+      VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32_SINT },
+    { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SNORM, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT, VK_FORMAT_R16G16B16A16_SFLOAT,
+      VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT, VK_FORMAT_R32G32B32A32_SFLOAT,
+      VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT },
+};
+static int attr_fmt_vk(uint32_t f, VkFormat *out) {
+    if (f >= 0x01 && f <= 0x30) {
+        uint32_t n = (f - 1) / 12, k = (f - 1) % 12;
+        if (n < 4) { *out = g_attr_fmt[n][k]; return 1; }
+    }
+    switch (f) {
+        case 0x3D: *out = VK_FORMAT_A2B10G10R10_UNORM_PACK32; return 1;
+        case 0x3F: *out = VK_FORMAT_B10G11R11_UFLOAT_PACK32; return 1;
+        case 0x9A: *out = VK_FORMAT_B8G8R8A8_UNORM; return 1;
+    }
+    return 0;
+}
+// 回退格式：着色器声明的分量类型与个数（与苹果侧的 NVN_CT_* 一套）| fallback format: the component type and count the shader declares (Apple's NVN_CT_* set)
+static VkFormat fallback_fmt(uint32_t ctype, uint32_t comps) {
+    static const VkFormat f[3][4] = {
+        { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT },
+        { VK_FORMAT_R32_SINT, VK_FORMAT_R32G32_SINT, VK_FORMAT_R32G32B32_SINT, VK_FORMAT_R32G32B32A32_SINT },
+        { VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32A32_UINT },
+    };
+    if (comps < 1) comps = 1;
+    if (comps > 4) comps = 4;
+    if (ctype > 2) ctype = 0;
+    return f[ctype][comps - 1];
+}
+
+#define DUMMY_BIND 31   // 常量回退属性挂在这一号绑定上（1 个元素、每实例推进）| the constant-fallback attributes ride on this binding (one element, advancing per instance)
+
+// 非实心填充要开 fillModeNonSolid 特性（设备侧没开就建不出管线），所以退回实心并只报一次
+// Non-solid fill needs the fillModeNonSolid feature (not enabled on the device, so creation would fail), so fall
+// back to solid and report it once
+static void poly_warn_once(int mode) {
+    static int said;
+    if (!said++) LOG("【黄】多边形模式 %d 需要 fillModeNonSolid 特性：按实心画", mode);
+}
+
+#define GPSO_TAB 192
+typedef struct { vk_gfx_state st; VkPipeline p; int used; } gpso_e;
+static gpso_e g_gpso[GPSO_TAB];
+static uint32_t bytes_hash(const void *p, size_t n) {
+    const uint8_t *b = p;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+    return h;
+}
+
+VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_gfx_state *st) {
+    if (!vs || !st || vs->mod == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    uint32_t h = bytes_hash(st, sizeof *st) & (GPSO_TAB - 1);
+    for (uint32_t k = 0; k < GPSO_TAB; k++) {
+        gpso_e *e = &g_gpso[(h + k) & (GPSO_TAB - 1)];
+        if (!e->used) break;
+        if (!memcmp(&e->st, st, sizeof *st)) return e->p;
+    }
+
+    const vk_shader *one[2] = { vs, ps };
+    VkPipelineLayout lay = vk_pipe_layout(one, ps ? 2 : 1);
+    if (lay == VK_NULL_HANDLE) { g_n_fail++; return VK_NULL_HANDLE; }
+
+    VkPipelineShaderStageCreateInfo sh[2];
+    int nsh = 0;
+    sh[nsh++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main" };
+    if (ps && ps->mod != VK_NULL_HANDLE)
+        sh[nsh++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = ps->mod, .pName = "main" };
+
+    // 顶点输入：以**顶点着色器声明的输入**为准（每一个都要有属性），格式/偏移/流来自影子属性表。
+    // 游戏没绑、或流步长为 0（NVN 的"常量流"）、或格式认不出来的，挂到常量回退绑定上。
+    // Vertex input: follows the **inputs the vertex shader declares** (each needs one), with format/offset/stream
+    // from the shadow attribute table. Anything the game did not bind, or whose stream stride is 0 (NVN's
+    // "constant stream"), or whose format is unrecognised, rides on the constant-fallback binding.
+    VkVertexInputBindingDescription vbind[17];
+    VkVertexInputAttributeDescription vatt[VK_SPV_MAXIN];
+    uint32_t nb = 0, na = 0, dummies = 0;
+    uint8_t stream_used[16];
+    memset(stream_used, 0, sizeof stream_used);
+    for (uint32_t i = 0; i < vs->nin && na < VK_SPV_MAXIN; i++) {
+        uint32_t loc = vs->in[i].loc;
+        if (loc >= 16) {   // 影子属性表按 NVN 属性号（0..15）索引，超出的一律走回退 | the shadow table is indexed by NVN attribute number (0..15); anything beyond falls back
+            static int said;
+            if (!said++) LOG("【黄】顶点着色器 %s 的输入 Location %u 超出 NVN 属性域：用常量回退", vs->key, loc);
+            vatt[na].location = loc; vatt[na].format = fallback_fmt(vs->in[i].ctype, vs->in[i].comps);
+            vatt[na].offset = 0; vatt[na].binding = DUMMY_BIND;
+            na++; dummies++;
+            continue;
+        }
+        const uint32_t st_ = st->attr[loc].stream < 16 ? st->attr[loc].stream : 0;
+        VkFormat f = VK_FORMAT_UNDEFINED;
+        int ok = st->attr[loc].valid && attr_fmt_vk(st->attr[loc].nvn_fmt, &f) && st->stream[st_].stride;
+        if (!ok) {   // 回退：常量属性（全零的小缓冲，每个实例一个元素）| fallback: a constant attribute (a small zeroed buffer, one element per instance)
+            vatt[na].location = loc; vatt[na].format = fallback_fmt(vs->in[i].ctype, vs->in[i].comps);
+            vatt[na].offset = 0; vatt[na].binding = DUMMY_BIND;
+            na++; dummies++;
+            if (st->attr[loc].valid && st->attr[loc].nvn_fmt) {
+                static int said2;
+                if (!said2++) LOG("【黄】顶点属性格式 %#x 未映射：用常量回退", st->attr[loc].nvn_fmt);
+            }
+            continue;
+        }
+        vatt[na].location = loc; vatt[na].format = f;
+        vatt[na].offset = st->attr[loc].offset; vatt[na].binding = 16 + st_;
+        na++;
+        if (!stream_used[st_]) {
+            stream_used[st_] = 1;
+            vbind[nb].binding = 16 + st_;
+            vbind[nb].stride = st->stream[st_].stride;
+            vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            if (st->stream[st_].divisor) {   // 每实例：Vulkan 的 divisor 需要扩展，暂按 1（见提交说明）| per instance: Vulkan's divisor needs an extension, so 1 for now (see the commit message)
+                vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+                static int said3;
+                if (st->stream[st_].divisor > 1 && !said3++) LOG("【黄】顶点流 %u 的 divisor=%u：暂按 1 处理（缺 VK_EXT_vertex_attribute_divisor）", st_, st->stream[st_].divisor);
+            }
+            nb++;
+        }
+    }
+    if (dummies) {
+        vbind[nb].binding = DUMMY_BIND; vbind[nb].stride = 16;
+        vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+        nb++;
+    }
+
+    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = nb, .pVertexBindingDescriptions = nb ? vbind : NULL,
+        .vertexAttributeDescriptionCount = na, .pVertexAttributeDescriptions = na ? vatt : NULL };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = st->topo, .primitiveRestartEnable = VK_FALSE };
+    VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        // 没有片元阶段时规范要求丢弃光栅化（探针用顶点着色器单独验管线时走这条）| the spec requires rassterizer discard when there is no fragment stage (the probe exercises a pipeline with the vertex shader alone)
+        .rasterizerDiscardEnable = nsh == 1 ? VK_TRUE : VK_FALSE,
+        .polygonMode = st->poly == VK_POLYGON_MODE_FILL ? VK_POLYGON_MODE_FILL
+                     : (poly_warn_once(st->poly), VK_POLYGON_MODE_FILL),
+        .cullMode = st->cull, .frontFace = st->front,
+        .depthBiasEnable = st->bias_en ? VK_TRUE : VK_FALSE,
+        .depthBiasConstantFactor = st->bias_factor, .depthBiasClamp = st->bias_clamp, .depthBiasSlopeFactor = st->bias_units,
+        .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = st->samples ? st->samples : VK_SAMPLE_COUNT_1_BIT,
+        .alphaToCoverageEnable = st->a2c ? VK_TRUE : VK_FALSE };
+    VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = st->depth_test ? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = st->depth_write ? VK_TRUE : VK_FALSE,
+        .depthCompareOp = st->depth_test ? st->depth_op : VK_COMPARE_OP_ALWAYS,
+        .stencilTestEnable = st->stencil_en ? VK_TRUE : VK_FALSE };
+    if (st->stencil_en) {
+        ds.front = (VkStencilOpState){ .failOp = st->stencil_fail[0], .passOp = st->stencil_zpass[0],
+            .depthFailOp = st->stencil_zfail[0], .compareOp = st->stencil_func[0],
+            .compareMask = st->stencil_vmask[0], .writeMask = st->stencil_wmask[0], .reference = 0 };
+        ds.back = (VkStencilOpState){ .failOp = st->stencil_fail[1], .passOp = st->stencil_zpass[1],
+            .depthFailOp = st->stencil_zfail[1], .compareOp = st->stencil_func[1],
+            .compareMask = st->stencil_vmask[1], .writeMask = st->stencil_wmask[1], .reference = 0 };
+    }
+    VkPipelineColorBlendAttachmentState cb[8];
+    memset(cb, 0, sizeof cb);
+    for (uint32_t i = 0; i < st->color_count && i < 8; i++) {
+        cb[i].blendEnable = st->blend_en[i] ? VK_TRUE : VK_FALSE;
+        cb[i].srcColorBlendFactor = st->src_rgb[i]; cb[i].dstColorBlendFactor = st->dst_rgb[i];
+        cb[i].srcAlphaBlendFactor = st->src_a[i]; cb[i].dstAlphaBlendFactor = st->dst_a[i];
+        cb[i].colorBlendOp = st->eq_rgb[i]; cb[i].alphaBlendOp = st->eq_a[i];
+        cb[i].colorWriteMask = (VkColorComponentFlags)st->write_mask[i];
+    }
+    VkPipelineColorBlendStateCreateInfo cbs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = st->color_count > 8 ? 8 : st->color_count, .pAttachments = cb };
+    const VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkPipelineDynamicStateCreateInfo dsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 3, .pDynamicStates = dyn };
+    // 动态渲染：附件的格式要在这里声明（管线与通道的兼容性由它决定）| dynamic rendering: the attachment formats are declared here (they decide pipeline/pass compatibility)
+    VkPipelineRenderingCreateInfo prc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = st->color_count > 8 ? 8 : st->color_count, .pColorAttachmentFormats = st->color,
+        .depthAttachmentFormat = st->depth_fmt, .stencilAttachmentFormat = st->stencil_fmt };
+    VkGraphicsPipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &prc,
+        .stageCount = (uint32_t)nsh, .pStages = sh, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+        .pColorBlendState = &cbs, .pDynamicState = &dsi, .layout = lay };
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(vk_dev(), VK_NULL_HANDLE, 1, &ci, NULL, &p);
+    if (r != VK_SUCCESS) {
+        g_n_fail++;
+        LOG("【红】建图形管线失败：VkResult %d（顶点 %s 片元 %s，属性 %u 条、流 %u 条、目标 %u 个、拓扑 %d）",
+            (int)r, vs->key, ps ? ps->key : "无", na, nb, st->color_count, (int)st->topo);
+        return VK_NULL_HANDLE;
+    }
+    // 存进缓存（满了就丢掉最老的那个槽，只求不无限增长）| store in the cache (when full, drop the oldest slot rather than grow without bound)
+    uint32_t slot = 0;
+    for (uint32_t k = 0; k < GPSO_TAB; k++) { slot = (h + k) & (GPSO_TAB - 1); if (!g_gpso[slot].used) break; }
+    if (g_gpso[slot].used) vkDestroyPipeline(vk_dev(), g_gpso[slot].p, NULL);
+    g_gpso[slot].st = *st; g_gpso[slot].p = p; g_gpso[slot].used = 1;
+    g_n_gpso++;
+    return p;
+}
+
 void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uint64_t *gpso, uint64_t *fail) {
     if (set_layouts) *set_layouts = g_n_dsl;
     if (layouts) *layouts = g_n_lay;

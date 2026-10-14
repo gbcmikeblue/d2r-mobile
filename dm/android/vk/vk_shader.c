@@ -290,7 +290,7 @@ static void free_ref(vk_shader *sh) {
     sh->cbuf = NULL; sh->sbuf = NULL; sh->tex = NULL;
     sh->ncbuf = sh->nsbuf = sh->ntex = 0;
 }
-static void free_spv(vk_shader *sh) { free(sh->spv); sh->spv = NULL; sh->nspv = 0; }
+static void free_spv(vk_shader *sh) { free(sh->spv); sh->spv = NULL; sh->nspv = 0; free(sh->in); sh->in = NULL; sh->nin = 0; }
 
 // ---------- 装载 ----------
 static vk_shader *load(const char *key, int stage) {
@@ -347,7 +347,9 @@ static vk_shader *load(const char *key, int stage) {
     // list every binding in the SPIR-V -- which is exactly how 3 compute pipelines failed on the device.
     if (r == VK_SUCCESS) {
         sh->spv = calloc(VK_SPV_MAXB, sizeof *sh->spv);
-        int nb = sh->spv ? vk_spv_scan((const uint32_t *)code, n, sh->spv, VK_SPV_MAXB) : -1;
+        sh->in = calloc(VK_SPV_MAXIN, sizeof *sh->in);
+        int ni = 0;
+        int nb = (sh->spv && sh->in) ? vk_spv_scan((const uint32_t *)code, n, sh->spv, VK_SPV_MAXB, sh->in, VK_SPV_MAXIN, &ni) : -1;
         if (nb < 0) {
             if (g_red_bad++ < 5) LOG("【红】着色器 %s 的 SPIR-V 绑定读不出来（%zu 字节）", key, n);
             free(code); free_ref(sh); free_spv(sh); free(sh);
@@ -355,6 +357,7 @@ static vk_shader *load(const char *key, int stage) {
             return NULL;
         }
         sh->nspv = (uint32_t)nb;
+        sh->nin = (uint32_t)ni;
     }
     free(code);
     if (r != VK_SUCCESS) {

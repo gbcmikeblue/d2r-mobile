@@ -40,6 +40,7 @@ int main(void) {
     uint32_t fail_dsl = 0, fail_pipe = 0;
     char first_dsl_bad[32] = "", first_pipe_bad[32] = "";
     uint64_t binds = 0;
+    uint32_t ngfx_try = 0, ngfx_ok = 0;
     struct dirent *de;
     while ((de = readdir(d))) {
         size_t l = strlen(de->d_name);
@@ -86,6 +87,27 @@ int main(void) {
             }
             (void)0;
         }
+
+        // 图形管线自检：给顶点着色器建一条（不带片元阶段 → 光栅化丢弃，规范如此要求）。顶点输入取自
+        // **着色器声明的输入**，影子属性表故意留空 → 每条属性都走常量回退。这样验的是管线构造本身：
+        // 属性/绑定/格式、混合与写掩码、深度模板、动态状态、以及动态渲染的附件格式。
+        // Graphics pipeline self-check: build one for a vertex shader (no fragment stage -> rasterizer discard, as
+        // the spec requires). The vertex input comes from the **inputs the shader declares** and the shadow
+        // attribute table is deliberately left empty, so every attribute takes the constant fallback. What this
+        // verifies is the construction itself: attributes/bindings/formats, blend and write masks, depth-stencil,
+        // dynamic state, and the dynamic-rendering attachment formats.
+        if (sh->stage == VK_STAGE_VS && ngfx_try < 60) {
+            ngfx_try++;
+            vk_gfx_state g;
+            memset(&g, 0, sizeof g);
+            memcpy(g.vs_key, sh->key, VK_SHADER_KEY_LEN);
+            g.topo = vk_topo_of(4);
+            g.color_count = 1; g.color[0] = VK_FORMAT_R8G8B8A8_UNORM;
+            g.write_mask[0] = 0xF;
+            g.poly = VK_POLYGON_MODE_FILL; g.cull = VK_CULL_MODE_NONE; g.front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            g.samples = 1;
+            if (vk_pipe_graphics(sh, NULL, &g) != VK_NULL_HANDLE) ngfx_ok++;
+        }
         if (sh->stage == VK_STAGE_CS) {
             ncs++;
             if (vk_pipe_compute(sh) != VK_NULL_HANDLE) npipe++;
@@ -119,6 +141,8 @@ int main(void) {
            (unsigned long long)dsl, (unsigned long long)lay, (unsigned long long)cpso,
            (unsigned long long)gpso, (unsigned long long)fail);
     printf("交叉核对：SPIR-V 有而 res.json 没有的绑定共 %u 条（布局以 SPIR-V 为准，所以这不影响建管线）\n", miss_total);
+    printf("图形管线（顶点着色器各建一条、属性走常量回退）：试 %u、成功 %u%s\n", ngfx_try, ngfx_ok,
+           ngfx_try && ngfx_ok != ngfx_try ? "  ← 有失败，看上面的【红】" : "");
     printf("耗时 %.1f 秒（布局按键去重，所以句柄数少于着色器数）\n", now_s() - t0);
     printf("%s\n", (fail_dsl || fail_pipe) ? "✗ 有失败：先看上面的键与 VkResult" : "✓ 全库布局与全部计算管线都被驱动收下");
     return (int)(fail_dsl + fail_pipe);
