@@ -23,7 +23,9 @@
 #include "nvn_mtl.h"
 #include "nvn_obj.h"
 #include "vk_device.h"
+#include "vk_pipe.h"
 #include "vk_region.h"
+#include "vk_shader.h"
 #include "vk_tex.h"
 #include "dm.h"
 #include <pthread.h>
@@ -234,8 +236,34 @@ typedef struct {
     const prog_t *prog;
     uint64_t blend_rgba;             // 混合常量（4 个 float 原样）| blend constant (four floats verbatim)
     int stencil_have, poly_have;
+    // 混合状态**按目标分存**：nvnCommandBufferBindBlendState 只传状态对象、目标号在对象里面（blend_st.target），
+    // 所以不能像别的状态那样只留最后一份 | the blend state is stored **per target**: BindBlendState passes only the
+    // state object and the target number lives inside it (blend_st.target), so unlike the other states a single last
+    // copy will not do
+    blend_st blend[8]; uint8_t blend_have;
+    // ---- 顶点输入与资源绑定（M2-6d-3）：绑定类 op 占命令流七成（实测前五名合计 70.5%），
+    //      所以这里一律"只存不解释"，把解释推迟到绘制时（与苹果侧的影子状态同一套做法）。
+    // ---- vertex input and resource bindings (M2-6d-3): bind ops are 70% of the stream (the measured top five are
+    //      70.5% together), so everything here is stored rather than interpreted, deferring that to draw time (the
+    //      same shape as Apple's shadow state).
+    va_st va[16]; uint16_t va_have;               // 位图：哪几号属性被绑过 | bitmap: which attribute numbers were bound
+    vs_st stream[16]; uint16_t stream_have;
+    NVNbufferRange vbuf[16]; uint16_t vbuf_have;
+    struct { uint64_t addr, size; } ubo[6][16], ssbo[6][128];
+    uint16_t ubo_have[6];                         // 16 位位图 | a 16-bit bitmap
+    uint64_t ssbo_have[6][2];                     // 128 位用两个 64 位字 | 128 bits take two 64-bit words
+    uint64_t tex[6][128], samp[6][128], img[6][32];
+    uint64_t tex_have[6][2], samp_have[6][2];     // 128 位用两个 64 位字 | 128 bits take two 64-bit words
+    uint32_t img_have[6];
+    dpool_t texpool, samppool; int have_texpool, have_samppool;
+    // 模板的值掩码 / 写掩码 / 参考值（按面，默认 0xff，与苹果侧一致；哪一项由 p_stencil.which 决定）
+    // Stencil value mask / write mask / reference (per face, defaulting to 0xff as on Apple; p_stencil.which picks one)
+    uint32_t st_vmask[2], st_wmask[2], st_ref[2];
+    float po_factor, po_units, po_clamp;          // 多边形偏移的三个值 | the three polygon offset values
 } rstate_t;
-static rstate_t g_rs;
+// 模板掩码的默认值：NVN / GL 的默认是全通，苹果侧同样按 0xff 起步（nvn_mtl.m 的状态复位）
+// Stencil mask defaults: NVN / GL default to all-ones, and the Apple side starts at 0xff too (its state reset)
+static rstate_t g_rs = { .st_vmask = { 0xff, 0xff }, .st_wmask = { 0xff, 0xff } };
 static _Atomic uint64_t g_pass_n, g_clear_n, g_draw_skip, g_shadow_n;
 static void pass_begin(void);
 static void pass_end(void);
@@ -496,6 +524,140 @@ static void pass_begin(void) {
     atomic_fetch_add(&g_pass_n, 1);
 }
 
+// ========== 影子状态 → 图形管线状态（M2-6d-3 的解释层）==========
+// ========== Shadow state -> graphics pipeline state (the interpretation layer of M2-6d-3) ==========
+// 与苹果侧的 pso_key_fill 同一套语义：位域对象 → Vulkan 枚举。所有"按面/按目标分存"的状态在这里摊平。
+// The same semantics as Apple's pso_key_fill: packed bit-field objects -> Vulkan enums. Every per-face / per-target
+// state is flattened here.
+static VkBlendFactor vk_bfac(uint32_t f) {
+    switch (f) {
+        case 0x01: return VK_BLEND_FACTOR_ZERO; case 0x02: return VK_BLEND_FACTOR_ONE;
+        case 0x03: return VK_BLEND_FACTOR_SRC_COLOR; case 0x04: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        case 0x05: return VK_BLEND_FACTOR_SRC_ALPHA; case 0x06: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        case 0x07: return VK_BLEND_FACTOR_DST_ALPHA; case 0x08: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+        case 0x09: return VK_BLEND_FACTOR_DST_COLOR; case 0x0A: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+        case 0x0B: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+        case 0x10: return VK_BLEND_FACTOR_SRC1_COLOR; case 0x11: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+        case 0x12: return VK_BLEND_FACTOR_SRC1_ALPHA; case 0x13: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+        case 0x61: return VK_BLEND_FACTOR_CONSTANT_COLOR; case 0x62: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+        case 0x63: return VK_BLEND_FACTOR_CONSTANT_ALPHA; case 0x64: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    }
+    return VK_BLEND_FACTOR_ONE;
+}
+// NVN 的混合运算 / 比较运算 / 模板运算编号都从 1 起且顺序与 Vulkan 一致，所以减一即可（苹果侧同样这么转）
+// NVN's blend / compare / stencil operation numbers start at 1 in the same order as Vulkan, so subtracting one is
+// all it takes (Apple converts the same way)
+static VkBlendOp vk_bop(uint32_t e) {
+    switch (e) { case 2: return VK_BLEND_OP_SUBTRACT; case 3: return VK_BLEND_OP_REVERSE_SUBTRACT;
+                 case 4: return VK_BLEND_OP_MIN; case 5: return VK_BLEND_OP_MAX; }
+    return VK_BLEND_OP_ADD;
+}
+static VkCompareOp vk_cmp(uint32_t f) {
+    if (f < 1 || f > 8) return VK_COMPARE_OP_ALWAYS;
+    return (VkCompareOp)(f - 1);
+}
+static VkStencilOp vk_sop(uint32_t o) {
+    if (o < 1 || o > 8) return VK_STENCIL_OP_KEEP;
+    return (VkStencilOp)(o - 1);
+}
+static VkSampleCountFlagBits vk_samples(int n) {
+    switch (n) { case 2: return VK_SAMPLE_COUNT_2_BIT; case 4: return VK_SAMPLE_COUNT_4_BIT;
+                 case 8: return VK_SAMPLE_COUNT_8_BIT; case 16: return VK_SAMPLE_COUNT_16_BIT; }
+    return VK_SAMPLE_COUNT_1_BIT;
+}
+// 深度/模板附件的格式拆分：组合格式两边都给，纯深度只给深度，S8 只给模板
+// Splitting the depth/stencil attachment format: a combined format goes to both, depth-only to depth, S8 to stencil
+static void vk_ds_fmt(VkFormat f, VkFormat *df, VkFormat *sf) {
+    switch (f) {
+        case VK_FORMAT_D16_UNORM_S8_UINT: case VK_FORMAT_D24_UNORM_S8_UINT: case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            *df = f; *sf = f; return;
+        case VK_FORMAT_S8_UINT: *df = VK_FORMAT_UNDEFINED; *sf = f; return;
+        default: *df = f; *sf = VK_FORMAT_UNDEFINED; return;
+    }
+}
+
+static void gfx_state_fill(vk_gfx_state *out, int topo_prim) {
+    memset(out, 0, sizeof *out);
+    out->topo = vk_topo_of(topo_prim);
+    out->poly = VK_POLYGON_MODE_FILL;
+    out->front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+    // 颜色目标：格式按顺序取到第一个空缺为止（NVN 的目标是从 0 开始的连续编号，跳号会错位）
+    // Color targets: formats are taken in order until the first gap (NVN numbers its targets contiguously from 0,
+    // so skipping one would misalign everything)
+    for (int i = 0; i < g_rs.ncolor && i < 8 && g_rs.color[i]; i++) {
+        VkFormat f = VK_FORMAT_UNDEFINED;
+        if (!vk_fmt_to_vk(g_rs.color[i]->d.format, &f) || !f) {
+            static int said;
+            if (!said++) LOG("【黄】颜色目标格式 %d 没有 Vulkan 对应物：这条流按不出图处理", g_rs.color[i]->d.format);
+            out->color_count = 0;
+            break;
+        }
+        out->color[out->color_count++] = f;
+        if (g_rs.color[i]->d.samples > 1) out->samples = (uint32_t)vk_samples(g_rs.color[i]->d.samples);
+    }
+    if (g_rs.depth) {
+        VkFormat f = VK_FORMAT_UNDEFINED;
+        if (vk_fmt_to_vk(g_rs.depth->d.format, &f) && f) vk_ds_fmt(f, &out->depth_fmt, &out->stencil_fmt);
+        if (g_rs.depth->d.samples > 1) out->samples = (uint32_t)vk_samples(g_rs.depth->d.samples);
+    }
+    if (!out->samples) out->samples = (uint32_t)VK_SAMPLE_COUNT_1_BIT;
+
+    // 颜色状态：写掩码、逐目标混合、alpha-to-coverage
+    color_st co;
+    memcpy(&co, g_rs.st_bytes[1], sizeof co);
+    chmask_st cm;
+    memcpy(&cm, g_rs.st_bytes[2], sizeof cm);
+    ms_st ms;
+    memcpy(&ms, g_rs.st_bytes[3], sizeof ms);
+    for (uint32_t i = 0; i < out->color_count; i++) {
+        out->write_mask[i] = (cm.mask >> (4 * i)) & 0xf;
+        out->blend_en[i] = g_rs.blend_have & (1u << i) ? 1 : 0;
+        out->src_rgb[i] = vk_bfac(g_rs.blend[i].src_rgb); out->dst_rgb[i] = vk_bfac(g_rs.blend[i].dst_rgb);
+        out->src_a[i] = vk_bfac(g_rs.blend[i].src_a); out->dst_a[i] = vk_bfac(g_rs.blend[i].dst_a);
+        out->eq_rgb[i] = vk_bop(g_rs.blend[i].eq_rgb); out->eq_a[i] = vk_bop(g_rs.blend[i].eq_a);
+    }
+    out->a2c = ms.a2c;
+
+    // 深度模板
+    ds_st ds;
+    memcpy(&ds, g_rs.st_bytes[5], sizeof ds);
+    out->depth_test = (uint8_t)ds.dt; out->depth_write = (uint8_t)ds.dw; out->depth_op = vk_cmp(ds.df);
+    out->stencil_en = (uint8_t)ds.st;
+    out->stencil_func[0] = vk_cmp(ds.sf_f); out->stencil_func[1] = vk_cmp(ds.sf_b);
+    out->stencil_vmask[0] = g_rs.st_vmask[0]; out->stencil_vmask[1] = g_rs.st_vmask[1];
+    out->stencil_wmask[0] = g_rs.st_wmask[0]; out->stencil_wmask[1] = g_rs.st_wmask[1];
+    out->stencil_fail[0] = vk_sop(ds.fail_f); out->stencil_zfail[0] = vk_sop(ds.zfail_f); out->stencil_zpass[0] = vk_sop(ds.zpass_f);
+    out->stencil_fail[1] = vk_sop(ds.fail_b); out->stencil_zfail[1] = vk_sop(ds.zfail_b); out->stencil_zpass[1] = vk_sop(ds.zpass_b);
+
+    // 光栅：剔除面与 NVNface 同位（NONE/FRONT/BACK/FRONT_AND_BACK = 0/1/2/3），前端面要翻过来（NVN 的 CW=0 与 Vulkan 相反）
+    // Rasterization: the cull face shares NVNface's bit values (NONE/FRONT/BACK/FRONT_AND_BACK = 0/1/2/3) while the
+    // front face must be flipped (NVN's CW=0 is the opposite of Vulkan's)
+    poly_st po;
+    memcpy(&po, g_rs.st_bytes[4], sizeof po);
+    out->cull = (VkCullModeFlags)(po.cull & 3);
+    out->front = po.front ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    out->poly = (VkPolygonMode)(po.mode <= 2 ? po.mode : 2);
+    out->bias_en = po.offset_en ? 1 : 0;
+    out->bias_factor = g_rs.po_factor; out->bias_units = g_rs.po_units; out->bias_clamp = g_rs.po_clamp;
+
+    // 顶点输入：影子里的属性按 NVN 属性号存，管线按着色器声明的 Location 取（两者同一套编号，见第 9 步）
+    // Vertex input: the shadow stores attributes by NVN attribute number and the pipeline looks them up by the
+    // Location a shader declares (the same numbering, see step 9)
+    for (int k = 0; k < 16; k++) {
+        if (!(g_rs.va_have & (1u << k))) continue;
+        out->attr[k].valid = 1;
+        out->attr[k].nvn_fmt = g_rs.va[k].fmt;
+        out->attr[k].offset = g_rs.va[k].offset;
+        out->attr[k].stream = g_rs.va[k].stream;
+    }
+    for (int k = 0; k < 16; k++) {
+        if (!(g_rs.stream_have & (1u << k))) continue;
+        out->stream[k].stride = g_rs.stream[k].stride;
+        out->stream[k].divisor = g_rs.stream[k].divisor;
+    }
+}
+
 // 命令流解释器：与 Metal 侧同形（OP_JUMP / OP_CALL 构成的小程序）。CPU 可见副作用按语义执行，
 // 渲染类 op 目前只计数——每次提交报一次分布，按实测的频次决定实现次序。
 // The command stream interpreter, shaped like the Metal one (a small program of OP_JUMP / OP_CALL). CPU-visible
@@ -603,25 +765,134 @@ void mtl_exec(const uint8_t *p) {
             const p_bind_state *b = (const p_bind_state *)a;
             int k = b->kind;
             if (k >= 0 && k < 6) { memcpy(g_rs.st_bytes[k], b->bytes, sizeof g_rs.st_bytes[k]); g_rs.st_have[k] = 1; }
+            if (k == 0) {   // 混合：目标号在对象内部（blend_st.target），按它分存 | blend: the target number lives inside the object (blend_st.target), so store by it
+                blend_st bl;
+                memcpy(&bl, b->bytes, sizeof bl);
+                uint32_t tg = bl.target < 8 ? bl.target : 0;
+                g_rs.blend[tg] = bl;
+                g_rs.blend_have |= (uint8_t)(1u << tg);
+            }
             atomic_fetch_add(&g_shadow_n, 1);
             break; }
-        case OP_STENCIL: g_rs.stencil_have = 1; atomic_fetch_add(&g_shadow_n, 1); break;
-        case OP_POLY_OFFSET: g_rs.poly_have = 1; atomic_fetch_add(&g_shadow_n, 1); break;
-        case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
-        case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG:
-        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
+        case OP_STENCIL: {
+            const p_stencil *s = (const p_stencil *)a;
+            for (int f = 0; f < 2; f++) if (s->face & (1 << f)) {   // NVN_FACE_FRONT = 1、BACK = 2 | NVN_FACE_FRONT = 1, BACK = 2
+                if (s->which == 0) g_rs.st_vmask[f] = (uint32_t)s->value_mask;
+                else if (s->which == 1) g_rs.st_wmask[f] = (uint32_t)s->mask;
+                else g_rs.st_ref[f] = (uint32_t)s->ref;
+            }
+            g_rs.stencil_have = 1;
             atomic_fetch_add(&g_shadow_n, 1);
-            break;
+            break; }
+        case OP_POLY_OFFSET: {
+            const p_poly_offset *p = (const p_poly_offset *)a;
+            g_rs.po_factor = p->factor; g_rs.po_units = p->units; g_rs.po_clamp = p->clamp;
+            g_rs.poly_have = 1;
+            atomic_fetch_add(&g_shadow_n, 1);
+            break; }
+        case OP_BIND_VATTR: {
+            const p_bind_vattr *b = (const p_bind_vattr *)a;
+            for (int32_t i = 0; i < b->n && i < 16; i++) {
+                int k = b->first + i;
+                if (k < 0 || k >= 16) continue;
+                memcpy(&g_rs.va[k], &b->st[i], sizeof g_rs.va[k]);   // 载荷里是原样的 32 位字，按结构体拷 | the payload carries verbatim 32-bit words, copied as the struct
+                g_rs.va_have |= (uint16_t)(1u << k);
+            }
+            atomic_fetch_add(&g_shadow_n, 1);
+            break; }
+        case OP_BIND_VSTREAM: {
+            const p_bind_vstream *b = (const p_bind_vstream *)a;
+            for (int32_t i = 0; i < b->n && i < 16; i++) {
+                int k = b->first + i;
+                if (k < 0 || k >= 16) continue;
+                g_rs.stream[k] = b->st[i];
+                g_rs.stream_have |= (uint16_t)(1u << k);
+            }
+            atomic_fetch_add(&g_shadow_n, 1);
+            break; }
+        case OP_BIND_VBUF: {
+            const p_bind_vbuf *b = (const p_bind_vbuf *)a;
+            for (int32_t i = 0; i < b->n && i < 16; i++) {
+                int k = b->first + i;
+                if (k < 0 || k >= 16) continue;
+                g_rs.vbuf[k] = b->r[i];
+                g_rs.vbuf_have |= (uint16_t)(1u << k);
+            }
+            atomic_fetch_add(&g_shadow_n, 1);
+            break; }
+        case OP_BIND_UBO: case OP_BIND_SSBO: {
+            const p_bind_buf *b = (const p_bind_buf *)a;
+            int stg = b->stage, idx = b->index;
+            if (stg >= 0 && stg < 6 && idx >= 0) {
+                if (h.op == OP_BIND_UBO && idx < 16) {
+                    g_rs.ubo[stg][idx].addr = b->addr; g_rs.ubo[stg][idx].size = b->size;
+                    g_rs.ubo_have[stg] |= (uint16_t)(1u << idx);
+                } else if (h.op == OP_BIND_SSBO && idx < 128) {
+                    g_rs.ssbo[stg][idx].addr = b->addr; g_rs.ssbo[stg][idx].size = b->size;
+                    g_rs.ssbo_have[stg][idx >> 6] |= 1ull << (idx & 63);
+                }
+            }
+            atomic_fetch_add(&g_shadow_n, 1);
+            break; }
+        case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: {
+            const p_bind_handles *b = (const p_bind_handles *)a;
+            int stg = b->stage;
+            if (stg >= 0 && stg < 6) {
+                for (int32_t i = 0; i < b->n && i < 32; i++) {
+                    int k = b->first + i;
+                    if (k < 0) continue;
+                    if (h.op == OP_BIND_IMG) {
+                        if (k >= 32) continue;
+                        g_rs.img[stg][k] = b->h[i];
+                        g_rs.img_have[stg] |= (uint32_t)(1u << k);
+                    } else if (k < 128) {
+                        if (h.op == OP_BIND_TEX) {
+                            g_rs.tex[stg][k] = b->h[i];
+                            g_rs.tex_have[stg][k >> 6] |= 1ull << (k & 63);
+                        } else {
+                            g_rs.samp[stg][k] = b->h[i];
+                            g_rs.samp_have[stg][k >> 6] |= 1ull << (k & 63);
+                        }
+                    }
+                }
+            }
+            atomic_fetch_add(&g_shadow_n, 1);
+            break; }
+        case OP_SET_TEX_POOL: { const p_set_pool *p = (const p_set_pool *)a; g_rs.texpool = *p->pool; g_rs.have_texpool = 1; atomic_fetch_add(&g_shadow_n, 1); break; }
+        case OP_SET_SAMP_POOL: { const p_set_pool *p = (const p_set_pool *)a; g_rs.samppool = *p->pool; g_rs.have_samppool = 1; atomic_fetch_add(&g_shadow_n, 1); break; }
 
-        // ---- 绘制：需要管线，留给下一步（M2-6d）。只计数，并把首批的现场打出来，好知道要建什么 ----
-        // ---- draws: they need pipelines and are left to the next step (M2-6d). Only counted, with the first few
-        //      logged so we know what has to be built ----
+        // ---- 绘制：M2-6d-3 的第一步——把影子状态解释成管线状态并**真建一条管线**，但还不绘制（描述符写入是下一步）。
+        //      这样"影子存储 + 状态解释"就能在真机跑游戏时被验证：管线建不建得出来、属性与格式对不对、拓扑是什么。
+        // ---- draws: the first half of M2-6d-3 -- interpret the shadow state into pipeline state and really build a
+        //      pipeline, but do not draw yet (writing descriptors is the next step). This makes the shadow storage and
+        //      the state interpretation verifiable while the game runs on the device: whether the pipeline builds,
+        //      whether attributes and formats line up, and which topology it is.
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: {
+            const p_draw *d = (const p_draw *)a;   // 两种绘制的载荷都以 prim/first 开头，按 p_draw 读拓扑是安全的 | both draw payloads start with prim/first, so reading the topology through p_draw is safe
             uint64_t k = atomic_fetch_add(&g_draw_skip, 1);
-            if (k < 6) {
-                const p_draw *d = (const p_draw *)a;
-                LOG("【黄】绘制先跳过（还没有管线）：%s first=%d count=%d 程序=%p 目标 %d 个 视口 %d 个",
-                    g_opname[h.op], d->first, d->count, (const void *)g_rs.prog, g_rs.ncolor, g_rs.nvp);
+            if (k < 8 || (k & 2047) == 2047) {
+                // 静态而不是栈上：mtl_exec 是递归的（OP_CALL），而它的栈是**客体的栈**——宿主在客体栈上展开
+                // 每多一个字节都可能把客体线程推过栈底。这个结构体 ~600 字节，放静态没有代价（用完即弃、
+                // 中间不重入：fill 与建管线之间没有别的 mtl_exec）。
+                // Static rather than on the stack: mtl_exec recurses (OP_CALL) and its stack is **the guest's stack** --
+                // every extra byte of host frame can push a guest thread past the bottom of its stack. This struct is
+                // about 600 bytes and costs nothing as a static (used and dropped immediately, with no re-entry between
+                // the fill and the pipeline build).
+                static vk_gfx_state stv;
+                gfx_state_fill(&stv, d->prim);
+                const vk_shader *vs = NULL, *ps = NULL;
+                if (g_rs.prog) for (uint32_t i = 0; i < g_rs.prog->nstage && i < 6; i++) {
+                    const vk_shader *sh = vk_shader_get(g_rs.prog->sd[i].control);
+                    if (!sh) continue;
+                    if (sh->stage == VK_STAGE_VS) vs = sh; else if (sh->stage == VK_STAGE_PS) ps = sh;
+                }
+                VkPipeline pl = vs ? vk_pipe_graphics(vs, ps, &stv) : VK_NULL_HANDLE;
+                uint64_t nlay = 0, nlay2 = 0, ncpso = 0, gpso = 0, nfail = 0;
+                vk_pipe_stats(&nlay, &nlay2, &ncpso, &gpso, &nfail);
+                LOG("%s 第 %llu 次：顶点 %s 片元 %s → 管线 %s；目标 %u 个、拓扑 %d、属性 %u 条；图形管线累计 %llu 条（失败 %llu）",
+                    g_opname[h.op], (unsigned long long)(k + 1), vs ? vs->key : "无", ps ? ps->key : "无",
+                    pl ? "建得成" : "建不出", stv.color_count, (int)stv.topo, vs ? vs->nin : 0,
+                    (unsigned long long)gpso, (unsigned long long)nfail);
             }
             break; }
 
