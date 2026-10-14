@@ -574,10 +574,9 @@ uint64_t mtl_sub_commit(void) {
         // fields would be cut off (measured)
         uint32_t pok = 0, pbad = 0;
         vk_shader_texpair_stats(&pok, &pbad);
-        LOG("[vk] 贴图绑定：配上 %llu、写空白 %llu、空槽采样器 %llu、采样器号查不到 %llu；槽配对 配 %u/漏 %u",
+        LOG("[vk] 贴图绑定：配上 %llu、写空白 %llu、采样器寄存器未知(用默认) %llu；槽配对 配 %u/漏 %u",
             (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank),
-            (unsigned long long)atomic_load(&g_desc_tex_emptysamp), (unsigned long long)atomic_load(&g_desc_tex_nosamp),
-            pok, pbad);
+            (unsigned long long)atomic_load(&g_desc_tex_nosamp), pok, pbad);
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;
@@ -880,6 +879,19 @@ static void desc_tex_probe(const vk_shader *st, const vk_tex_ref *tr) {
                 (unsigned)(t0 & 0xfffffu), (unsigned long long)(t0 >> 20), treg_of((uint32_t)t0) ? "命中" : "不在");
     if (ns) LOG("【查】首个采样器句柄 0x%llx（低 20 位 %u）", (unsigned long long)s0, (unsigned)(s0 & 0xfffffu));
     if (ni) LOG("【查】首张图像句柄 0x%llx", (unsigned long long)i0);
+    // 判定"贴图槽与采样器槽是否相交"用的现场：把非零采样器槽列出来（最多 8 个）——与上面的贴图槽集合一比即知。
+    // desc_tex_probe 打印的贴图槽分布来自"配不上的绑定"那条路，所以这里同时把非零贴图槽也列出来。
+    // The situation for deciding whether texture and sampler slots intersect: list the non-zero sampler slots (at
+    // most eight). Comparing that set with the texture slots settles it.
+    {
+        char sb[200];
+        size_t so = 0;
+        int shown = 0;
+        for (int k = 0; k < 128 && shown < 8 && so + 24 < sizeof sb; k++)
+            if (g_rs.samp[stg][k]) { so += (size_t)snprintf(sb + so, sizeof sb - so, " %d:0x%llx", k, (unsigned long long)g_rs.samp[stg][k]); shown++; }
+        sb[so] = 0;
+        LOG("【查】阶段 %d 的非零采样器槽（最多 8 个）：%s", stg, so ? sb : "（没有）");
+    }
     uint32_t ha = (uint32_t)tr->handle;
     void *hb = NULL; uint64_t ho = 0;
     if (ha && mtl_addr(ha, 4, &hb, &ho)) {
@@ -984,27 +996,26 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                     const treg_e *e = treg_of((uint32_t)h);
                     if (e) {
                         texv = vk_tex_view(&e->t);
-                        // 采样器句柄的高 20 位是号，但 0xFFF 是 NVN 的**空槽哨兵**（真机实测槽上绑的是
-                        // 0xfff00000）：那些槽是用来"填满"的，落到它们上的绑定本来就不会被采样，所以用一个
-                        // 默认采样器是对的、不是缺口。真正值得追的是"绑了号、但注册表里没有它"。
-                        // The handle's high 20 bits are the id, but 0xFFF is NVN's **empty-slot sentinel** (the device
-                        // shows 0xfff00000 bound on those slots): such slots exist to be filled and a binding landing
-                        // on one is never sampled, so using a default sampler is correct rather than a gap. What is
-                        // worth chasing is "an id is bound but the registry lacks it".
-                        uint64_t sh_ = g_rs.samp[stg_t][tr->nvn_slot];
-                        uint32_t sid = (uint32_t)(sh_ >> 20);
-                        int empty = (sh_ == 0) || (sid == 0xfffu);
-                        if (!empty) texs = samp_of_id(sid);
+                        // **采样器寄存器是未知的**：贴图槽与采样器槽是两套编号（仓库文档 dm/gfx/README.md:62 里
+                        // 两者是两个句柄表——分离贴图在 c[2][0x168+8r]、分离采样器在 c[2][0x568+8r]，r 是各自的
+                        // 寄存器号），而 D2R 根本不用合并绑定入口（BindTexture/BindTextures 调用点均为 0，只用
+                        // BindSeparate*）。所以**不能**拿贴图槽去查采样器表——早先那一版就是这么错的：它读到的
+                        // 0xfff00000 被我当成"空槽哨兵"，其实可能只是查错了槽。
+                        // 现在先一律用默认采样器（计数为"采样器寄存器未知"），等采样器寄存器落地；判定它到底该
+                        // 从哪来，靠 desc_tex_probe 打印的"该阶段非零采样器槽清单 vs 贴图槽"。
+                        // **The sampler register is unknown**: texture slots and sampler slots are two numberings (the
+                        // repo's dm/gfx/README.md:62 shows two handle tables -- separate textures at c[2][0x168+8r] and
+                        // separate samplers at c[2][0x568+8r], where r is each one's own register number) and D2R does
+                        // not use the combined entry points at all (BindTexture/BindTextures have zero call sites; only
+                        // BindSeparate* are used). So a texture slot must **not** be used to index the sampler table --
+                        // which is exactly what an earlier version did: the 0xfff00000 it read was taken for an
+                        // "empty-slot sentinel" while it may simply have been the wrong slot.
+                        // For now a default sampler is always used (counted as "sampler register unknown") until the
+                        // sampler register lands; where it should come from is decided by desc_tex_probe's "non-zero
+                        // sampler slots versus texture slots" for that stage.
+                        (void)texs;
                         if (texv) atomic_fetch_add(&g_desc_tex_ok, 1);
-                        if (!texs) {
-                            if (empty) atomic_fetch_add(&g_desc_tex_emptysamp, 1);
-                            else {
-                                static _Atomic uint64_t miss_said;
-                                if (atomic_fetch_add(&g_desc_tex_nosamp, 1) < 6 && atomic_fetch_add(&miss_said, 1) < 6)
-                                    LOG("【查】槽 %d 的采样器号 %u 在注册表里没有（采样器句柄 0x%llx、注册表 %llu 项）",
-                                        tr->nvn_slot, sid, (unsigned long long)sh_, (unsigned long long)atomic_load(&g_sreg_n));
-                            }
-                        }
+                        atomic_fetch_add(&g_desc_tex_nosamp, 1);
                     }
                 }
             }

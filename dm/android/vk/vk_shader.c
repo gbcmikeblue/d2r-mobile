@@ -307,12 +307,33 @@ static const char *facts_line(const char *key) {
 // res.json's type -> the dimension name used by the interface table. The first five were **derived from forced
 // pairings and validated locally** (see the section above); 1029 / 1283 are absent on purpose (unsettled, not guessed).
 static const char *kind_of_type(int type) {
-    switch (type) {
-        case 3: return "2d";
+    // 权威来源：`type` 就是 Ryujinx 的 `SamplerType`（一个 [Flags] 枚举）——
+    //   低 8 位（&0xff）= 基础目标：1=1D、2=TextureBuffer、3=2D、4=3D、5=Cube
+    //   bit8(256) = 数组、bit9(512) = 多重采样、bit10(1024) = 阴影比较
+    // 取值表见 dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/SamplerType.cs（另有 Maxwell 转换旁证在同目录
+    // 的 InstEmitTexture.cs）。阴影位不影响**维度**，所以与接口描述表里的维度名一一对应：
+    //   1029 = Cube|Shadow → cube；1283 = 2D|Array|Shadow → 2darray；259 = 2D|Array → 2darray；515 = 2D|MS → 2dms。
+    // 这里换掉了早先那张**统计推出来的表**：它把 2 当成 cube，而真值是 TextureBuffer（texel buffer）——2 在样本里
+    // 只出现过一次，统计被它误导了。源码表出来之后就不用推了。
+    // Authoritative source: `type` is Ryujinx's `SamplerType` (a [Flags] enum) --
+    //   low 8 bits (& 0xff) = base target: 1 = 1D, 2 = TextureBuffer, 3 = 2D, 4 = 3D, 5 = Cube
+    //   bit8 (256) = array, bit9 (512) = multisample, bit10 (1024) = shadow compare.
+    // The value table is in dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/SamplerType.cs (with a Maxwell
+    // conversion cross-check in InstEmitTexture.cs beside it). The shadow bit does not change the **dimension**, so
+    // values map one-to-one onto the dimension names of the interface table:
+    //   1029 = Cube|Shadow -> cube; 1283 = 2D|Array|Shadow -> 2darray; 259 = 2D|Array -> 2darray; 515 = 2D|MS -> 2dms.
+    // This replaces the earlier **statistically derived** table, which called 2 "cube" when it is really TextureBuffer
+    // (a texel buffer) -- 2 appeared only once in the sample and misled the statistics. With the source table there is
+    // nothing left to infer.
+    switch (type & 0xff) {
+        case 1: return "1d";
+        case 2: return "buffer";
+        case 3:
+            if (type & 256) return "2darray";
+            if (type & 512) return "2dms";
+            return "2d";
         case 4: return "3d";
-        case 2: return "cube";
-        case 5: return "cube";
-        case 259: return "2darray";
+        case 5: return (type & 256) ? "cubearray" : "cube";
         default: return NULL;
     }
 }
