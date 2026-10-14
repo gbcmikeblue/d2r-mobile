@@ -175,6 +175,35 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // 苹果页 16K、Horizon 页 4K：可访问区扩到 16K 边界（多放开的是同区未用页，不影响语义）
         // Apple pages are 16K, Horizon pages 4K: the accessible region is extended to a 16K boundary (the extra pages opened are unused pages of the same region, semantics unaffected)
         uint64_t lo = dst & ~0x3FFFull, hi = (dst + size + 0x3FFF) & ~0x3FFFull;
+        // 栈侧再留一段余量（安卓）。原因：线程栈的大小是客体按**原版（Switch）libc** 量的（真机上实测有 96 KB 的
+        // 线程栈），而客体的导入表在宿主这边指向的是**宿主的 bionic**（libc 直通表），HLE 实现也是宿主的——宿主
+        // 一个深一点的调用（格式化、dlopen、递归解析）就能把 96 KB 压穿。实测过一次完整现场：主体是
+        // stp x29,x30,[sp,#-32]! 落在栈底下面那页（PROT_NONE）→ sig=11，pc 落在 /apex/…/libc.so 里。
+        // 这里往**栈长的方向**（低地址）多放开一段，与上面按页边界多放开是同一条思路。
+        // 只放开页、**不动登记范围**：宿主的 QueryMemory 按登记表报可分配区，登记一变，SDK 那边的内存账
+        // 就对不上（实测过：把余量并进登记范围后，游戏在启动处从「能跑 37 帧」退化成直接 Break）。
+        // 与已登记的映射冲突就不留（相邻线程栈排得很密），且不越出栈区。
+        // A further margin on the stack side (Android). Why: thread stack sizes are sized by the guest for the
+        // **original (Switch) libc** (a 96 KB thread stack was measured on the real device), while the guest's
+        // imports point at the **host's bionic** on this side (the libc passthrough table) and the HLE
+        // implementations are the host's too -- one moderately deep host call (formatting, dlopen, recursive
+        // parsing) overruns 96 KB. A full report was captured once: the instruction was
+        // stp x29,x30,[sp,#-32]! landing on the page below the stack bottom (PROT_NONE) -> sig=11, with pc
+        // inside /apex/.../libc.so. The accessible region is therefore extended in the **direction the stack
+        // grows** (downwards), the same idea as the boundary rounding above.
+        // Only pages are opened; the **registered range is left alone**: the host's QueryMemory reports
+        // allocatable areas from the registry, and changing the registry throws the SDK's memory accounting off
+        // (measured: folding the margin into the registered range turned "runs 37 frames" into an immediate
+        // Break at startup). The margin is skipped when it would collide with an already registered mapping
+        // (adjacent thread stacks are packed tightly) and never leaves the stack region.
+#if defined(__ANDROID__)
+        { const uint64_t margin = 1ull << 20;   // 1 MB
+          uint64_t mlo = lo > margin ? lo - margin : (uint64_t)(uintptr_t)g_stack;
+          if (mlo < (uint64_t)(uintptr_t)g_stack) mlo = (uint64_t)(uintptr_t)g_stack;
+          mlo &= ~0x3FFFull;
+          if (mlo < lo && !map_find(mlo, lo - mlo) &&
+              !mprotect((void *)mlo, lo - mlo, PROT_READ | PROT_WRITE)) lo = mlo; }
+#endif
         if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) die("MapMemory mprotect errno=%d", errno);
         memcpy((void *)dst, (void *)src, size);   // 搬移语义：映射期间源区不被访问（Horizon 把它设为不可访问） | move semantics: the source region is not accessed while mapped (Horizon makes it inaccessible)
         map_add(dst, size, src, 0x0B /*MappedMemory*/);
