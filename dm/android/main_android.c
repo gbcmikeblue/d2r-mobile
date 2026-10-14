@@ -54,33 +54,37 @@ int main(int argc, char **argv) {
     snprintf(buf, sizeof buf, "%s/temp", root); mkdir_if_needed(buf);
 
     // RomFS：调用方可以自己用 DM_ROMFS 指；否则按候选顺序自动探测，**前面的优先**，并把选中的那个打出来。
-    //   ① /data/local/d2rm/romfs    首选：与 /data/local/tmp 同分区（快），而且不是 /data/local/tmp 那种
-    //                               可能被系统清理的临时目录，重启也不丢
-    //   ② <根>/romfs、<根>/data/romfs   早期约定：资源放在工作区里
-    //   ③ /sdcard/d2rm/romfs、/sdcard/Download/d2rm/romfs   最保险的持久位置、手机文件管理器里能直接看到
-    //                                （走 FUSE，加载会稍慢）
-    // 目录约定会随部署方式变（见 docs/ANDROID_PLAN 的部署一节），所以这里做成"按顺序找、找到即用"，
-    // 换目录时只管搬文件，宿主不用改。
+    //   ① <根>/romfs、<根>/data/romfs   首选：资源放工作区里（本机上就是 /data/local/tmp/dm/romfs），
+    //                                  与工作区同分区、读盘最快
+    //   ② /sdcard/d2rm/romfs、/sdcard/Download/d2rm/romfs   后备：重启不丢、手机文件管理器里能直接看到
+    //                                  （走 FUSE，加载稍慢）。放一份在这里就不会被系统清理影响
+    //   ③ /data/local/d2rm/romfs        需要 root 才能建（/data/local 是 root:root 且不给 shell 写），
+    //                                  列在最后只是"有就用"，没有也不提示
+    // 顺序反映的是决定本身（2026-10-14：保持工作区里那份为主，重启风险用 /sdcard 那份兜底）；
+    // 做成"按顺序找、找到即用"而不是写死，换目录时只管搬文件、宿主不用改。
     // RomFS: the caller may point at it with DM_ROMFS; otherwise candidates are probed in this order (earlier
     // ones win) and the chosen one is printed.
-    //   1. /data/local/d2rm/romfs      preferred: same partition as /data/local/tmp (fast), and not a temp-style
-    //                                 directory like /data/local/tmp that the system may clean, so it survives a reboot
-    //   2. <root>/romfs, <root>/data/romfs   the early convention, where resources live inside the workspace
-    //   3. /sdcard/d2rm/romfs, /sdcard/Download/d2rm/romfs   the safest persistent places, visible in the phone's
-    //                                 file manager (over FUSE, so loading is a bit slower)
-    // The convention follows the deployment method (see the deployment section of docs/ANDROID_PLAN), so this
-    // looks them up in order and uses the first hit: changing directories only means moving files, with no host
-    // change needed.
+    //   1. <root>/romfs, <root>/data/romfs   preferred: resources live inside the workspace (on this device that
+    //                                 is /data/local/tmp/dm/romfs), same partition, fastest reads
+    //   2. /sdcard/d2rm/romfs, /sdcard/Download/d2rm/romfs   fallback: survives a reboot and is visible in the
+    //                                 phone's file manager (over FUSE, so loading is a bit slower). Keeping a copy
+    //                                 here means the system cleaning /data/local/tmp does not matter
+    //   3. /data/local/d2rm/romfs      needs root to create (/data/local is root:root and not writable by shell);
+    //                                 listed last simply as "use it if it is there", with no warning otherwise
+    // The order reflects the decision itself (2026-10-14: keep the workspace copy as the primary and use the
+    // /sdcard copy as cover for the reboot risk); "probe in order, use the first hit" rather than hard-coding is
+    // what makes a directory change a matter of moving files only, with no host change.
     if (!getenv("DM_ROMFS")) {
         char c_ws[4096], c_wsdata[4096];
         snprintf(c_ws, sizeof c_ws, "%s/romfs", root);
         snprintf(c_wsdata, sizeof c_wsdata, "%s/data/romfs", root);
-        const char *cands[] = { "/data/local/d2rm/romfs", c_ws, c_wsdata,
-                                "/sdcard/d2rm/romfs", "/sdcard/Download/d2rm/romfs" };
+        const char *cands[] = { c_ws, c_wsdata,
+                                "/sdcard/d2rm/romfs", "/sdcard/Download/d2rm/romfs",
+                                "/data/local/d2rm/romfs" };
         for (unsigned i = 0; i < sizeof cands / sizeof cands[0]; i++)
             if (exists(cands[i])) { setenv("DM_ROMFS", cands[i], 1); fprintf(stderr, "romfs: %s\n", cands[i]); break; }
         if (!getenv("DM_ROMFS"))
-            fprintf(stderr, "romfs: 【黄】候选目录都没有（/data/local/d2rm/romfs、%s、/sdcard/d2rm/romfs…），"
+            fprintf(stderr, "romfs: 【黄】候选目录都没有（%s、/sdcard/d2rm/romfs…），"
                             "也没有 DM_ROMFS——资源读不到（先跑通到 UNIMPL 不受影响）\n", c_ws);
     }
 

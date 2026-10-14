@@ -299,22 +299,29 @@ the rewriter's output are pushed with `adb push` to `/data/local/tmp/dm/{dmhost,
 `./dmhost ./patched main sdk` is run from `/data/local/tmp/dm`. Packaging an APK waits until after M2, when
 there is something to show.
 
-**Where the game resources (the 8.3 GB RomFS) live**: not inside the workspace. The Android entry point
-`main_android.c` **probes candidates in order**, uses the first hit and logs the chosen path (`romfs: <path>`);
-the caller can still point at it directly with `DM_ROMFS`. Order (earlier wins):
+**Where the game resources (the 8.3 GB RomFS) live**: the decision (2026-10-14) is **inside the workspace** --
+`/data/local/tmp/dm/romfs` on this device: same partition, fastest reads, one `adb push` and done. The Android
+entry point `main_android.c` **probes candidates in order**, uses the first hit and logs the chosen path
+(`romfs: <path>`); the caller can still point at it directly with `DM_ROMFS`. Order (earlier wins):
 
-1. **`/data/local/d2rm/romfs`** -- the intended spot, but **measured unusable on this device**: `/data/local` is
-   `drwxr-x--x root:root` and the `shell` user cannot create a subdirectory in it (`mkdir: Permission denied`).
-   Android has locked down `/data/local`, which is exactly why `/data/local/tmp` exists.
-2. **`<root>/romfs`, `<root>/data/romfs`** -- the early convention, with resources inside the workspace.
-3. **`/sdcard/d2rm/romfs`, `/sdcard/Download/d2rm/romfs`** -- the **only place that both survives a reboot and is
-   writable by `shell`** (`/sdcard` -> `/storage/self/primary`, `mkdir` succeeds in testing); the cost is going
-   through FUSE, so loading is a bit slower.
+1. **`<root>/romfs`, `<root>/data/romfs`** -- preferred: resources inside the workspace (on this device
+   `/data/local/tmp/dm/romfs`).
+2. **`/sdcard/d2rm/romfs`, `/sdcard/Download/d2rm/romfs`** -- the fallback: the **only place that both survives a
+   reboot and is writable by `shell`** (`/sdcard` -> `/storage/self/primary`, `mkdir` succeeds in testing), at the
+   cost of going through FUSE, so loading is a bit slower. Keeping a copy here means the system cleaning
+   `/data/local/tmp` no longer matters.
+3. **`/data/local/d2rm/romfs`** -- last, merely "use it if it is there": `/data/local` is `drwxr-x--x root:root`
+   and the `shell` user **cannot create a subdirectory** in it (`mkdir: Permission denied`, measured), so it needs
+   root.
+
+**Reboot risk and recovery**: `/data/local/tmp` may be cleaned by the system, in which case re-pushing from the
+computer takes about 4-5 minutes (from `.work/data/switch/3.3.94012/Update/RomFS/data`); with a copy kept on
+`/sdcard` it is instead a matter of pointing `DM_ROMFS` there (or letting the probe pick it), which takes no time.
 
 "Probe in order, use the first hit" rather than hard-coding one path is what makes a directory change a matter of
-**moving files only, with no host change**. Moving between directories on the same partition (e.g. `<root>/romfs`
-to elsewhere on it) is a rename and takes no time; between `/data/local/tmp` and `/sdcard` it is a real copy
-(8.3 GB, about 2-4 minutes on the device, still faster than re-pushing from the computer).
+**moving files only, with no host change**: moving within one partition is a rename and takes no time, while
+`/data/local/tmp` to `/sdcard` is a real copy across filesystems (8.3 GB, about 2-4 minutes on the device, still
+faster than re-pushing from the computer).
 
 **M1 conclusion**: the acceptance criterion -- "the host runs and the log shows the game's `UNIMPL` lines" --
 is met, and exceeded all the way to `nnMain`. Next comes M2.

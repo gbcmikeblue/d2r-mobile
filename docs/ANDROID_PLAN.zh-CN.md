@@ -295,19 +295,24 @@ nninitInitializeSdkModule
 `/data/local/tmp/dm/{dmhost, patched/}`，然后在 `/data/local/tmp/dm` 下执行 `./dmhost ./patched main sdk`。
 打成 APK 留到 M2 之后（那时才有画面）。
 
-**游戏资源（8.3 GB RomFS）放哪**：不进工作区，由安卓入口 `main_android.c` **按候选顺序自动探测**，找到即用并把
+**游戏资源（8.3 GB RomFS）放哪**：决定（2026-10-14）是**放工作区里**——本机即 `/data/local/tmp/dm/romfs`，
+与工作区同分区、读盘最快，`adb push` 一次到位。由安卓入口 `main_android.c` **按候选顺序自动探测**，找到即用并把
 选中的路径打进日志（`romfs: <路径>`）；调用方仍可用 `DM_ROMFS` 直接指定。候选顺序（前面的优先）：
 
-1. **`/data/local/d2rm/romfs`** —— 本想要的位置，但**实测本机不可用**：`/data/local` 是 `drwxr-x--x root:root`，
-   `shell` 用户建不了子目录（`mkdir: Permission denied`）。安卓已经把 `/data/local` 收紧，这也正是
-   `/data/local/tmp` 存在的原因。
-2. **`<根>/romfs`、`<根>/data/romfs`** —— 早期约定（资源放在工作区里）。
-3. **`/sdcard/d2rm/romfs`、`/sdcard/Download/d2rm/romfs`** —— **唯一「重启不丢且 shell 可写」的位置**
-   （`/sdcard` → `/storage/self/primary`，实测 `mkdir` 成功）；代价是走 FUSE，加载稍慢。
+1. **`<根>/romfs`、`<根>/data/romfs`** —— 首选，资源放工作区里（本机 = `/data/local/tmp/dm/romfs`）。
+2. **`/sdcard/d2rm/romfs`、`/sdcard/Download/d2rm/romfs`** —— 后备：**唯一「重启不丢且 shell 可写」**的位置
+   （`/sdcard` → `/storage/self/primary`，实测 `mkdir` 成功），代价是走 FUSE、加载稍慢。在这里留一份，
+   就不怕系统清理 `/data/local/tmp`。
+3. **`/data/local/d2rm/romfs`** —— 列在最后、只是"有就用"：`/data/local` 是 `drwxr-x--x root:root`，
+   `shell` 用户**建不了子目录**（`mkdir: Permission denied`，实测），要 root 才行。
 
-做成「按顺序找、找到即用」而不是写死一个路径，就是为了换目录时**只管搬文件、宿主不用改**。搬动同分区的
-（如 `<根>/romfs` → 别处同分区）是改名、秒级完成；`/data/local/tmp` 与 `/sdcard` 之间是不同文件系统，
-只能实拷（8.3 GB，设备内拷约 2～4 分钟，比从电脑重推快）。
+**重启风险与恢复**：`/data/local/tmp` 有可能被系统清理，届时从电脑重推约 4～5 分钟（源：
+`.work/data/switch/3.3.94012/Update/RomFS/data`）；若在 `/sdcard` 留了后备，则只需把 `DM_ROMFS` 指过去
+（或让候选探测自动选中它），秒级切换。
+
+做成「按顺序找、找到即用」而不是写死一个路径，就是为了换目录时**只管搬文件、宿主不用改**：同分区内搬动是
+改名、秒级完成；`/data/local/tmp` 与 `/sdcard` 之间是不同文件系统，只能实拷（8.3 GB，设备内拷约 2～4 分钟，
+仍比从电脑重推快）。
 
 **M1 结论**：验收判据「宿主跑起来、日志出现游戏的 `UNIMPL`」已达成，并超出到 `nnMain`。下一步进入 M2。
 
