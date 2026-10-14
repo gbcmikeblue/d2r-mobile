@@ -10,7 +10,14 @@
 #include <string.h>
 
 #define SPV_MAGIC 0x07230203u
-#define MAX_IDS 4096
+// id 上限：SPIR-V 的 id 稠密、从 1 起，越大的着色器 id 越多。早先取 4096，真机上就吃到了教训——
+// 大着色器里 b0 那个块的类型 id 超过 4096，于是被当成"认不出来的种类"（日志里每份着色器正好一条黄）。
+// 按模块头里声明的 bound 检查，不足就报错而不是静默丢 id。
+// id limit: SPIR-V ids are dense and start at 1, and bigger shaders have more of them. The earlier value of 4096
+// taught a lesson on the device -- in large shaders the type id of that b0 block exceeds 4096 and was therefore
+// treated as an unrecognised kind (exactly one yellow line per shader in the log). The module header's declared
+// bound is checked and a shortfall is an error instead of ids being silently dropped.
+#define MAX_IDS 65536
 
 enum { OP_TYPE_IMAGE = 25, OP_TYPE_SAMPLER = 26, OP_TYPE_SAMPLED_IMAGE = 27, OP_TYPE_ARRAY = 28,
        OP_TYPE_RUNTIME_ARRAY = 29, OP_TYPE_STRUCT = 30, OP_TYPE_POINTER = 32,
@@ -74,6 +81,7 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap) {
     const uint32_t *w = code;
     size_t nw = bytes / 4;
     if (w[0] != SPV_MAGIC) return -1;
+    if (nw < 5 || w[3] == 0 || w[3] > MAX_IDS) return -1;   // 模块头声明的 id 上界超过我们的表：报错，别静默丢 id | the header's declared id bound exceeds our tables: fail rather than drop ids silently
     memset(&t, 0, sizeof t);
     for (int i = 0; i < MAX_IDS; i++) { t.set_of[i] = -1; t.binding_of[i] = -1; }
 
@@ -86,10 +94,18 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap) {
         const uint32_t *o = w + i;
         switch (op) {
         case OP_DECORATE:
-            if (wc >= 4 && o[1] < MAX_IDS) {
-                uint32_t target = o[1], dec = o[2], val = o[3];
-                if (dec == DEC_BINDING) t.binding_of[target] = (int32_t)val;
-                else if (dec == DEC_SET) t.set_of[target] = (int32_t)val;
+            // 注意字长：Binding / DescriptorSet 带一个操作数（4 个字），而 **Block / BufferBlock 不带**（3 个字）。
+            // 早先统一按 4 个字判，于是这两种装饰被整条跳过——真机上表现为"所有结构体类都判成认不出来"
+            // （UBO / SSBO → other），而图像类全对（它们的种类来自类型声明、不靠装饰），正是这个组合暴露了它。
+            // Mind the word count: Binding / DescriptorSet carry one operand (4 words) while **Block / BufferBlock
+            // do not** (3 words). Requiring 4 everywhere silently skipped both decorations -- on the device that
+            // showed up as "every struct kind unrecognised" (UBO / SSBO -> other) while image kinds were all
+            // correct (they come from the type declarations, not from decorations), and that combination is what
+            // exposed it.
+            if (wc >= 3 && o[1] < MAX_IDS) {
+                uint32_t target = o[1], dec = o[2], val = wc >= 4 ? o[3] : 0;
+                if (dec == DEC_BINDING && wc >= 4) t.binding_of[target] = (int32_t)val;
+                else if (dec == DEC_SET && wc >= 4) t.set_of[target] = (int32_t)val;
                 else if (dec == DEC_BLOCK) t.is_block[target] = 1;
                 else if (dec == DEC_BUFFER_BLOCK) t.is_buffer_block[target] = 1;
             }

@@ -50,6 +50,15 @@ int main(void) {
         const vk_shader *sh = vk_shader_by_key(key, VK_STAGE_NONE);
         if (!sh) continue;
         nsh++;
+        // 头两份把 C 版扫出来的**完整**绑定清单打出来（与 PowerShell 的真值对照，定位种类判错的根因）
+        // Print the **full** binding list the C scanner produced for the first two shaders (to compare against the
+        // PowerShell ground truth and pin down why a kind is misjudged)
+        if (nsh <= 2) {
+            printf("  C 版扫描 %s（阶段 %d）：", sh->key, sh->stage);
+            for (uint32_t j = 0; j < sh->nspv; j++)
+                printf("b%u=%s ", sh->spv[j].binding, vk_spv_kind_name(sh->spv[j].kind));
+            printf("\n");
+        }
         const vk_shader *one[1] = { sh };
         if (vk_pipe_layout(one, 1) == VK_NULL_HANDLE) {
             fail_dsl++;
@@ -75,6 +84,7 @@ int main(void) {
                 printf("  交叉核对：%s 的 set%u/b%u（%s）在 res.json 里没有条目\n",
                        sh->key, b->set, b->binding, vk_spv_kind_name(b->kind));
             }
+            (void)0;
         }
         if (sh->stage == VK_STAGE_CS) {
             ncs++;
