@@ -8,6 +8,8 @@
 #include <dlfcn.h>
 #include <sys/ucontext.h>
 #include "dm_uctx.h"
+#include <fcntl.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
@@ -130,6 +132,106 @@ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+// 崩在客体地址上时，把 /proc/self/maps 里覆盖该地址的那一行打出来。
+// 理由：安卓没有 ESR 的读写位（见 dm_uctx.h），光看寄存器分不清「这一页根本没映射」还是「这一页被写保护」——
+// 两者的修法完全不同（前者是宿主没铺到那页，后者是脏页跟踪的缺页钩子没接住），所以现场必须带上这一行。
+// 只用 open / read：信号上下文里 malloc 可能正好是崩在锁上的那个线程持有的锁，fopen 会死等。
+// On a guest-address fault, print the /proc/self/maps entry covering it.
+// Why: Android has no ESR read/write bit (see dm_uctx.h), and the registers alone cannot tell "this page is not
+// mapped at all" from "this page is write-protected" -- and the two have completely different fixes (the
+// former means the host never laid the page out, the latter that the dirty-page fault hook did not catch it),
+// so the report has to carry this line.
+// Only open / read are used: inside a signal handler malloc's lock may be held by the very thread that
+// crashed, and fopen would wait forever on it.
+// 打印覆盖 a 的那一行，外加前后各一行：只给一行分不清「这一页没映射」和「这一页在某个大段的边界上」，
+// 而边界正是栈出问题的典型形态（栈往下长、撞到下一段的边界）。
+// Prints the entry covering a plus the one before and the one after: a single line cannot tell "this page is
+// not mapped" from "this page sits on the boundary of a larger region", and boundaries are exactly what a
+// stack problem looks like (the stack grows down and hits the next region's edge).
+// 读入 /proc/self/maps 的全文（静态缓冲，信号上下文里不分配）；返回读到的字节数。
+// Read all of /proc/self/maps into a static buffer (no allocation in signal context); returns the byte count.
+static size_t maps_read(char *buf, size_t cap) {
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) { buf[0] = 0; return 0; }
+    size_t got = 0;
+    for (;;) {
+        if (got >= cap - 1) break;
+        ssize_t n = read(fd, buf + got, cap - 1 - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    buf[got] = 0;
+    return got;
+}
+
+// 落在客体地址空间里的全部映射（最多列 24 条）：栈上到底是什么、哪一段是谁铺的，一次看完。
+// Every mapping inside the guest address space (at most 24 lines): what is really on the stack and who laid
+// each part out, in one go.
+static size_t maps_in_as(uint8_t *as, size_t asz, char *out, size_t cap) {
+    static char buf[1 << 20];
+    size_t got = maps_read(buf, sizeof buf), k = 0;
+    unsigned long ab = (unsigned long)(uintptr_t)as, ae = ab + asz;
+    int shown = 0, more = 0;
+    k += (size_t)snprintf(out + k, cap - k, "[dm] 客体 AS 内的映射（读入 %zu 字节）:\n", got);
+    for (char *p = buf; p && *p; ) {
+        char *e = strchr(p, '\n');
+        if (e) *e = 0;
+        unsigned long lo = 0, hi = 0;
+        if (sscanf(p, "%lx-%lx", &lo, &hi) == 2 && lo < ae && hi > ab) {
+            if (shown < 24) {
+                k += (size_t)snprintf(out + k, cap - k, "   +%+#llx +%#llx  %s\n",
+                                      (long long)(lo - ab), (unsigned long long)(hi - lo), p);
+                shown++;
+            } else more++;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    if (!shown) k += (size_t)snprintf(out + k, cap - k, "   （一条也没有）\n");
+    else if (more) k += (size_t)snprintf(out + k, cap - k, "   …另有 %d 条未列出\n", more);
+    return k;
+}
+
+static void maps_window(uint64_t a, char *out, size_t cap) {
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) { snprintf(out, cap, "（打不开 /proc/self/maps）"); return; }
+    static char buf[1 << 20];                       // 静态缓冲：信号上下文里不能分配。1 MB：256 KB 装不下整个 maps 时，
+                                                    // pc 那一条会排在栈之后被截掉，现场就变成自相矛盾的两行（实测踩过）
+                                                    // Static buffer: no allocation in signal context. 1 MB: with 256 KB the
+                                                    // pc entry (which comes after the stack one) got cut off and the report
+                                                    // contradicted itself (this really happened)
+    size_t got = 0;
+    for (;;) {
+        if (got >= sizeof buf - 1) break;
+        ssize_t n = read(fd, buf + got, sizeof buf - 1 - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    buf[got] = 0;
+    // 先把行切开（就地改 \n 为 \0）
+    char *ln[4096]; int nl = 0;
+    for (char *p = buf; p && *p && nl < (int)(sizeof ln / sizeof ln[0]); ) {
+        char *e = strchr(p, '\n');
+        if (e) *e = 0;
+        ln[nl++] = p;
+        if (!e) break;
+        p = e + 1;
+    }
+    int hit = -1;
+    for (int i = 0; i < nl; i++) {
+        unsigned long lo = 0, hi = 0;
+        if (sscanf(ln[i], "%lx-%lx", &lo, &hi) == 2 && a >= lo && a < hi) { hit = i; break; }
+    }
+    size_t k = 0;
+    if (hit < 0) { snprintf(out, cap, "不在任何映射里（这一页没映射；maps 共读入 %zu 字节、%d 行）", got, nl); return; }
+    for (int i = hit - 1; i <= hit + 1 && i < nl; i++) {
+        if (i < 0) continue;
+        k += (size_t)snprintf(out + k, cap - k, "%s%s", i == hit ? ">> " : "   ", ln[i]);
+        if (i < hit + 1 && i + 1 < nl) k += (size_t)snprintf(out + k, cap - k, "\n           ");
+    }
+}
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
@@ -148,6 +250,45 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     fprintf(stderr, " sp=%#llx\n", DM_UC_SP(uc));
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, DM_UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
+    // 出错地址、pc、sp 各自落在哪一段、那一段是什么权限（见 maps_line 的说明），以及出错指令的原始编码
+    // （安卓拿不到 ESR 的读写位，从编码能看出是 load 还是 store）。
+    // 一起拼好、一次 write 出去：崩溃时别的线程还在往 stderr 写，分几次打会交错得读不出来。
+    // Which mapping each of the fault address, pc and sp falls into and that mapping's permissions (see
+    // maps_line), plus the raw encoding of the faulting instruction (Android has no ESR read/write bit, and the
+    // encoding shows whether it is a load or a store).
+    // All of it is assembled and written once: other threads are still writing to stderr during a crash, and
+    // several separate writes interleave into something unreadable.
+    {
+        static char mb[24576], t[1024];   // 要装下最多 24 条映射行 | has to hold up to 24 mapping lines
+        size_t k = 0;
+        maps_window((uint64_t)si->si_addr, t, sizeof t);
+        k += (size_t)snprintf(mb + k, sizeof mb - k, "[dm] maps 出错地址: %s\n", t);
+        maps_window(DM_UC_PC(uc), t, sizeof t);
+        k += (size_t)snprintf(mb + k, sizeof mb - k, "[dm] maps 出错指令: %s\n", t);
+        maps_window(DM_UC_SP(uc), t, sizeof t);
+        k += (size_t)snprintf(mb + k, sizeof mb - k, "[dm] maps 栈指针: %s\n", t);
+        const uint32_t *ip = (const uint32_t *)(uintptr_t)DM_UC_PC(uc);
+        k += (size_t)snprintf(mb + k, sizeof mb - k, "[dm] 出错指令编码: %08x %08x（安卓无 ESR，据此判读读/写）\n", ip[0], ip[1]);
+        // 三个地址相对客体地址空间的偏移：一眼看出各自落在哪一段（预留段 / alias / 栈 / 堆）。
+        // 单看绝对地址看不出这些，而「落在哪一段」正是判断是客体跑野了还是宿主没铺好那页的关键。
+        // The three addresses relative to the guest address space: it shows at a glance which part each falls
+        // into (reservation / alias / stack / heap). Absolute addresses do not show that, and "which part" is
+        // what tells a guest that ran wild from a page the host never laid out.
+        { void svc_guest_range(uint8_t **base, size_t *size);
+          uint8_t *as = NULL; size_t asz = 0; svc_guest_range(&as, &asz);
+          if (as) k += (size_t)snprintf(mb + k, sizeof mb - k,
+              "[dm] 相对客体 AS（%p +%#llx）：地址 %+#llx、指令 %+#llx、栈 %+#llx；固定划分 alias +%#x、stack +%#x、heap +%#x\n",
+              as, (unsigned long long)asz,
+              (long long)((uint64_t)si->si_addr - (uint64_t)(uintptr_t)as),
+              (long long)((uint64_t)DM_UC_PC(uc) - (uint64_t)(uintptr_t)as),
+              (long long)((uint64_t)DM_UC_SP(uc) - (uint64_t)(uintptr_t)as),
+              0x10000000u, 0x30000000u, 0x40000000u);
+          // 落到客体 AS 里的所有映射：栈上到底是什么、哪一段是谁铺的，一眼看完（崩溃现场最要紧的一份事实）
+          // Every mapping that falls inside the guest address space: what is really on the stack and who laid
+          // each part out, all in one place (the single most important fact in a crash report)
+          if (as) k += maps_in_as(as, asz, mb + k, sizeof mb - k); }
+        if (write(2, mb, k) < 0) { /* 打不出来就算了 | nothing to do if it cannot be written */ }
+    }
     dm_backtrace(DM_UC_FP(uc));
     if (g_dump_hook) g_dump_hook();
     _exit(128 + sig);

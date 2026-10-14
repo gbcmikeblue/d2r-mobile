@@ -147,6 +147,15 @@ add_executable(dmhost_android_bin ${CMAKE_CURRENT_SOURCE_DIR}/main_android.c)
 target_link_libraries(dmhost_android_bin PRIVATE
   -Wl,--whole-archive dmhost_android -Wl,--no-whole-archive)
 set_target_properties(dmhost_android_bin PROPERTIES OUTPUT_NAME dmhost)
+# 把符号导出到动态表：崩溃现场的 dm_backtrace 用 dladdr 解析宿主自己的帧，而 dladdr 只看 .dynsym
+#（.symtab 完整也没用）。不导出的话，回溯里宿主那几帧只剩一串裸地址，正好是最要紧的那几帧——
+# 客体帧有模块表可查，宿主帧只能靠这个名字。宿主是可执行文件、不分发体积，代价只有几十 KB。
+# Export symbols into the dynamic table: dm_backtrace resolves the host's own frames with dladdr in a crash
+# report, and dladdr only looks at .dynsym (a complete .symtab does not help). Without it the host frames in a
+# backtrace are bare addresses -- exactly the frames that matter most, since guest frames can be looked up in
+# the module table while host frames depend on this name. The host is an executable whose size is not
+# distributed, so the cost is a few tens of KB.
+target_link_options(dmhost_android_bin PRIVATE -Wl,--export-dynamic)
 # 安卓 15 起要求 16 KiB 页对齐；显式声明以免在新设备上装不上 / 跑不起来
 # Android 15 and later require 16 KiB page alignment; state it explicitly so the binary loads on
 # newer devices
