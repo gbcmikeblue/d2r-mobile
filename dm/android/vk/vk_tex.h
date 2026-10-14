@@ -35,6 +35,13 @@ int vk_fmt_to_vk(int nvn_fmt, VkFormat *out);
 VkImage vk_tex_image(const tex_t *t);
 VkImageView vk_tex_view(const tex_t *t);
 
+// 取（必要时建）这个采样器的 VkSampler；失败返回 VK_NULL_HANDLE。按参数内容缓存——游戏会按值拷贝
+// NVNsampler 对象，同一个参数组合可能有多个对象，所以键是参数而不是对象。
+// Get (creating if needed) this sampler's VkSampler; VK_NULL_HANDLE on failure. Cached by the parameters: the game
+// copies NVNsampler objects by value, so one parameter set may exist as several objects and the key is the
+// parameters rather than the object.
+VkSampler vk_samp_of(const samp_t *s);
+
 // 池内容被 CPU 改过（脏页跟踪的结论）：下次取用之前重传。释放时调 vk_tex_drop。
 // The pool content was changed on the CPU (per the dirty-page tracking): re-upload before the next use. Call
 // vk_tex_drop when the texture is released.

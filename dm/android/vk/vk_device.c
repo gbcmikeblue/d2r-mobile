@@ -25,6 +25,7 @@ static int g_tried;
 static int g_dyn_render;                       // 动态渲染可用（回放层开通道的前提）| dynamic rendering available (the replay layer's precondition for opening passes)
 static int g_fill_non_solid;                   // 非实心多边形模式（线框等）| non-solid polygon modes (wireframe and such)
 static int g_attr_divisor, g_attr_divisor_zero; // 顶点流每实例步进 > 1 / 可为 0 | per-instance vertex stream step > 1 / may be 0
+static int g_aniso;                            // 各向异性过滤（采样器用）| anisotropic filtering (for samplers)
 static VkExtensionProperties *g_exts; static uint32_t g_nexts;
 
 VkInstance vk_instance(void) { return g_inst; }
@@ -43,6 +44,7 @@ int vk_have_dyn_render(void) { return g_dyn_render; }
 int vk_have_fill_non_solid(void) { return g_fill_non_solid; }
 int vk_have_attr_divisor(void) { return g_attr_divisor; }
 int vk_have_attr_divisor_zero(void) { return g_attr_divisor_zero; }
+int vk_have_anisotropy(void) { return g_aniso; }
 
 // 安卓的桩库只到 1.1：1.3 的入口从设备上取（见 vk_device.h 的说明）
 // Android's stub library stops at 1.1, so the 1.3 entry points are fetched from the device (see vk_device.h)
@@ -129,6 +131,9 @@ void vk_device_init(void) {
     g_fill_non_solid = core.fillModeNonSolid ? 1 : 0;
     g_attr_divisor = have_vd && vdf.vertexAttributeInstanceRateDivisor ? 1 : 0;
     g_attr_divisor_zero = have_vd && vdf.vertexAttributeInstanceRateZeroDivisor ? 1 : 0;
+    // 各向异性过滤：采样器要用（NVN 的 aniso 参数直接对应 Vulkan 的 maxAnisotropy），问一下再开
+    // Anisotropic filtering: samplers need it (NVN's aniso maps straight to Vulkan's maxAnisotropy); ask first
+    g_aniso = core.samplerAnisotropy ? 1 : 0;
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -139,6 +144,7 @@ void vk_device_init(void) {
     VkPhysicalDeviceFeatures2 feats = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     feats.features = core;
     feats.features.fillModeNonSolid = g_fill_non_solid ? VK_TRUE : VK_FALSE;
+    feats.features.samplerAnisotropy = g_aniso ? VK_TRUE : VK_FALSE;
     f13.dynamicRendering = g_dyn_render ? VK_TRUE : VK_FALSE;
     {
         void *tail = &f13;

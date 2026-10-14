@@ -41,6 +41,7 @@ int vk_have_ext(const char *name);
 //   vk_have_attr_divisor: a vertex stream's per-instance step may exceed 1 (otherwise divisor > 1 is treated as 1)
 int vk_have_fill_non_solid(void);
 int vk_have_attr_divisor(void);
+int vk_have_anisotropy(void);          // 各向异性过滤可用（采样器要用）| anisotropic filtering available (needed by samplers)
 int vk_have_attr_divisor_zero(void);   // divisor 可为 0（NVN 的"常量流"正好能用这个表达）| divisor may be 0 (exactly what NVN's "constant stream" needs)
 
 // 动态渲染是否可用（回放层开渲染通道的前提；不可用时那一层退回只记状态）

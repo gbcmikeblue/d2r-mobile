@@ -197,6 +197,79 @@ int vk_fmt_to_vk(int f, VkFormat *out) {
     }
 }
 
+// ---------- 采样器：按**参数内容**缓存（不是按对象）----------
+// ---------- samplers: cached by **parameter content**, not by object ----------
+// 为什么不能按对象缓存：游戏按值拷贝 NVNsampler（nvn_obj.h 里 tex_t 的注释说得很清楚），同一个参数组合可能以
+// 多个对象存在，按指针/序号当键会白建一堆 VkSampler。
+// Why not by object: the game copies NVNsampler by value (the comment on tex_t in nvn_obj.h makes that plain), so one
+// parameter set can exist as many objects and keying by pointer or serial would create a pile of redundant VkSamplers.
+static VkSamplerAddressMode wrap_vk(uint8_t w) {
+    switch (w) {
+        case 0: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;   // NVN 的 CLAMP 就是钳到边缘 | NVN's CLAMP means clamp to edge
+        case 1: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        // 2/3/4 = 镜像钳制族；4（镜像 + 到边界色）Vulkan 没有，退成到边缘并记一次
+        // 2/3/4 = the mirror-clamp family; 4 (mirror + border colour) has no Vulkan form and degrades to edge, reported once
+        case 2: case 3: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        case 4: { static int said; if (!said++) LOG("【黄】采样器环绕模式 4（镜像钳制到边界色）在 Vulkan 里没有对应：按镜像钳制到边缘"); return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE; }
+        case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        case 6: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;  // 7 = CLAMP_TO_EDGE | 7 = CLAMP_TO_EDGE
+    }
+}
+
+#define SAMP_TAB 256
+typedef struct { samp_par p; VkSampler s; int used; } samp_e;
+static samp_e g_samps[SAMP_TAB];
+
+VkSampler vk_samp_of(const samp_t *s) {
+    if (!s) return VK_NULL_HANDLE;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    samp_par p = s->p;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < sizeof p; i++) h = (h ^ ((const uint8_t *)&p)[i]) * 16777619u;
+    h &= SAMP_TAB - 1;
+    for (uint32_t k = 0; k < SAMP_TAB; k++) {
+        samp_e *e = &g_samps[(h + k) & (SAMP_TAB - 1)];
+        if (e->used && !memcmp(&e->p, &p, sizeof p)) return e->s;
+        if (!e->used) {
+            // minf 同时编码 min 过滤与 mip 过滤（0..5：0 最近邻、1 线性、2/3 加最近邻 mip、4/5 加线性 mip），
+            // 与苹果侧同一套解读。
+            // minf encodes both the min filter and the mip filter (0..5: 0 nearest, 1 linear, 2/3 with nearest mip,
+            // 4/5 with linear mip), read the same way as on the Apple side.
+            int lin_min = (p.minf == 1 || p.minf == 3 || p.minf == 5);
+            int lin_mip = (p.minf == 4 || p.minf == 5);
+            int aniso_ok = vk_have_anisotropy() && p.aniso > 1;
+            VkSamplerCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                .magFilter = p.magf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+                .minFilter = lin_min ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+                .mipmapMode = lin_mip ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                .addressModeU = wrap_vk(p.ws), .addressModeV = wrap_vk(p.wt), .addressModeW = wrap_vk(p.wr),
+                .mipLodBias = p.lod_bias,
+                .anisotropyEnable = aniso_ok ? VK_TRUE : VK_FALSE,
+                .maxAnisotropy = aniso_ok ? (p.aniso > 16 ? 16.0f : p.aniso) : 1.0f,
+                .compareEnable = p.cmp_mode ? VK_TRUE : VK_FALSE,
+                .compareOp = p.cmp_mode ? (VkCompareOp)(p.cmp_func >= 1 && p.cmp_func <= 8 ? p.cmp_func - 1 : 7) : VK_COMPARE_OP_NEVER,
+                .minLod = p.lod_min < 0 ? 0.0f : p.lod_min,
+                .maxLod = p.lod_max > 0 ? p.lod_max : VK_LOD_CLAMP_NONE,   // 0 = 没设，别把整条 mip 链钳到第 0 级 | 0 means unset, so do not clamp the whole mip chain to level 0
+                .borderColor = p.border[3] > 0.5f ? (p.border[0] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK)
+                                                  : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
+            if (!vk_have_anisotropy() && p.aniso > 1) {
+                static int said; if (!said++) LOG("【黄】设备不支持各向异性过滤：采样器按 1x 建");
+            }
+            VkSampler sv = VK_NULL_HANDLE;
+            if (vkCreateSampler(vk_dev(), &ci, NULL, &sv) != VK_SUCCESS) {
+                LOG("【红】建采样器失败（minf=%u magf=%u 环绕 %u/%u/%u 比较 %u）", p.minf, p.magf, p.ws, p.wt, p.wr, p.cmp_mode);
+                return VK_NULL_HANDLE;
+            }
+            e->p = p; e->s = sv; e->used = 1;
+            return sv;
+        }
+    }
+    LOG("【红】采样器缓存满了（%d 项）", SAMP_TAB);
+    return VK_NULL_HANDLE;
+}
+
 // ---------- serial → 贴图表（开放寻址，键是序号不是指针）----------
 // ---------- serial -> texture table (open addressing; the key is the serial, not a pointer) ----------
 typedef struct {
