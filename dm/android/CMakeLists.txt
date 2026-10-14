@@ -83,6 +83,26 @@ target_link_libraries(vk_probe PRIVATE vulkan)
 target_link_options(vk_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk_probe PRIVATE ${COMPAT})
 
+# M2 的第二个能力探针：Vulkan 能不能把「宿主自己那块内存」直接当 GPU 内存用（VK_EXT_external_memory_host）。
+# 苹果有统一内存、任意宿主指针都能包成 MTLBuffer；Vulkan 没对应物，这条扩展是零拷贝内存池的唯一出路。
+# M2's second capability probe: can Vulkan take a piece of the host's own memory and use it as GPU memory
+# (VK_EXT_external_memory_host). Apple has unified memory so any host pointer can be wrapped in an
+# MTLBuffer; Vulkan has no equivalent, and this extension is the only route to a zero-copy memory pool.
+add_executable(vk_hostmem_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_hostmem_probe.c)
+target_link_libraries(vk_hostmem_probe PRIVATE vulkan)
+target_link_options(vk_hostmem_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk_hostmem_probe PRIVATE ${COMPAT})
+
+# M2 的第三个能力探针：零拷贝内存能不能一次要这么多、够不够铺客体地址空间（heap 4 GB + alias 512 MB）。
+# 这是「没有 VK_EXT_external_memory_host 之后，零拷贝该怎么办」这条设计路线的可行性依据。
+# M2's third capability probe: how much zero-copy memory can be obtained at once, and is it enough to
+# back the guest address space (heap 4 GB + alias 512 MB). This is the feasibility evidence for the design
+# route "what to do about zero-copy now that VK_EXT_external_memory_host is missing".
+add_executable(vk_region_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region_probe.c)
+target_link_libraries(vk_region_probe PRIVATE vulkan)
+target_link_options(vk_region_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk_region_probe PRIVATE ${COMPAT})
+
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；
 # 打成 APK 留到 M2 之后（那时才有画面）。

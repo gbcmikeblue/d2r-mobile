@@ -365,6 +365,77 @@ real device**, and the rest of M2 can take the cheapest, zero-copy route. (The p
 separately: the copy reads and the fill writes the same buffer, and separate submissions avoid a
 hand-written barrier.)
 
+### M2 step 3: how the memory pools land (two capability measurements that fixed the design)
+
+**(1) Metal's route has no Vulkan counterpart.** On the Apple side a pool is set up like this (`mtl_pool_add`
+in `nvn_mtl.m`):
+
+```objc
+// [mem, mem+size) expanded to page boundaries -> newBufferWithBytesNoCopy -> zero copy
+id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a
+                                            options:MTLResourceStorageModeShared deallocator:nil];
+```
+
+Apple has unified memory, so **any host pointer can be wrapped in an MTLBuffer**. The only Vulkan equivalent
+is `VK_EXT_external_memory_host` (import a host pointer as a `VkDeviceMemory`) -- and on the real device
+(Adreno 830, 165 device extensions):
+
+```
+  [yes] VK_KHR_external_memory / VK_EXT_descriptor_indexing / VK_KHR_timeline_semaphore
+  [yes] VK_KHR_swapchain / VK_ANDROID_external_memory_android_hardware_buffer / VK_EXT_queue_family_foreign
+  [no]  VK_EXT_external_memory_host        <- the Vulkan counterpart of Metal's route
+  [no]  VK_EXT_host_image_copy
+```
+
+**So "wrap the pool pointer in a buffer" does not work on Vulkan and the design has to change.**
+
+**(2) The replacement: back the guest address space itself with Vulkan zero-copy memory.** The host lays that
+address space out itself (`mem_init` in `hle_svc.c`):
+
+```c
+#define RESERVE (5ull << 30)
+g_as    = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+g_alias = g_as + 0x10000000; g_alias_cap = 0x20000000;            // alias 512 MB
+g_stack = g_as + 0x30000000; g_stack_cap = 0x10000000;            // stack 256 MB
+g_heap  = g_as + 0x40000000; g_heap_cap  = RESERVE - 0x40000000;  // heap 4 GB
+```
+
+The address `vkAllocateMemory` + `vkMapMemory` returns **is itself a host pointer** (step 2 already verified
+both directions are CPU/GPU visible). Backing the heap and the alias region with Vulkan zero-copy memory
+therefore turns pool-address-to-buffer translation into arithmetic, **with no need for that extension**. The
+only open question was whether such a large block can be obtained -- measured (`vk_region_probe.c`):
+
+```
+maxMemoryAllocationSize = 1024 MB (the advertised value; the real limit is higher), bufferImageGranularity = 1
+  3072 / 3200 / 3328 / 3456 / 3584 / 3712 / 3840 / 3968 MB: all allocate and map successfully
+  4096 MB: fails with VK_ERROR_OUT_OF_DEVICE_MEMORY
+  => the per-allocation limit is 3968 MB
+  lazy commit: a 3.9 GB block with only 64 pages touched -> resident pages changed by -96 (it does not really cost that memory)
+  binding a buffer at a non-zero offset inside the block: memory alignment 64, binding at offset 16 MB succeeds, and both directions work at that offset
+```
+
+**(3) The design is now settled** (M2 implements this):
+
+| region | size | source | why |
+|---|---|---|---|
+| heap | 4 GB capacity, 3728 MB actually used | **Vulkan zero-copy memory** (one 3968 MB allocation suffices) | the game's `StandardAllocator` carves NVN pools out of the heap, and pools must be directly GPU-visible |
+| alias | 512 MB | **Vulkan zero-copy memory** (a second allocation) | physical memory mapped in by `MapPhysicalMemory`, used by the SDK's VammManager |
+| stack | 256 MB | ordinary mmap | it is only a CPU stack, the GPU never touches it |
+| the rest of the reservation | remainder | ordinary mmap | takes address space only |
+
+That is about 4.5 GB of Vulkan allocations, committed lazily, so it does not really consume that much memory
+(heap 0 has 15 GB).
+
+**Two hard boundaries of this design (to handle during implementation)**:
+
+- **The per-allocation limit is 3968 MB**: the guest heap is currently 3728 MB, leaving about 240 MB. If
+  `app_pool()` is raised later so the heap exceeds it, the design degrades into "two non-contiguous pieces",
+  so `mem_init` must **fail loudly when it would exceed the limit** rather than failing silently.
+- **Pools that fall outside the Vulkan regions**: if the guest opens a pool in an ordinary mmap region
+  (stack / the rest of the reservation) it cannot currently become a buffer. `pool_add` must **report failures
+  loudly and count them**, so that the real device tells us whether it ever happens before we decide on a
+  compensation route (a shadow copy, or changing the allocation).
+
 ### M2 — minimal Vulkan replay layer (the largest item)
 
 - [ ] Vulkan skeleton: device, queue, `ANativeWindow` swapchain

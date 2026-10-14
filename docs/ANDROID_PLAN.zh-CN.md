@@ -351,6 +351,68 @@ nninitInitializeSdkModule
 「统一内存假设」这条头号风险到此**在真机上验证通过**，M2 其余部分可以照「零拷贝」这条最省的路走。
 （探针里两步是分开提交的：拷贝读、填充写同一条缓冲，分开提交就不必自己插屏障。）
 
+### M2 第 3 步：内存池的落法（两次能力实测，设计据此定型）
+
+**① Metal 那条路在 Vulkan 上没有对应物。** 苹果侧内存池是这么落的（`nvn_mtl.m` 的 `mtl_pool_add`）：
+
+```objc
+// [mem, mem+size) 外扩到页边界 → newBufferWithBytesNoCopy → 零拷贝
+id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a
+                                            options:MTLResourceStorageModeShared deallocator:nil];
+```
+
+苹果有统一内存，**任意宿主指针都能包成 MTLBuffer**。Vulkan 要等价的效果只有
+`VK_EXT_external_memory_host`（把宿主指针导入成 `VkDeviceMemory`）——实测真机（Adreno 830，165 个设备扩展）：
+
+```
+  [有] VK_KHR_external_memory / VK_EXT_descriptor_indexing / VK_KHR_timeline_semaphore
+  [有] VK_KHR_swapchain / VK_ANDROID_external_memory_android_hardware_buffer / VK_EXT_queue_family_foreign
+  [无] VK_EXT_external_memory_host        ← ★ Metal 那条路的 Vulkan 对应物
+  [无] VK_EXT_host_image_copy
+```
+
+**所以「把池子指针直接包成缓冲」这条路在 Vulkan 上不通，设计必须改。**
+
+**② 改成：客体地址空间本身由 Vulkan 零拷贝内存来铺。** 宿主本来就是自己摆这块地址空间的
+（`hle_svc.c` 的 `mem_init`）：
+
+```c
+#define RESERVE (5ull << 30)
+g_as    = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+g_alias = g_as + 0x10000000; g_alias_cap = 0x20000000;            // alias 512 MB
+g_stack = g_as + 0x30000000; g_stack_cap = 0x10000000;            // stack 256 MB
+g_heap  = g_as + 0x40000000; g_heap_cap  = RESERVE - 0x40000000;  // heap 4 GB
+```
+
+`vkAllocateMemory` + `vkMapMemory` 拿到的映射地址**本身就是宿主指针**（第 2 步已验过 CPU / GPU 双向可见）。
+于是只要把 heap 与 alias 这两块改由 Vulkan 零拷贝内存提供，池子地址到缓冲就全是算术，**不需要那条扩展**。
+关键只剩「一次能不能要到这么大」——实测（`vk_region_probe.c`）：
+
+```
+maxMemoryAllocationSize = 1024 MB（广告值，实际能超），bufferImageGranularity = 1
+  3072 / 3200 / 3328 / 3456 / 3584 / 3712 / 3840 / 3968 MB：分配并映射全部成功
+  4096 MB：失败 VK_ERROR_OUT_OF_DEVICE_MEMORY
+  ⇒ 单次上限 3968 MB
+  惰性提交：3.9 GB 的块只碰 64 个页 → 常驻增量 -96 页（不真占内存）
+  块内非零偏移绑缓冲：memory alignment 64，偏移 16 MB 处绑定成功，且该偏移处双向都通
+```
+
+**③ 设计定型**（M2 照此实现）：
+
+| 区域 | 大小 | 来源 | 理由 |
+|---|---|---|---|
+| heap | 4 GB 容量，实际用到 3728 MB | **Vulkan 零拷贝内存**（单次 3968 MB 够） | 游戏的 `StandardAllocator` 从堆里切出 NVN 内存池，池子必须在 GPU 侧直接可见 |
+| alias | 512 MB | **Vulkan 零拷贝内存**（另一次分配） | `MapPhysicalMemory` 映射进来的物理内存，SDK 的 VammManager 用 |
+| stack | 256 MB | 普通 mmap | 只是 CPU 栈，GPU 不碰 |
+| 其余预留段 | 剩余 | 普通 mmap | 只占地址空间 |
+
+合计约 4.5 GB 的 Vulkan 分配，惰性提交所以不会真吃掉这么多内存（堆 0 有 15 GB）。
+
+**这条设计的两处硬边界（实现时要处理）**：
+
+- **单次分配上限 3968 MB**：客体堆当前是 3728 MB，余量约 240 MB。若将来提高 `app_pool()` 让堆超过这个数，就会退化成「两块不连续」——所以 `mem_init` 要**在超限时明确报红**，而不是静默失败。
+- **落不到 Vulkan 区的池子**：客体若把池子开在普通 mmap 段（stack / 预留段），当前无法把它变成缓冲。实现时 `pool_add` 要**明确报红并计数**，先让真机跑出来告诉我们它到底会不会发生，再决定要不要补偿路（拷贝影子或改分配）。
+
 ### M2 —— 最小 Vulkan 回放层（最大工作量）
 
 - [ ] 搭 Vulkan 骨架：设备、队列、`ANativeWindow` 交换链
