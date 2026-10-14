@@ -110,6 +110,15 @@ target_include_directories(vk_hostmem_probe PRIVATE ${COMPAT})
 # M2's third capability probe: how much zero-copy memory can be obtained at once, and is it enough to
 # back the guest address space (heap 4 GB + alias 512 MB). This is the feasibility evidence for the design
 # route "what to do about zero-copy now that VK_EXT_external_memory_host is missing".
+# 兼容层摘要实现的自检（标准向量）。回放层的着色器键就靠 sha256(控制段)[:16]，
+# 而兼容层原先全是占位实现——这条探针把真实现验住，顺带把「键」这个用法也跑一遍。
+# Self-check of the compat layer's digest implementations (standard vectors). The replay layer's shader key is
+# sha256(control segment)[:16] and the compat layer used to be all placeholders -- this probe pins the real
+# implementation down and exercises the key usage as well.
+add_executable(t_digest ${CMAKE_CURRENT_SOURCE_DIR}/tests/t_digest.c)
+target_link_options(t_digest PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(t_digest PRIVATE ${COMPAT})
+
 add_executable(vk_fdmap_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_fdmap_probe.c)
 target_link_libraries(vk_fdmap_probe PRIVATE vulkan)
 target_link_options(vk_fdmap_probe PRIVATE -Wl,-z,max-page-size=16384)
