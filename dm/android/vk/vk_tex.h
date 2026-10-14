@@ -76,6 +76,51 @@ void vk_tex_transition(const tex_t *t, VkImageLayout want, VkCommandBuffer cb);
 void vk_tex_gpu_written(const tex_t *t);
 int vk_tex_is_gpu_written(const tex_t *t);
 
+// 从**驱动侧**把一张贴图（某一级、第 0 层）读回主机内存，输出为 RGBA8、行距 `pitch` 字节。
+// 与 `mtl_read_texels`（池内存直读）的区别：那条路读的是"池是真值"的表示，这条路读的是 **GPU 真正写过的那份**
+// ——两者在"贴图被当渲染目标用过"之后就不一样了。走这里不做块解排布：Vulkan 的图像拷贝已经把驱动布局转成线性，
+// 池里的块线性表示是另一回事。需要这张贴图的 VkImage **已经存在**（没被 GPU 用过就不该走这里，直读池即可）。
+// 成功返回 1，并把实际尺寸写回 out_w / out_h。
+// Read a texture (one level, layer 0) back from the **driver side** into host memory as RGBA8 with a row pitch of
+// `pitch` bytes. The difference from `mtl_read_texels` (a direct read of pool memory): that one reads the
+// "the pool is the truth" representation while this one reads **what the GPU actually wrote**, and the two diverge
+// once a texture has served as a render target. No block deswizzle happens here -- a Vulkan image copy already turns
+// the driver layout into linear order, and the pool's block-linear representation is a separate matter. The texture's
+// VkImage must **already exist** (a texture the GPU never touched should not come this way; read the pool directly).
+// Returns 1 on success and writes the actual size back through out_w / out_h.
+int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h);
+
+// 贴图 → 贴图拷贝（NVN 的 nvnCommandBufferCopyTextureToTexture）。记进**回放层的命令缓冲**，不另开一次提交
+// ——顺序就是语义：拷贝必须排在产生源内容的那些绘制之后。区域里宽/高/深 <= 0 表示"从偏移到边界"（NVN 的约定）。
+// 放在纹理层是因为只有这里同时知道两边的布局与"池是真值还是 GPU 写过"。
+// Texture-to-texture copy (NVN's nvnCommandBufferCopyTextureToTexture). Recorded into the **replay layer's command
+// buffer** rather than a separate submission -- order is the semantics here: the copy has to follow the draws that
+// produce the source content. A region width/height/depth of <= 0 means "from the offset to the edge" (NVN's
+// convention). It lives in the texture layer because only this layer knows both sides' layouts and whether the pool
+// or the GPU is the truth.
+int vk_tex_copy_t2t(const tex_t *src, const view_t *sv, const NVNcopyRegion *sr,
+                    const tex_t *dst, const view_t *dv, const NVNcopyRegion *dr, VkCommandBuffer cb);
+uint64_t vk_tex_t2t_count(void);
+
+// 登记"这张贴图是窗口（交换链）贴图"（客体建窗口时逐个报过来）。这一档不是记账，是**存储归属**：
+// 交换链贴图没有客体内存（存储由驱动持有），所以它照样要能建出图像——内容来自渲染或拷贝，不来自池。
+// 不登记的话这类贴图会被"没有内存就不建图"那条规矩挡掉，而渲染目标那一侧只是静默跳过它：
+// 结果是画面永远到不了出图纹理上（截图失败查出来的正是这条）。
+// Mark a texture as a window (swapchain) texture (the guest reports each one when it builds a window). This is not
+// bookkeeping but **storage ownership**: a swapchain texture has no guest memory (the driver owns its storage), yet it
+// must still get an image -- its content comes from rendering or copying, not from the pool. Without the mark, the
+// "no memory, no image" rule rejects it, and the render-target path merely skips it in silence: the picture then
+// never reaches the present texture (which is exactly what the failed screenshot uncovered).
+void vk_tex_mark_window_ser(uint64_t serial);
+int vk_tex_is_window_ser(uint64_t serial);
+
+// 诊断：列出"与给定尺寸相同的已知贴图"都是谁（序号、格式、是否窗口贴图、是否被 GPU 写过）。出图纹理读不回来时
+// 用它对着看——"客体到底把画面画进了哪一张"这件事不该靠猜。
+// Diagnostics: list which known textures share a given size (serial, format, whether it is a window texture, whether
+// the GPU has written it). Use it when the present texture cannot be read back: "which texture did the guest actually
+// draw the picture into" is not something to guess at.
+void vk_tex_dump_size(uint32_t w, uint32_t h);
+
 // CPU 读贴图（NVN ReadTexels）：与 Metal 侧同签名。这里走"池内存是真值"的直读路径（解排布直读），
 // 还没考虑 GPU 写出过的贴图——那一类要等回读通了再从 VkImage 取（见 docs/ANDROID_PLAN 的 M2 进度）。
 // CPU texture read (NVN ReadTexels), same signature as the Metal side. This takes the "pool memory is the truth"

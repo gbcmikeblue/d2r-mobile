@@ -59,6 +59,10 @@ add_library(dmhost_android STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_spv.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c
+  # 最小 PNG 写出（自带、无依赖）：出图截图要落盘成能直接看的文件，见 vk_png.h
+  # Minimal PNG writer (self-contained, no dependencies): a present screenshot has to land on disk as a file that can
+  # be looked at directly, see vk_png.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_png.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
   ${HOST_SRC}
   ${DM}/host/entry.S

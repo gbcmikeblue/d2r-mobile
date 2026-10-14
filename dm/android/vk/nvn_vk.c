@@ -27,6 +27,7 @@
 #include "vk_region.h"
 #include "vk_shader.h"
 #include "vk_tex.h"
+#include "vk_png.h"
 #include "dm.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -412,6 +413,115 @@ int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
     if (t0) *t0 = a;
     if (t1) *t1 = b;
     return b >= a && b ? 1 : 0;
+}
+
+// ========== 出图与截图（M2 验收的仪器）==========
+// ========== Present and screenshots (M2's acceptance instrument) ==========
+// 还没有窗口与交换链（那是 M3），但客体出图时**仍然会调** mtl_present——nvnQueuePresentTexture 会把交换链纹理交出来，
+// 所以这里是"游戏真正要显示哪一张画面"的**权威来源**，不用去猜哪张贴图是最终输出。这也是这一步能落地的原因：
+// 与其从几百张渲染目标里挑一张，不如用游戏自己交出来的那张。
+// There is no window or swapchain yet (that is M3), but the guest **still calls** mtl_present when it presents --
+// nvnQueuePresentTexture hands over the swapchain texture -- so this is the **authoritative** answer to "which
+// picture does the game mean to show", with no need to guess which texture is the final output. That is also why this
+// step can land at all: rather than picking one out of hundreds of render targets, take the one the game itself
+// hands over.
+
+static _Atomic uint64_t g_present_n;
+static struct { uint64_t frame; char path[512]; } g_shotq[8];
+static int g_nshotq;
+static pthread_mutex_t g_shotq_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// diag.c 提供强定义（DM_TICK_HOLD=E:SHOT 靠它解冻）；图形单测不链宿主时用这个空定义
+// diag.c provides the strong definition (DM_TICK_HOLD=E:SHOT unfreezes on it); this empty one serves graphics unit
+// tests that do not link the host
+__attribute__((weak)) void dm_shot_written(const char *path, int ok) { (void)path; (void)ok; }
+
+// 截图：等到 GPU 做完，把这张纹理从驱动侧读回，写成 PNG。
+// Take a screenshot: wait for the GPU to finish, read this texture back from the driver side and write it as a PNG.
+static int shot_take(const tex_t *t, const char *path) {
+    if (!t) { LOG("【红】截图 %s：出图纹理为空", path); return 0; }
+    uint32_t w = t->d.width, h = t->d.height;
+    if (!w || !h) { LOG("【红】截图 %s：出图纹理尺寸 %ux%u", path, w, h); return 0; }
+    uint8_t *buf = malloc((size_t)w * h * 4);
+    if (!buf) { LOG("【红】截图 %s：%ux%u 的像素缓冲分配不出", path, w, h); return 0; }
+    // 出图那张贴图**按需建**——与苹果侧一致（那边是 `id<MTLTexture> src = tex_mtl(t)`，建不出就报红"出图贴图建不出
+    // MTLTexture"）。这一条我先前搞错了：要求"入口必须已存在"等于把"此前没人问过它"误当成"游戏没画过它"。
+    // The present texture is built **on demand**, the same as Apple (there it is `id<MTLTexture> src = tex_mtl(t)`,
+    // which reports "cannot build an MTLTexture for the present texture" on failure). I had this wrong before:
+    // requiring a pre-existing entry mistakes "nobody asked for it yet" for "the game never drew into it".
+    if (!vk_tex_view(t, NULL)) {
+        LOG("【红】截图 %s：出图贴图（序号 %llu）建不出图像", path, (unsigned long long)t->serial);
+        free(buf);
+        return 0;
+    }
+    uint32_t gw = 0, gh = 0;
+    int ok = vk_tex_grab(t, 0, buf, (size_t)w * 4, &gw, &gh);
+    if (ok) ok = vk_png_write(path, buf, gw, gh);
+    // 读不回来就把"这个尺寸还有哪些已知贴图"列出来：画面到底进了哪一张，看这里最快
+    // If the readback fails, list which known textures share this size: this is the quickest way to see which one the
+    // picture went into
+    if (!ok) vk_tex_dump_size(w, h);
+    LOG("截图 %ux%u 格式 %#x → %s %s", gw, gh, t->d.format, path, ok ? "成功" : "失败");
+    free(buf);
+    dm_shot_written(path, ok);
+    return ok;
+}
+
+// 出图。安卓这边没有出图队列（M3 才有真的交换链），所以只做三件事：数帧、按请求截图、把票号报 0。
+// Presenting. There is no present queue on Android (a real swapchain arrives in M3), so this does three things: count
+// frames, take requested screenshots, and report a ticket of 0.
+uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
+    (void)period_s; (void)crop;
+    uint64_t n = atomic_fetch_add(&g_present_n, 1) + 1;
+
+    // DM_NVN_SHOT=帧号[,帧号…]:路径（路径里的 %d 换成帧号）——与苹果侧同名同义，脚本与经验可以直接搬过来
+    // DM_NVN_SHOT=<frame>[,<frame>...]:<path> (%d in the path becomes the frame number) -- the same name and meaning
+    // as on Apple, so scripts and know-how carry over
+    static long frames[16]; static int nf = -1; static const char *shot_path;
+    if (nf < 0) {
+        nf = 0;
+        const char *e = getenv("DM_NVN_SHOT"), *c = e ? strchr(e, ':') : NULL;
+        if (c) {
+            shot_path = c + 1;
+            for (const char *q = e; q < c && nf < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : c) frames[nf++] = atol(q);
+            LOG("[vk] 截图已排程：出图帧 %s 共 %d 个 → %s", e, nf, shot_path);
+        }
+    }
+    for (int i = 0; i < nf; i++)
+        if ((long)n == frames[i]) { char path[512]; snprintf(path, sizeof path, shot_path, (int)n); shot_take(t, path); }
+
+    pthread_mutex_lock(&g_shotq_mu);
+    for (int i = 0; i < g_nshotq;) if (n >= g_shotq[i].frame) { shot_take(t, g_shotq[i].path); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;
+    pthread_mutex_unlock(&g_shotq_mu);
+
+    // 前三次与每 300 次报一行：这也是日志里的"出图帧号"，截图时间点按它对齐
+    // The first three and then every 300th: this is the present frame number in the log, which screenshot timings
+    // line up against
+    if (n <= 3 || n % 300 == 0)
+        LOG("[vk] 出图第 %llu 次：纹理序号 %llu %ux%u 格式 %#x（没有交换链，只做统计与截图）", (unsigned long long)n,
+            (unsigned long long)(t ? t->serial : 0), t ? t->d.width : 0, t ? t->d.height : 0, t ? t->d.format : 0);
+    return 0;   // 没有出图队列：票号恒 0，后端那条 mtl_present_wait 等待即空转 | no present queue: the ticket is always 0, so the back end's mtl_present_wait returns immediately
+}
+
+// 按请求截图（DM_NVN_SHOT_UI / DM_TICK_HOLD=E:SHOT 用）：在当前出图帧之后第 k 帧截图。与苹果侧同签名。
+// Screenshot on request (used by DM_NVN_SHOT_UI and DM_TICK_HOLD=E:SHOT): the kth frame after the current present.
+// The same signature as Apple's.
+void dm_gfx_shot_at(long k, const char *path) {
+    pthread_mutex_lock(&g_shotq_mu);
+    if (g_nshotq < 8) {
+        g_shotq[g_nshotq].frame = atomic_load(&g_present_n) + (uint64_t)(k > 0 ? k : 0);
+        snprintf(g_shotq[g_nshotq].path, sizeof g_shotq[0].path, "%s", path);
+        g_nshotq++;
+    } else LOG("【红】截图请求超过 8 个，丢弃 %s", path);
+    pthread_mutex_unlock(&g_shotq_mu);
+}
+
+// 客体建窗口时逐个报过来的交换链贴图（nvnWindowInitialize）：**存储归属**的登记，不是记账——见 vk_tex.h 的说明。
+// The swapchain textures the guest reports one by one when it builds a window (nvnWindowInitialize): a registration of
+// **storage ownership** rather than bookkeeping -- see the note in vk_tex.h.
+void mtl_xv_window_tex(uint64_t serial) {
+    vk_tex_mark_window_ser(serial);
+    LOG("[vk] 登记窗口贴图：序号 %llu", (unsigned long long)serial);   // 与出图时报的序号对着看 | compare against the serial reported at present
 }
 
 static void inflight_reap(void) {
@@ -1100,7 +1210,16 @@ static void pass_begin(void) {
         // pass them down -- an attachment whose view limits the mip range also has a different size, which has to be
         // handled along with it.
         VkImageView iv = vk_tex_view(t, g_rs.has_cview[i] ? &g_rs.cview[i] : NULL);
-        if (!iv) continue;
+        if (!iv) {
+            // 不再静默：附件建不出图像这件事曾经让"画面到不了出图纹理"藏了很久（截图才把它照出来），
+            // 而纹理层只会报一次原因，所以这里也报一次"哪个目标被跳过"。
+            // No longer silent: an attachment that cannot produce an image once hid "the picture never reaches the
+            // present texture" for a long time (the screenshot is what exposed it), and the texture layer reports the
+            // reason only once, so this says which target was skipped.
+            static int said;
+            if (!said++) LOG("【黄】颜色附件建不出图像（序号 %llu）：这个目标本次跳过", (unsigned long long)t->serial);
+            continue;
+        }
         vk_tex_transition(t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, cb);
         vk_tex_gpu_written(t);
         int clr = g_rs.cc_have && (g_rs.cc_mask & (1 << i));
@@ -1127,6 +1246,10 @@ static void pass_begin(void) {
     int has_d = 0;
     if (g_rs.depth) {
         VkImageView dv = vk_tex_view(g_rs.depth, g_rs.has_dview ? &g_rs.dview : NULL);
+        if (!dv) {
+            static int said;
+            if (!said++) LOG("【黄】深度附件建不出图像（序号 %llu）：这次绘制没有深度附件", (unsigned long long)g_rs.depth->serial);
+        }
         if (dv) {
             vk_tex_transition(g_rs.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, cb);
             vk_tex_gpu_written(g_rs.depth);
@@ -1620,7 +1743,19 @@ void mtl_exec(const uint8_t *p) {
         // ---- 屏障与拷贝：先把通道关掉再做（拷贝不进渲染通道）----
         // ---- barriers and copies: close the pass first (copies do not run inside a render pass) ----
         case OP_BARRIER: pass_end(); break;
-        case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_COPY_STRIDE: case OP_CLEAR_TEX:
+        case OP_COPY_T2T: {
+            // 贴图 → 贴图拷贝。**画面进"出图纹理"走的就是这条路**：真机上窗口纹理从没被当渲染目标用过，
+            // 所以在实现这一步之前它在 Vulkan 侧根本不存在（截图失败的诊断正是这么说的）。
+            // Texture-to-texture copy. **This is how the picture reaches the present texture**: on the device the
+            // window texture is never used as a render target, so before this step it did not exist on the Vulkan
+            // side at all (which is exactly what the failed screenshot's diagnostics said).
+            pass_end();
+            const p_copy_t2t *c = (const p_copy_t2t *)a;
+            if (g_cur_slot < 0 || !vk_tex_copy_t2t(c->src, c->has_sv ? &c->sv : NULL, &c->sr,
+                                                   c->dst, c->has_dv ? &c->dv : NULL, &c->dr, g_inf[g_cur_slot].cb))
+                atomic_fetch_add(&g_shadow_n, 1);
+            break; }
+        case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_STRIDE: case OP_CLEAR_TEX:
             pass_end(); atomic_fetch_add(&g_shadow_n, 1); break;
 
         default: atomic_fetch_add(&g_op_unhandled, 1); break;   // 其余渲染类：先只统计 | the other render-side ops: counted only for now

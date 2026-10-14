@@ -32,9 +32,11 @@ uint32_t mtl_present_qos(void) { return 0; }
 
 // ---- 出图 | Presentation ----
 
-// 出图入队并返回票号；没有出图，恒返回 0
-// Enqueue a present and return its ticket; there is no presentation, so always 0
-uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) { (void)t; (void)period_s; (void)crop; return 0; }
+// mtl_present / dm_gfx_shot_at 已由回放层实现（nvn_vk.c 的"出图与截图"那一节）：客体出图时仍会调它们，
+// 那里是"游戏真正要显示哪张画面"的权威来源，也顺带成了截图与出图帧号的来源。
+// mtl_present / dm_gfx_shot_at are implemented by the replay layer now (the "present and screenshots" section of
+// nvn_vk.c): the guest still calls them when it presents, and that is the authoritative answer to which picture the
+// game means to show -- as well as the source of screenshots and of the present frame number.
 void mtl_present_wait(uint64_t ticket) { (void)ticket; }
 void mtl_present_flush(void) { }
 double mtl_presented_time(uint64_t ticket) { (void)ticket; return 0; }
@@ -50,7 +52,6 @@ uint64_t mtl_drawable_ns_take(void) { return 0; }
 // is no presentation, so the request is dropped.
 // 注意：丢掉它意味着 diag.c 的 DM_TICK_HOLD=E:SHOT 永远等不到 dm_shot_written 而解冻。
 // Note: dropping it means diag.c's DM_TICK_HOLD=E:SHOT never sees dm_shot_written and never unfreezes.
-void dm_gfx_shot_at(long k, const char *path) { (void)k; (void)path; }
 
 // ---- 显示节拍与等待 | Display link and waits ----
 
@@ -74,7 +75,11 @@ int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 1; }          // �
 void mtl_tex_release(tex_t *t) { (void)t; }
 void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_set_tex_pool_n(int n) { (void)n; }
-void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
+// mtl_xv_window_tex 已由回放层实现（nvn_vk.c）：它不是记账，而是"交换链贴图没有客体内存"这件事的**存储归属**登记，
+// 没有它窗口贴图就建不出图像、画面到不了出图纹理上。
+// mtl_xv_window_tex is implemented by the replay layer now (nvn_vk.c): it is not bookkeeping but the registration of
+// the fact that a swapchain texture has no guest memory, without which the window texture gets no image and the picture
+// never reaches the present texture.
 
 // ---- 外推与冻结的渲染侧握手 | Render-side handshake for extrapolation and freezing ----
 

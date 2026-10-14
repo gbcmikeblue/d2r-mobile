@@ -299,6 +299,46 @@ static VkCommandPool g_pool; static VkCommandBuffer g_cb;
 
 static uint64_t hsh(uint64_t k) { k *= 11400714819323198485ull; return k ^ (k >> 29); }
 
+// ---------- 窗口（交换链）贴图的登记（见 vk_tex.h 的说明）----------
+// ---------- Registration of window (swapchain) textures (see the note in vk_tex.h) ----------
+static uint64_t g_win_ser[64];
+static int g_nwin;
+
+void vk_tex_mark_window_ser(uint64_t serial) {
+    if (!serial) return;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nwin; i++) if (g_win_ser[i] == serial) { pthread_mutex_unlock(&g_mu); return; }
+    if (g_nwin < 64) g_win_ser[g_nwin++] = serial;
+    else { static int said; if (!said++) LOG("【黄】窗口贴图超过 %d 张：多出来的按普通贴图对待", 64); }
+    pthread_mutex_unlock(&g_mu);
+}
+
+static int win_ser_locked(uint64_t serial) {
+    for (int i = 0; i < g_nwin; i++) if (g_win_ser[i] == serial) return 1;
+    return 0;
+}
+
+int vk_tex_is_window_ser(uint64_t serial) {
+    pthread_mutex_lock(&g_mu);
+    int v = win_ser_locked(serial);
+    pthread_mutex_unlock(&g_mu);
+    return v;
+}
+
+void vk_tex_dump_size(uint32_t w, uint32_t h) {
+    pthread_mutex_lock(&g_mu);
+    int shown = 0;
+    for (int i = 0; i < g_cap && shown < 8; i++) {
+        ent_t *e = &g_tab[i];
+        if (!e->serial || !e->img || e->w != w || e->h != h) continue;
+        LOG("[vk] 同尺寸（%ux%u）的已知贴图：序号 %llu、格式 %d、%s、%s", w, h, (unsigned long long)e->serial, (int)e->fmt,
+            win_ser_locked(e->serial) ? "窗口贴图" : "普通贴图", e->gpu_written ? "GPU 写过" : "没被 GPU 写过");
+        shown++;
+    }
+    if (!shown) LOG("[vk] 同尺寸（%ux%u）的已知贴图：一张都没有", w, h);
+    pthread_mutex_unlock(&g_mu);
+}
+
 static ent_t *find_slot(uint64_t serial, int create) {
     if (!g_cap) { g_cap = 256; g_tab = calloc((size_t)g_cap, sizeof *g_tab); }
     if (create && g_n * 2 >= g_cap) {
@@ -518,6 +558,215 @@ int vk_tex_is_gpu_written(const tex_t *t) {
     return v;
 }
 
+// ---------- 贴图 → 贴图拷贝（见 vk_tex.h 的说明）----------
+// ---------- Texture-to-texture copy (see the note in vk_tex.h) ----------
+static _Atomic uint64_t g_t2t_n;
+
+int vk_tex_copy_t2t(const tex_t *src, const view_t *sv, const NVNcopyRegion *sr,
+                    const tex_t *dst, const view_t *dv, const NVNcopyRegion *dr, VkCommandBuffer cb) {
+    if (!src || !dst || !cb || !src->serial || !dst->serial) return 0;
+    if (src == dst && !sr && !dr) return 0;   // 同图同区：没有意义，也没有副作用 | same image, same region: nothing to do and no side effect
+    // 两边都先备好图像。注意目标一侧也要建：拷贝要往里写，没有图像就无处可写——**这正是窗口纹理的处境**
+    // （它从没被当渲染目标用过，所以到这一步之前它在 Vulkan 侧根本不存在）。
+    // Prepare both images first. The destination needs building too: a copy writes into it and there is nowhere to
+    // write without an image -- **which is exactly the window texture's situation** (never used as a render target, so
+    // on the Vulkan side it does not exist yet at this point).
+    if (!vk_tex_view(src, NULL)) {
+        static int said; if (!said++) LOG("【红】T2T 拷贝：源贴图（序号 %llu）的图像建不出来", (unsigned long long)src->serial);
+        return 0;
+    }
+    if (!vk_tex_view(dst, NULL)) {
+        static int said; if (!said++) LOG("【红】T2T 拷贝：目标贴图（序号 %llu）的图像建不出来（多半是池里取不到内存）", (unsigned long long)dst->serial);
+        return 0;
+    }
+    VkImage si = VK_NULL_HANDLE, di = VK_NULL_HANDLE;
+    VkFormat sf = VK_FORMAT_UNDEFINED, df = VK_FORMAT_UNDEFINED;
+    uint32_t sw = 0, sh = 0, sl = 0, dw = 0, dh = 0, dl = 0;
+    pthread_mutex_lock(&g_mu);
+    ent_t *es = find_slot(src->serial, 0), *ed = find_slot(dst->serial, 0);
+    if (es && es->img) { si = es->img; sf = es->fmt; sw = es->w; sh = es->h; sl = es->levels; }
+    if (ed && ed->img) { di = ed->img; df = ed->fmt; dw = ed->w; dh = ed->h; dl = ed->levels; }
+    pthread_mutex_unlock(&g_mu);
+    if (!si || !di) return 0;
+
+    // 视图可以限定 mip：拷的是它限定的那一级（与渲染目标那边同一套读法）
+    // A view can limit the mip level: the copy targets the level it names (the same reading as on the render-target side)
+    uint32_t slv = (sv && sv->set_levels && sv->base_level > 0) ? (uint32_t)sv->base_level : 0;
+    uint32_t dlv = (dv && dv->set_levels && dv->base_level > 0) ? (uint32_t)dv->base_level : 0;
+    if (slv >= sl) slv = 0;
+    if (dlv >= dl) dlv = 0;
+    if (sf != df) {
+        static int said;
+        if (!said++) LOG("【黄】T2T 拷贝的两边格式不同（源 %d、目标 %d）：这一对拷贝跳过", (int)sf, (int)df);
+        return 0;
+    }
+    // 区域：宽/高/深 <= 0 = 从偏移到边界；再按这一级的实际尺寸钳住（钳了就报，与渲染区那处同一个理由）
+    // Region: width/height/depth <= 0 means from the offset to the edge, then clamped to that level's real size
+    // (a clamp is reported, for the same reason as the render-area clamp)
+    int32_t lw = (int32_t)(slv > 31 ? 1u : sw >> slv), lh = (int32_t)(slv > 31 ? 1u : sh >> slv);
+    int32_t x = sr ? sr->xoffset : 0, y = sr ? sr->yoffset : 0, z = sr ? sr->zoffset : 0;
+    int32_t w = sr && sr->width > 0 ? sr->width : lw - x, h = sr && sr->height > 0 ? sr->height : lh - y;
+    int32_t d = sr && sr->depth > 0 ? sr->depth : 1;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (z < 0) z = 0;
+    if (x >= lw) x = lw - 1;
+    if (y >= lh) y = lh - 1;
+    if (w > lw - x) w = lw - x;
+    if (h > lh - y) h = lh - y;
+    if (w <= 0 || h <= 0 || d <= 0) { static int said; if (!said++) LOG("【黄】T2T 拷贝的区域不成立（%d,%d %dx%d 深 %d，源这一级 %dx%d）", x, y, w, h, d, lw, lh); return 0; }
+    int32_t dx = dr ? dr->xoffset : 0, dy = dr ? dr->yoffset : 0, dz = dr ? dr->zoffset : 0;
+    if (dx < 0) dx = 0;
+    if (dy < 0) dy = 0;
+    if (dz < 0) dz = 0;
+
+    // 布局转换由纹理层做（它记着当前布局）；两个调用都不在锁里——它们自己会加锁
+    // The layout transitions go through the texture layer (which tracks the current layouts); neither call is made
+    // under our lock because they take it themselves
+    vk_tex_transition(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cb);
+    vk_tex_transition(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, cb);
+    VkImageCopy rg = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, slv, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, dlv, 0, 1 },
+        .srcOffset = { x, y, z }, .dstOffset = { dx, dy, dz }, .extent = { (uint32_t)w, (uint32_t)h, (uint32_t)d } };
+    vkCmdCopyImage(cb, si, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, di, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+    // 目标从这一刻起"池不是真值"：CPU 再读它（或它被当渲染目标）都得走驱动侧
+    // From now on the destination's pool is not the truth: a CPU read of it (or its use as a render target) has to go
+    // through the driver side
+    vk_tex_gpu_written(dst);
+    uint64_t n = atomic_fetch_add(&g_t2t_n, 1) + 1;
+    if (n <= 3) LOG("[vk] T2T 拷贝第 %llu 次：%ux%u（源级 %u、目标级 %u）", (unsigned long long)n, (unsigned)w, (unsigned)h, slv, dlv);
+    return 1;
+}
+
+uint64_t vk_tex_t2t_count(void) { return atomic_load(&g_t2t_n); }
+
+// ---------- 从驱动侧读回（见 vk_tex.h 的说明）----------
+// ---------- Read back from the driver side (see the note in vk_tex.h) ----------
+int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
+    // 读不回就得说清为什么：这一层早退的路很多，静默早退过一次（真机上表现为"截图 0x0 失败"配一条黄红都没有），
+    // 所以每条早退都留一句话。
+    // A failed readback has to say why: this layer has many early exits and one of them was silent (on the device that
+    // looked like "screenshot 0x0 failed" with no failure line anywhere), so every exit leaves a line behind.
+    if (!t || !t->serial || !dst) {
+        LOG("【黄】读回：参数不成立（纹理 %p、序号 %llu、目标 %p）——序号为 0 说明这个对象还没在宿主这边登记",
+            (const void *)t, (unsigned long long)(t ? t->serial : 0), (const void *)dst);
+        return 0;
+    }
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) { LOG("【红】读回：设备还没建起来"); return 0; }
+
+    VkImage img = VK_NULL_HANDLE;
+    VkFormat fmt = VK_FORMAT_UNDEFINED;
+    uint32_t iw = 0, ih = 0, levels = 0;
+    VkImageLayout lay = VK_IMAGE_LAYOUT_UNDEFINED;
+    int depth_like = 0;
+    pthread_mutex_lock(&g_mu);
+    ent_t *e = find_slot(t->serial, 0);
+    if (e && e->img) {
+        img = e->img; fmt = e->fmt; iw = e->w; ih = e->h; levels = e->levels;
+        lay = e->lay; depth_like = e->depth_like || e->dsa;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!img) {
+        // 入口不存在：这张贴图还没被 GPU 用过，真值在池里（直读那条路），不该走这里
+        // No entry: the GPU has never touched this texture and the pool holds the truth (the direct path), so this is
+        // the wrong way to read it
+        LOG("【黄】从驱动侧读回一张还没被 GPU 用过的贴图（serial %llu）：它是直读池的那一类", (unsigned long long)t->serial);
+        return 0;
+    }
+    if (depth_like) {
+        static int said;
+        if (!said++) LOG("【黄】读回的是深度/模板贴图（serial %llu）：出图截图只取颜色，跳过", (unsigned long long)t->serial);
+        return 0;
+    }
+    // 只有 8 位四通道能直接当 RGBA8 用；两种字节序各认一遍（交换链常见的是 B8G8R8A8）
+    // Only 8-bit four-channel formats are usable as RGBA8 directly; both byte orders are recognised (B8G8R8A8 is the
+    // usual swapchain format)
+    int bgra = 0;
+    switch (fmt) {
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_R8G8B8A8_SNORM: bgra = 0; break;
+        case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_SNORM: bgra = 1; break;
+        default: {
+            static int said;
+            if (!said++) LOG("【黄】读回不支持格式 %d（只支持 8 位 RGBA/BGRA 四通道）：截图跳过", (int)fmt);
+            return 0;
+        }
+    }
+    uint32_t lv = level < levels ? level : 0;
+    uint32_t w = lv > 31 ? 1u : iw >> lv, h = lv > 31 ? 1u : ih >> lv;
+    if (!w) w = 1;
+    if (!h) h = 1;
+
+    // 中转缓冲：宿主可见 + 一致，拷完直接映射读
+    // Staging buffer: host-visible and coherent, mapped and read straight after the copy
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = (VkDeviceSize)w * h * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    if (vkCreateBuffer(vk_dev(), &bci, NULL, &buf) != VK_SUCCESS) { LOG("【红】读回：建中转缓冲失败"); return 0; }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(vk_dev(), buf, &mr);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
+    if (vkAllocateMemory(vk_dev(), &mai, NULL, &mem) != VK_SUCCESS || vkBindBufferMemory(vk_dev(), buf, mem, 0) != VK_SUCCESS) {
+        LOG("【红】读回：中转缓冲的内存分配 / 绑定失败");
+        vkDestroyBuffer(vk_dev(), buf, NULL);
+        return 0;
+    }
+
+    // 拷之前先把队列排空：要读的是 GPU 已经写完的画面（与苹果侧截图前那次 mtl_finish_gpu 同一个意思）
+    // Drain the queue before copying: the point is to read a picture the GPU has finished (the same meaning as the
+    // mtl_finish_gpu before Apple's screenshot)
+    vkQueueWaitIdle(vk_queue());
+    int ok = 0;
+    if (one_begin()) {
+        VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = lay, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = img, .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS } };
+        vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        VkBufferImageCopy rg = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1 },
+            .imageOffset = { 0, 0, 0 }, .imageExtent = { w, h, 1 } };
+        vkCmdCopyImageToBuffer(g_cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rg);
+        ok = one_end();
+    }
+    if (ok) {
+        void *p = NULL;
+        if (vkMapMemory(vk_dev(), mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
+            const uint8_t *s = (const uint8_t *)p;
+            for (uint32_t y = 0; y < h; y++) {
+                uint8_t *d = dst + (size_t)y * pitch;
+                const uint8_t *r = s + (size_t)y * w * 4;
+                if (bgra) for (uint32_t x = 0; x < w; x++) { d[x * 4 + 0] = r[x * 4 + 2]; d[x * 4 + 1] = r[x * 4 + 1]; d[x * 4 + 2] = r[x * 4 + 0]; d[x * 4 + 3] = r[x * 4 + 3]; }
+                else memcpy(d, r, (size_t)w * 4);
+            }
+            vkUnmapMemory(vk_dev(), mem);
+            if (out_w) *out_w = w;
+            if (out_h) *out_h = h;
+        } else { ok = 0; LOG("【红】读回：中转缓冲映射不出（尺寸 %ux%u、%llu 字节）", w, h, (unsigned long long)bci.size); }
+    } else {
+        static int said;
+        if (!said++) LOG("【红】读回：命令缓冲那一套没走通（格式 %d 尺寸 %ux%u）", (int)fmt, w, h);
+    }
+    // 拷完图像停在 TRANSFER_SRC：把布局记准，下一次转换才知道从哪来
+    // The image stays in TRANSFER_SRC after the copy: record that layout so the next transition knows where from
+    if (ok) {
+        pthread_mutex_lock(&g_mu);
+        ent_t *e2 = find_slot(t->serial, 0);
+        if (e2 && e2->img == img) e2->lay = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        pthread_mutex_unlock(&g_mu);
+    }
+    vkDestroyBuffer(vk_dev(), buf, NULL);
+    vkFreeMemory(vk_dev(), mem, NULL);
+    return ok;
+}
+
 // 按 view 取（必要时建）视图。view 为空、或它一个"限定/重解释"位都没设，就是底视图。
 // target 的取值与 ent_build 的 switch 同一套（0=1D、1=2D、2=3D、3=1D 数组、4=2D 数组、8=Cube、9=Cube 数组）。
 // Get (creating if needed) a view. An empty view, or one that sets none of the "limit/reinterpret" bits, is the base
@@ -585,7 +834,18 @@ static VkImageView view_for(ent_t *e, const view_t *v) {
 }
 
 static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *aspect, const view_t *vw) {
-    if (!t || !t->serial || !t->mem) return VK_NULL_HANDLE;
+    // 窗口（交换链）贴图没有客体内存：存储由驱动持有，内容是渲染或拷贝进去的——所以它**照样要能建出图像**。
+    // 不区分的话，渲染目标那一侧会静默跳过它（截图失败查出来的就是这条），画面永远到不了出图纹理上。
+    // A window (swapchain) texture has no guest memory: the driver owns its storage and its content arrives by being
+    // rendered or copied into it -- so it **must still get an image**. Without this distinction the render-target path
+    // skips it in silence (which is what the failed screenshot uncovered) and the picture never reaches the present
+    // texture.
+    if (!t || !t->serial) return VK_NULL_HANDLE;
+    if (!t->mem && !win_ser_locked(t->serial)) {
+        static int said;
+        if (!said++) LOG("【黄】贴图（序号 %llu）既没有客体内存、也没登记成窗口贴图：建不出图像", (unsigned long long)t->serial);
+        return VK_NULL_HANDLE;
+    }
     if (view) *view = VK_NULL_HANDLE;
     pthread_mutex_lock(&g_mu);
     ent_t *e = find_slot(t->serial, 1);
@@ -593,7 +853,14 @@ static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *asp
     if (need) {
         if (!e->img) { if (!ent_build(t, e)) { e->serial = 0; g_n--; pthread_mutex_unlock(&g_mu); return VK_NULL_HANDLE; } }
         VkImageAspectFlags a = e->depth_like ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (e->dsa ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
-        if (!ent_upload(t, e, a)) LOG("【红】贴图上传失败 serial=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
+        if (t->mem) {
+            if (!ent_upload(t, e, a)) LOG("【红】贴图上传失败 serial=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
+        } else {
+            // 窗口贴图：池里没有真值（本来就没有池），内容只来自 GPU，所以进图就是"GPU 写过"那一档
+            // A window texture: the pool holds no truth (there is no pool) and the content only ever comes from the
+            // GPU, so it enters as "the GPU has written it"
+            e->gpu_written = 1;
+        }
         e->dirty = 0;
     }
     if (aspect) *aspect = e->depth_like ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (e->dsa ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
