@@ -498,6 +498,21 @@ The next step is the replay layer itself (`nvn_vk.c`): implementing `mtl_init` /
 
 ### M3 — front end + touch + audio
 
+**First piece: the minimal window project (working; a picture appears on the device)** -- `dm/android/apk/` (one
+`NativeActivity`, zero Java, `hasCode="false"` in the manifest), with the scripts `build_apk.cmd` / `install_apk.cmd`.
+On the device: installed and launched, **two screencaps three seconds apart** show the background shifting from dark red
+to dark purple and the white bar moving left to right -- the whole chain `APK -> ANativeWindow -> VkSurface -> swapchain
+-> present` works (`1156x2510 format 37, 5 images, FIFO`). Drawing deliberately avoids render passes
+(`vkCmdClearColorImage` plus `vkCmdCopyBufferToImage`), so no pipeline has to be compiled on the device.
+
+**Reading the data once installed as an APK (measured; two questions, two answers)**: the app's domain is
+`u:r:untrusted_app:s0` and the data adb put in `/data/local/tmp` carries the `shell_data_file` label, so -- **reads work,
+writes do not**: `can read /data/local/tmp/dm/{patched,spv,romfs}` (the 9.1 GB **needs no copying**), but
+`cannot write /data/local/tmp/dm/save` (`errno 13`). Making `save`/`temp` **symlinks** into the app's directory does not
+help either (measured: the same `errno 13`). The answer is the environment variables the host already has:
+`DM_ROOT=/data/local/tmp/dm` together with `DM_SAVE` / `DM_TEMP` pointing at
+`/sdcard/Android/data/ai.d2rm.dm/files/{save,temp}` (the directory that "can write" in the positive control).
+
 - [ ] `front_run`: Android window and main loop (`NativeActivity` / `SurfaceView`)
 - [ ] `front_text_input`: system software keyboard
 - [ ] Touch: reuse `dm_touch_controls.c` (plain C); rewrite input capture and widget rendering

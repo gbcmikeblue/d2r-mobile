@@ -20,9 +20,12 @@
 #include <android_native_app_glue.h>
 #include <vulkan/vulkan.h>
 #include <android/log.h>
-#include <time.h>
-#include <string.h>
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #define TAG "dmwin"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -301,9 +304,59 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
     }
 }
 
+// 数据从哪读：这个探针只回答一个问题 —— 装成 APK 之后（uid 不再是 shell），app 还能不能读到 adb 放进
+// /data/local/tmp 的游戏数据？**权限位是放得开的**（/data/local/tmp 是 771，"其他"可穿越；/data/local/tmp/dm 是
+// 777；文件是 -rw-rw-rw-），所以剩下的只有 **SELinux**：adb shell 建的这类文件标签通常是 shell_data_file，
+// 而 app 域（untrusted_app）读它一般是被拒的。能读就省掉 9.1 GB 的搬运，读不到就得把数据放到 app 自己可读的
+// 目录里 —— 这个结论不该靠猜，所以让 app 自己说出来（连域与 errno 一起）。
+// Where the data comes from: this probe answers exactly one question -- now that we are an installed APK (not the shell
+// uid), can the app still read the game data adb pushed into /data/local/tmp? **The permission bits are wide open**
+// (/data/local/tmp is 771 so "other" may traverse, /data/local/tmp/dm is 777 and the files are -rw-rw-rw-), so all that
+// remains is **SELinux**: files of this kind created by adb shell usually carry the shell_data_file label, which the app
+// domain (untrusted_app) is normally denied. If it can read them, 9.1 GB of copying is avoided; if not, the data has to
+// move somewhere the app can read -- and that conclusion is not something to guess at, so the app says it itself
+// (together with its domain and errno).
+static void probe_paths(void) {
+    char ctx[256] = "";
+    FILE *f = fopen("/proc/self/attr/current", "r");
+    if (f) { if (fgets(ctx, sizeof ctx, f)) { char *nl = strchr(ctx, '\n'); if (nl) *nl = 0; } fclose(f); }
+    LOGI("探针：uid=%u gid=%u 域 %s", (unsigned)getuid(), (unsigned)getgid(), ctx[0] ? ctx : "?");
+    static const char *paths[] = {
+        "/data/local/tmp/dm/patched/main.patched.bin",          // 游戏主模块（54 MB）| the game's main module
+        "/data/local/tmp/dm/spv",                                // 着色器产物目录 | the shader artifact directory
+        "/data/local/tmp/dm/romfs",                              // 8.3 GB 的原版档案 | the 8.3 GB original archives
+        "/sdcard/Android/data/ai.d2rm.dm/files",                 // 正向对照：app 自己的外部目录，必然可读
+                                                                 // positive control: the app's own external directory, readable by construction
+        "/sdcard/d2rm/romfs",                                    // 入口里写好的备用位置（还没建）| the fallback the entry already knows (not created yet)
+    };
+    for (unsigned i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        FILE *g = fopen(paths[i], "rb");
+        if (g) { LOGI("  能读 %s", paths[i]); fclose(g); }
+        else LOGE("  读不了 %s（errno %d：%s）", paths[i], errno, strerror(errno));
+    }
+    // 写探针：游戏要写存档（save）与临时文件（temp），而**读得到不等于写得进** —— SELinux 对 shell_data_file 的写
+    // 通常比读严得多。写得进，数据就完全不用搬；写不进，就让 shell 把 save/temp 做成指向 app 自己目录的软链
+    // （软链的**目标**是 app_data_file，app 对它可写 —— 而游戏看到的仍是 <DM_ROOT>/save 这个路径）。
+    // Write probe: the game writes saves (save) and temporary files (temp), and **being able to read does not imply
+    // being able to write** -- SELinux is usually much stricter about writing shell_data_file. If writing works the data
+    // needs no moving at all; if not, have the shell symlink save/temp to the app's own directory (the symlink's
+    // **target** is app_data_file, which the app may write, while the game still sees the <DM_ROOT>/save path).
+    static const char *wpaths[] = {
+        "/data/local/tmp/dm/save/.d2rm_probe",
+        "/data/local/tmp/dm/temp/.d2rm_probe",
+        "/sdcard/Android/data/ai.d2rm.dm/files/.d2rm_probe",
+    };
+    for (unsigned i = 0; i < sizeof wpaths / sizeof wpaths[0]; i++) {
+        FILE *g = fopen(wpaths[i], "wb");
+        if (g) { fputc('x', g); fclose(g); remove(wpaths[i]); LOGI("  能写 %s", wpaths[i]); }
+        else LOGE("  写不了 %s（errno %d：%s）", wpaths[i], errno, strerror(errno));
+    }
+}
+
 void android_main(struct android_app *app) {
     app->onAppCmd = on_cmd;
     LOGI("启动（NativeActivity + app_glue）");
+    probe_paths();
     for (;;) {
         int events = 0;
         struct android_poll_source *src = NULL;

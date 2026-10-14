@@ -466,6 +466,17 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
 
 ### M3 —— 前端 + 触摸 + 音频
 
+**第一块：窗口最小工程（已通，真机看到画面）** —— `dm/android/apk/`（一个 `NativeActivity`、零 Java、清单
+`hasCode="false"`），脚本 `build_apk.cmd` / `install_apk.cmd`。真机：装上去启动后，**相隔 3 秒的两张截屏**里底色
+从暗红变暗紫、白条从左移到右 —— `APK → ANativeWindow → VkSurface → 交换链 → 上屏` 整条链通了（`1156x2510 格式 37、
+5 张、FIFO`）。画法有意不用渲染通道（`vkCmdClearColorImage` + `vkCmdCopyBufferToImage`），所以真机上没有管线要现编。
+
+**装成 APK 之后数据怎么读（实测，两问两答）**：app 域是 `u:r:untrusted_app:s0`，adb 放进 `/data/local/tmp` 的数据
+标签是 `shell_data_file`，于是 —— **读得到、写不进**：`能读 /data/local/tmp/dm/{patched,spv,romfs}`（9.1 GB **不用搬**），
+但 `写不了 /data/local/tmp/dm/save`（`errno 13`）。把 `save`/`temp` 做成指向 app 目录的**软链也不行**（实测同样
+`errno 13`）。正解是宿主本来就有的环境变量：`DM_ROOT=/data/local/tmp/dm` + `DM_SAVE` / `DM_TEMP` 指到
+`/sdcard/Android/data/ai.d2rm.dm/files/{save,temp}`（app 正向对照里"能写"的那个目录）。
+
 - [ ] `front_run`：安卓窗口与主循环（`NativeActivity` / `SurfaceView`）
 - [ ] `front_text_input`：系统软键盘输入框
 - [ ] 触摸：复用 `dm_touch_controls.c`（纯 C），重写输入采集与控件渲染
