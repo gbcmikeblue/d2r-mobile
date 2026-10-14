@@ -57,7 +57,14 @@ typedef struct { uint32_t binding; int32_t slot, cb_slot, cb_offset; uint32_t fl
 // nvn_slot: the **NVN texture slot** this binding corresponds to (-1 when it could not be paired). res.json has no
 // such field (Apple's reflection has `reg`), so it is paired at load time from shader_facts.tsv -- the rule and how it
 // was validated are in the section of vk_shader.c that does it.
-typedef struct { uint32_t binding, type, array, separate, flags, writable; int32_t cbuf_slot, handle, nvn_slot; char format[24]; } vk_tex_ref;
+// nvn_slot / nvn_sslot：这条绑定对应的 **NVN 贴图槽** 与 **NVN 采样器槽**（-1 = 解不出）。两者是**两套编号**
+// （仓库文档 dm/gfx/README.md:59-64：分离贴图句柄在 c2[0x168+8r]、分离采样器在 c2[0x568+8r]），都从 res.json 的
+// `handle` 里解码出来（公式与苹果侧产物同源，见 vk_shader.c 的说明）。
+// nvn_slot / nvn_sslot: the **NVN texture slot** and **NVN sampler slot** this binding corresponds to (-1 when it
+// cannot be decoded). The two are **separate numberings** (the repo's dm/gfx/README.md:59-64: separate texture handles
+// at c2[0x168+8r], separate samplers at c2[0x568+8r]) and both are decoded from res.json's `handle` (the same formula
+// the Apple-side artifacts are built with; see the note in vk_shader.c).
+typedef struct { uint32_t binding, type, array, separate, flags, writable; int32_t cbuf_slot, handle, nvn_slot, nvn_sslot; char format[24]; } vk_tex_ref;
 
 typedef struct {
     char key[VK_SHADER_KEY_LEN + 1];

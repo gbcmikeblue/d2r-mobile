@@ -574,9 +574,10 @@ uint64_t mtl_sub_commit(void) {
         // fields would be cut off (measured)
         uint32_t pok = 0, pbad = 0;
         vk_shader_texpair_stats(&pok, &pbad);
-        LOG("[vk] 贴图绑定：配上 %llu、写空白 %llu、采样器寄存器未知(用默认) %llu；槽配对 配 %u/漏 %u",
+        LOG("[vk] 贴图绑定：配上 %llu、写空白 %llu、空槽采样器 %llu、采样器号查不到 %llu；槽解码 成 %u/败 %u",
             (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank),
-            (unsigned long long)atomic_load(&g_desc_tex_nosamp), pok, pbad);
+            (unsigned long long)atomic_load(&g_desc_tex_emptysamp), (unsigned long long)atomic_load(&g_desc_tex_nosamp),
+            pok, pbad);
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;
@@ -996,26 +997,27 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                     const treg_e *e = treg_of((uint32_t)h);
                     if (e) {
                         texv = vk_tex_view(&e->t);
-                        // **采样器寄存器是未知的**：贴图槽与采样器槽是两套编号（仓库文档 dm/gfx/README.md:62 里
-                        // 两者是两个句柄表——分离贴图在 c[2][0x168+8r]、分离采样器在 c[2][0x568+8r]，r 是各自的
-                        // 寄存器号），而 D2R 根本不用合并绑定入口（BindTexture/BindTextures 调用点均为 0，只用
-                        // BindSeparate*）。所以**不能**拿贴图槽去查采样器表——早先那一版就是这么错的：它读到的
-                        // 0xfff00000 被我当成"空槽哨兵"，其实可能只是查错了槽。
-                        // 现在先一律用默认采样器（计数为"采样器寄存器未知"），等采样器寄存器落地；判定它到底该
-                        // 从哪来，靠 desc_tex_probe 打印的"该阶段非零采样器槽清单 vs 贴图槽"。
-                        // **The sampler register is unknown**: texture slots and sampler slots are two numberings (the
-                        // repo's dm/gfx/README.md:62 shows two handle tables -- separate textures at c[2][0x168+8r] and
-                        // separate samplers at c[2][0x568+8r], where r is each one's own register number) and D2R does
-                        // not use the combined entry points at all (BindTexture/BindTextures have zero call sites; only
-                        // BindSeparate* are used). So a texture slot must **not** be used to index the sampler table --
-                        // which is exactly what an earlier version did: the 0xfff00000 it read was taken for an
-                        // "empty-slot sentinel" while it may simply have been the wrong slot.
-                        // For now a default sampler is always used (counted as "sampler register unknown") until the
-                        // sampler register lands; where it should come from is decided by desc_tex_probe's "non-zero
-                        // sampler slots versus texture slots" for that stage.
-                        (void)texs;
+                        // 采样器按**采样器槽**取（不是贴图槽！两套编号：分离贴图在 c2[0x168+8r]、分离采样器在
+                        // c2[0x568+8r]，`nvn_sslot` 是从同一个 handle 的第二个字解出来的）。句柄高 20 位是采样器
+                        // 池号，但 0xFFF 是"填空槽"的哨兵——那种槽上的绑定本来不会被采样，用默认采样器是对的。
+                        // The sampler is taken by its **sampler slot** (not the texture slot! Two numberings: separate
+                        // textures at c2[0x168+8r], separate samplers at c2[0x568+8r], and `nvn_sslot` is decoded from
+                        // the second word of the same handle). The handle's high 20 bits are the sampler pool id while
+                        // 0xFFF is the "slot filled in" sentinel -- a binding on such a slot is never sampled, so a
+                        // default sampler is correct there.
+                        uint64_t sh_ = (tr->nvn_sslot >= 0 && tr->nvn_sslot < 128) ? g_rs.samp[stg_t][tr->nvn_sslot] : 0;
+                        uint32_t sid = (uint32_t)(sh_ >> 20);
+                        if (sh_ && sid != 0xfffu) texs = samp_of_id(sid);
                         if (texv) atomic_fetch_add(&g_desc_tex_ok, 1);
-                        atomic_fetch_add(&g_desc_tex_nosamp, 1);
+                        if (!texs) {
+                            if (!sh_ || sid == 0xfffu) atomic_fetch_add(&g_desc_tex_emptysamp, 1);
+                            else {
+                                static _Atomic uint64_t miss_said;
+                                if (atomic_fetch_add(&g_desc_tex_nosamp, 1) < 6 && atomic_fetch_add(&miss_said, 1) < 6)
+                                    LOG("【查】采样器槽 %d 的号 %u 在注册表里没有（句柄 0x%llx、注册表 %llu 项）",
+                                        tr->nvn_sslot, sid, (unsigned long long)sh_, (unsigned long long)atomic_load(&g_sreg_n));
+                            }
+                        }
                     }
                 }
             }

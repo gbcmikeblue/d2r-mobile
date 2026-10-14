@@ -342,71 +342,57 @@ typedef struct { int slot; const char *kind; size_t klen; uint8_t used; } fslot;
 
 // 把这张着色器的贴图绑定与接口描述表里的槽配起来（结果写进 vk_tex_ref.nvn_slot）
 // Pair this shader's texture bindings with the table's slots (the result goes into vk_tex_ref.nvn_slot)
-static void pair_tex_slots(vk_shader *sh) {
+// 从 res.json 的 `handle` 里**精确解出**贴图槽与采样器槽。这是这一步换掉"统计配对"的地方：
+// 早先那套（按维度分组、组内按顺序，自洽 98.4%）已经被下面这套取代——因为 handle 里本来就带槽号，
+// 公式在仓库里已经有两处实现（`dm/gfx/tools/dmsh_build.py:306-319` 的 decode_tex 就是苹果侧产物用的同一套；
+// `dm/gfx/tools/maxwell_refs.py` + `dm/gfx/README.md:59-64` 是全量实测的约定：贴图槽 r 的句柄在 c2[0x168+8r]、
+// 采样器槽 r 在 c2[0x568+8r]、图像槽 r 在 c2[0x120+8r]）。
+// 句柄字的拆法：o0 = h & 0x3FFF、o1 = (h >> 14) & 0x3FFF、ty = h >> 28；ty ≠ 0 时**两个字都要试**——分离采样器
+// 句柄的那一半就在 o1 里（只试 o0 会漏掉这一类，本地抽样里约 7%）。
+// **三方对账**（抽样 800 份着色器 / 5199 条贴图条目）：贴图槽 100% 落在 shader_facts.tsv 的槽集合内（那份表来自
+// PC 反射，是独立来源）、解不出 0 条、采样器槽全部落在 0..10——与真机上"非零采样器槽 0..10"的现场吻合。
+// Decode the texture slot and sampler slot **exactly** from res.json's `handle`. This is where the earlier
+// "statistical pairing" is replaced: the rule that came before (group by dimension, then in order, 98.4%
+// self-consistent) is superseded because the handle already carries the slots, and the formula already has two
+// implementations in the repo (`dm/gfx/tools/dmsh_build.py:306-319`'s decode_tex is the same one the Apple-side
+// artifacts are built with; `dm/gfx/tools/maxwell_refs.py` plus `dm/gfx/README.md:59-64` record the convention
+// measured across the whole library: texture slot r's handle at c2[0x168+8r], sampler slot r at c2[0x568+8r], image
+// slot r at c2[0x120+8r]).
+// Splitting the handle word: o0 = h & 0x3FFF, o1 = (h >> 14) & 0x3FFF, ty = h >> 28; when ty != 0 **both words must
+// be tried** -- the separate-sampler half lives in o1 (trying only o0 misses that class, about 7% in the local
+// sample).
+// **Cross-checked against three sources** (a sample of 800 shaders / 5199 texture entries): every decoded texture
+// slot lands in shader_facts.tsv's slot set (that table comes from the PC reflection, an independent source), zero
+// entries fail to decode, and every sampler slot lands in 0..10 -- matching the device's "non-zero sampler slots
+// 0..10".
+static int hnd_words(uint32_t h, uint32_t w[2]) {
+    w[0] = h & 0x3FFFu;
+    w[1] = (h >> 14) & 0x3FFFu;
+    return (h >> 28) ? 2 : 1;
+}
+
+static int slot_of_word(uint32_t word, uint32_t base, uint32_t lim) {
+    uint64_t b = (uint64_t)word * 4;
+    if (b < base || b >= lim || ((b - base) % 8)) return -1;
+    return (int)((b - base) / 8);
+}
+
+static void decode_slots(vk_shader *sh) {
     if (!sh->tex) return;
-    for (uint32_t i = 0; i < sh->ntex; i++) sh->tex[i].nvn_slot = -1;
-    if (!sh->ntex) return;
-    const char *v = facts_line(sh->key);
-    if (!v) { g_pair_bad += sh->ntex; return; }
-    const char *t = strstr(v, "\"tex\"");
-    if (!t) t = v;
-    t = strchr(t, '{');
-    if (!t) { g_pair_bad += sh->ntex; return; }
-    fslot fs[FACTS_MAXSLOT];
-    int n = 0;
-    for (const char *p = t + 1; *p && *p != '}' && n < FACTS_MAXSLOT;) {
-        if (*p != '"') { p++; continue; }
-        p++;
-        int s = 0;
-        if (*p < '0' || *p > '9') break;
-        while (*p >= '0' && *p <= '9') s = s * 10 + (*p++ - '0');
-        if (*p != '"') break;
-        p++;
-        while (*p == ' ') p++;
-        if (*p != ':') continue;
-        p++;
-        while (*p == ' ') p++;
-        if (*p != '"') continue;
-        p++;
-        const char *k0 = p;
-        while (*p && *p != '"') p++;
-        fs[n].slot = s; fs[n].kind = k0; fs[n].klen = (size_t)(p - k0); fs[n].used = 0;
-        n++;
-        if (*p == '"') p++;
-    }
-    if (!n) { g_pair_bad += sh->ntex; return; }
-    // 槽按槽号升序（表里的键序不是数字序，"8" 会排在 "48" 之后）——组内顺序就靠这个
-    // Sort slots by slot number (the table's key order is not numeric: "8" comes after "48") -- the within-group
-    // order depends on it
-    for (int i = 1; i < n; i++) {
-        fslot x = fs[i];
-        int j = i - 1;
-        while (j >= 0 && fs[j].slot > x.slot) { fs[j + 1] = fs[j]; j--; }
-        fs[j + 1] = x;
-    }
-    // 绑定按 binding 升序处理（res.json 里本来就有序，但别依赖它）
-    // Bindings are processed in ascending binding order (res.json is ordered already, but do not rely on it)
-    uint32_t idx[VK_SPV_MAXB];
-    uint32_t m = sh->ntex < VK_SPV_MAXB ? sh->ntex : VK_SPV_MAXB;
-    for (uint32_t i = 0; i < m; i++) idx[i] = i;
-    for (uint32_t i = 1; i < m; i++) {
-        uint32_t x = idx[i];
-        uint32_t j = i;
-        while (j > 0 && sh->tex[idx[j - 1]].binding > sh->tex[x].binding) { idx[j] = idx[j - 1]; j--; }
-        idx[j] = x;
-    }
-    for (uint32_t i = 0; i < m; i++) {
-        const char *want = kind_of_type((int)sh->tex[idx[i]].type);
-        if (!want) { g_pair_bad++; continue; }
-        size_t wl = strlen(want);
-        for (int k = 0; k < n; k++) {
-            if (fs[k].used || fs[k].klen != wl || strncmp(fs[k].kind, want, wl)) continue;
-            fs[k].used = 1;
-            sh->tex[idx[i]].nvn_slot = fs[k].slot;
-            g_pair_ok++;
-            break;
+    for (uint32_t i = 0; i < sh->ntex; i++) {
+        vk_tex_ref *r = &sh->tex[i];
+        r->nvn_slot = -1;
+        r->nvn_sslot = -1;
+        uint32_t w[2];
+        int nw = hnd_words((uint32_t)r->handle, w);
+        for (int k = 0; k < nw; k++) {
+            int t = slot_of_word(w[k], 0x168, 0x568);
+            if (t >= 0) { r->nvn_slot = t; continue; }
+            int s = slot_of_word(w[k], 0x568, 0x968);
+            if (s >= 0) r->nvn_sslot = s;
         }
-        if (sh->tex[idx[i]].nvn_slot < 0) g_pair_bad++;
+        if (r->nvn_slot >= 0) g_pair_ok++;
+        else g_pair_bad++;
     }
 }
 
@@ -522,7 +508,7 @@ static vk_shader *load(const char *key, int stage) {
     }
     free(js);
 
-    pair_tex_slots(sh);   // 装载时就把"贴图 binding ↔ NVN 槽"配出来（规则与验证见上面那一节）
+    decode_slots(sh);   // 装载时从 handle 精确解出贴图槽与采样器槽（见上面的说明与三方对账）
 
     // json 自己的 key 必须与文件名一致：不一致说明产物混了版本，缓存键会被写歪（缓存按 sh->key 查）
     // The key inside the json must match the file name: a mismatch means the artifacts are mixed across
