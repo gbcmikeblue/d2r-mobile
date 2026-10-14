@@ -52,7 +52,12 @@ typedef struct { uint32_t binding; int32_t slot, cb_slot, cb_offset; uint32_t fl
 // Texture/image: where the handle comes from (cbuf_slot < 0 means the handle is the number baked into the constants)
 // plus type/format, as in res.json. `writable` records the source: the images array of res.json (a writable image ->
 // STORAGE_IMAGE) versus the textures array (read-only -> a combined image sampler).
-typedef struct { uint32_t binding, type, array, separate, flags, writable; int32_t cbuf_slot, handle; char format[24]; } vk_tex_ref;
+// nvn_slot：这条绑定对应的 **NVN 贴图槽号**（-1 = 没配出来）。res.json 里没有这个字段（苹果侧那份反射有 reg），
+// 所以它是装载时用 shader_facts.tsv 配对出来的——规则与验证见 vk_shader.c 里那一节的说明。
+// nvn_slot: the **NVN texture slot** this binding corresponds to (-1 when it could not be paired). res.json has no
+// such field (Apple's reflection has `reg`), so it is paired at load time from shader_facts.tsv -- the rule and how it
+// was validated are in the section of vk_shader.c that does it.
+typedef struct { uint32_t binding, type, array, separate, flags, writable; int32_t cbuf_slot, handle, nvn_slot; char format[24]; } vk_tex_ref;
 
 typedef struct {
     char key[VK_SHADER_KEY_LEN + 1];
@@ -98,3 +103,8 @@ void vk_shader_stats(uint32_t *loaded, uint32_t *missing, uint32_t *bad);
 // 被挪到 set 1 的片元绑定条数（"按阶段分空间"生效的证据；诊断用）
 // How many fragment bindings were moved to set 1 (evidence that "a space per stage" is in effect; for diagnostics)
 uint32_t vk_shader_set_moved(void);
+
+// 贴图绑定与 NVN 槽的配对结果：配上 / 配不上（配不上的会在真机上计数，用来证伪配对规则本身）
+// The result of pairing texture bindings with NVN slots: paired / unpaired (unpaired ones are counted on the device,
+// which is what falsifies the pairing rule itself)
+void vk_shader_texpair_stats(uint32_t *paired, uint32_t *unpaired);

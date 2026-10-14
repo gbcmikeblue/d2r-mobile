@@ -67,7 +67,10 @@ int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 1; }          // �
 // mtl_reg_tex 已由回放层实现（nvn_vk.c 的贴图注册表）：句柄解析要用它。
 // mtl_reg_tex is implemented by the replay layer now (the texture registry in nvn_vk.c): handle resolution needs it.
 
-void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
+// mtl_reg_samp 已由回放层实现（nvn_vk.c 的采样器注册表）：采样器号 → 参数要用它。
+// mtl_reg_samp is implemented by the replay layer now (the sampler registry in nvn_vk.c): the sampler id -> parameters
+// table needs it.
+
 void mtl_tex_release(tex_t *t) { (void)t; }
 void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_set_tex_pool_n(int n) { (void)n; }

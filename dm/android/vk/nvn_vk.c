@@ -283,7 +283,7 @@ static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途
 // 这两个计数在"提交"那一段的统计行里要用，而它们属于描述符那一节（定义在后），所以在这里先定下来。
 // These two counters are used by the periodic stats line in the submission section while they belong to the
 // descriptor section (defined further down), so they are declared here first.
-static _Atomic uint64_t g_desc_draws, g_desc_tex_ok, g_desc_tex_blank;
+static _Atomic uint64_t g_desc_draws, g_desc_tex_ok, g_desc_tex_blank, g_desc_tex_nosamp;
 
 #define GPU_RING 1024        // 与苹果侧同一个环大小 | the same ring size as Apple
 #define GPU_PASS_MAX 64      // 一次提交最多记这么多通道；超了就不再写时间戳（那一次的量会偏小） | at most this many passes per submission; beyond it no more timestamps are written (that submission reads low)
@@ -572,8 +572,11 @@ uint64_t mtl_sub_commit(void) {
         // 贴图单独一行：上面的行已经接近宿主的长度上限，再挂两项就会被截断（实测过）
         // Textures get their own line: the line above is already close to the host's length limit and two more
         // fields would be cut off (measured)
-        LOG("[vk] 贴图绑定：解析成功 %llu、写空白 %llu",
-            (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank));
+        uint32_t pok = 0, pbad = 0;
+        vk_shader_texpair_stats(&pok, &pbad);
+        LOG("[vk] 贴图绑定：解析成功 %llu、写空白 %llu、无采样器 %llu；槽配对 配 %u / 漏 %u（漏的要能在日志里解释）",
+            (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank),
+            (unsigned long long)atomic_load(&g_desc_tex_nosamp), pok, pbad);
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;
@@ -671,6 +674,47 @@ static const treg_e *treg_of(uint32_t handle) {
         if (e->tid == tid) return e;
     }
     return NULL;
+}
+
+// ========== 采样器注册表：采样器号 → 参数 ==========
+// ========== Sampler registry: sampler id -> parameters ==========
+// 宿主在游戏建采样器时调 mtl_reg_samp（hle_nvn.c 的 nvnSamplerPoolRegisterSampler，传的就是采样器对象里的
+// `samp_par`），安卓侧原本是**空桩**。绑定时拿到的句柄高 20 位是采样器号（`samp[阶段][槽] >> 20`，
+// 与苹果侧同一套取法），所以需要这张表把号换回参数，再交给纹理层已有的 vk_samp_of 按参数内容建/取 VkSampler。
+// The host calls mtl_reg_samp when the game builds a sampler (nvnSamplerPoolRegisterSampler in hle_nvn.c, passing the
+// `samp_par` inside the sampler object), and on Android it was a **stub**. A bound handle carries the sampler id in
+// its high 20 bits (`samp[stage][slot] >> 20`, the same extraction as Apple), so this table turns the id back into
+// parameters and hands them to the texture layer's existing vk_samp_of, which caches a VkSampler by parameter content.
+#define SREG_TAB 4096
+typedef struct { int used, id; samp_par p; } sreg_e;
+static sreg_e g_sreg[SREG_TAB];
+static _Atomic uint64_t g_sreg_n;
+
+void mtl_reg_samp(int id, const samp_par *p) {
+    if (id < 0 || !p) return;
+    unsigned h = ((unsigned)id * 2654435761u) & (SREG_TAB - 1);
+    for (unsigned k = 0; k < SREG_TAB; k++) {
+        sreg_e *e = &g_sreg[(h + k) & (SREG_TAB - 1)];
+        if (!e->used) { e->used = 1; e->id = id; e->p = *p; atomic_fetch_add(&g_sreg_n, 1); return; }
+        if (e->id == id) { e->p = *p; return; }   // 同号重注册：按值刷新 | re-registration of one id: refresh by value
+    }
+    static int said;
+    if (!said++) LOG("【红】采样器注册表满了（%d 项）：后面的采样器取不到参数", SREG_TAB);
+}
+
+static VkSampler samp_of_id(uint32_t sid) {
+    unsigned h = (sid * 2654435761u) & (SREG_TAB - 1);
+    for (unsigned k = 0; k < SREG_TAB; k++) {
+        const sreg_e *e = &g_sreg[(h + k) & (SREG_TAB - 1)];
+        if (!e->used) return VK_NULL_HANDLE;
+        if ((unsigned)e->id == sid) {
+            samp_t t;
+            memset(&t, 0, sizeof t);
+            t.p = e->p;            // vk_samp_of 只读 p（按参数内容缓存）| vk_samp_of reads only p (cached by content)
+            return vk_samp_of(&t);
+        }
+    }
+    return VK_NULL_HANDLE;
 }
 
 // ========== 描述符写入（M2-6d-3 的 B 步）==========
@@ -925,12 +969,27 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
             //   the texture handles bound for that stage and the constant-bank addresses) goes into the log so the
             //   device's numbers can settle it.
             const vk_tex_ref *tr = desc_tex_ref(st, b[i].binding);
+            int stg_t = st->stage >= 0 && st->stage < 6 ? st->stage : 0;
             VkImageView texv = VK_NULL_HANDLE;
-            if (tr && tr->cbuf_slot < 0) {
-                const treg_e *e = treg_of((uint32_t)tr->handle);
-                if (e) texv = vk_tex_view(&e->t);
+            VkSampler texs = VK_NULL_HANDLE;
+            // 槽由接口描述表配对而来（见 vk_shader.c 那一节）。有了槽，就该阶段"绑在第几号"有了答案：
+            // **贴图与采样器都按同一个槽取**——NVN 里这两者就是按槽号配对绑定的（分开绑的两个数组，同一号成对）。
+            // The slot comes from the interface table (see the section in vk_shader.c). With a slot there is an
+            // answer to "which slot is bound for this stage": **both the texture and the sampler are taken by that
+            // same slot** -- in NVN the two are bound paired by slot number (two separate arrays, paired by index).
+            if (tr && tr->nvn_slot >= 0 && tr->nvn_slot < 128) {
+                uint64_t h = g_rs.tex[stg_t][tr->nvn_slot];
+                if (h) {
+                    const treg_e *e = treg_of((uint32_t)h);
+                    if (e) {
+                        texv = vk_tex_view(&e->t);
+                        uint64_t sh_ = g_rs.samp[stg_t][tr->nvn_slot];
+                        if (sh_) texs = samp_of_id((uint32_t)(sh_ >> 20));
+                        if (texv) atomic_fetch_add(&g_desc_tex_ok, 1);
+                    }
+                }
             }
-            if (!texv && tr && tr->cbuf_slot >= 0) desc_tex_probe(st, tr);   // 编码取证（前三次）| encoding forensics (first three)
+            if (!texv && tr) desc_tex_probe(st, tr);   // 配不上时取证（前三次）| forensics when unpaired (first three)
             if (!texv) {
                 // 用**自己的**计数器：早先和图"拿不到缓冲地址"共用 g_desc_blank，前 8 条被 UBO 的空白占掉，
                 // 于是贴图这条诊断在真机上一行都没打出来（查了半天）。
@@ -948,15 +1007,15 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), vk_pipe_dummy_view(),
                                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             } else {
-                // 采样器暂时用空白：句柄高位（>> 20）是采样器号，而"按采样器号取对象"的那张表还没有
-                // （绑定形态的采样器在 res.json 的 samplers 里，那是下一步）。采样器不对会让过滤方式不对，
-                // 但贴图本身能出来——这一步的目标是让贴图先出现。
-                // The sampler is a blank for now: the handle's high bits (>> 20) are the sampler id and the table
-                // that turns a sampler id into an object does not exist yet (bound-form samplers live in res.json's
-                // samplers, the next step). A wrong sampler means wrong filtering, but the texture itself shows up,
-                // and showing textures is what this step is for.
-                ii[nw] = (VkDescriptorImageInfo){ vk_pipe_dummy_sampler(), texv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                atomic_fetch_add(&g_desc_tex_ok, 1);
+                // 采样器来自**同一个槽**的采样器句柄高位（>> 20）；取不到才退回空白并计数——贴图照常绑上。
+                // 注：早先这里写着"res.json 的 samplers 数组"是**错的**，res.json 没有那个数组（已核实）。
+                // The sampler comes from the **same slot**'s sampler handle high bits (>> 20); only when that fails
+                // does it fall back to a blank (counted), with the texture still bound.
+                // Note: an earlier comment here mentioned "res.json's samplers array", which is **wrong** -- res.json
+                // has no such array (verified).
+                ii[nw] = (VkDescriptorImageInfo){ texs ? texs : vk_pipe_dummy_sampler(), texv,
+                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                if (!texs) atomic_fetch_add(&g_desc_tex_nosamp, 1);
             }
             w.descriptorType = b[i].type;
             w.pImageInfo = &ii[nw];

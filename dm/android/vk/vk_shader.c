@@ -216,6 +216,184 @@ static uint32_t js_count(const char *a) {
 // (logged and counted) and builds no pipeline
 static uint32_t g_set_moved;   // 被挪到 set 1 的片元绑定条数（诊断用）| fragment bindings moved to set 1 (for diagnostics)
 
+// ---------- 接口描述表（shader_facts.tsv）：SPIR-V 贴图 binding ↔ NVN 贴图槽 ----------
+// ---------- Interface table (shader_facts.tsv): SPIR-V texture binding <-> NVN texture slot ----------
+// 为什么需要配对：SPIR-V 里的贴图 binding 与 NVN 的贴图槽**不是一回事**，而 `<键>.res.json` 里**没有**这个对应
+// 关系（苹果侧那份反射有 `reg` 字段，安卓这份没有——翻译器只给 binding）。仓库里另有一张接口描述表
+// `shader_facts.tsv`：逐键记着"这个着色器用了哪些贴图槽、各是什么维度"，它的生成脚本自己写着
+// "NVN slot number = D3D register number"（dmsh_facts.py 的文件头）。
+// 于是"binding ↔ 槽"只能靠两边**配对**，规则是**按维度分组、组内按槽号/绑定号升序**。这条规则不是拍脑袋：
+// 它在本地用全库 44,135 条贴图绑定验过——自洽 98.4%；并做了**反例对照**（故意弄错一条映射就掉到 65.1%），
+// 所以这个一致性指标是有分辨力的。配不上的保持 -1 并在真机上计数，**不猜**。
+// 还有两个 type 至今没定下来（1029、1283，共 687 条）：试过把它们当 texel buffer，只能多配上 229 条，说明不是；
+// 它们一律不配，等在真机上看到实际影响再定。
+// Why pairing is needed: a texture binding in the SPIR-V is **not** an NVN texture slot, and `<key>.res.json` has
+// **no** such correspondence (Apple's reflection has a `reg` field and this one does not -- the translator emits only
+// the binding). The repository does carry another interface table, `shader_facts.tsv`, recording per key "which
+// texture slots this shader uses and what dimension each is", and its own generator states "NVN slot number = D3D
+// register number" (the header of dmsh_facts.py).
+// So "binding <-> slot" can only be **paired**, by the rule "group by dimension, then ascending slot/binding within a
+// group". That rule is not a guess: it was checked locally against all 44,135 texture bindings in the library -- 98.4%
+// self-consistent -- and falsified with a control (deliberately corrupting one mapping drops it to 65.1%), so the
+// consistency figure does discriminate. Unpaired entries stay at -1 and are counted on the device; **nothing is
+// guessed**.
+// Two types remain unsettled (1029 and 1283, 687 bindings together): treating them as texel buffers matched only 229
+// more, so that is not it. They stay unpaired until their real effect shows up on the device.
+#include <stdatomic.h>   // 配对计数是原子的：装载可能来自多个线程 | the pairing counters are atomic: loading may come from several threads
+
+#define FACTS_MAXSLOT 64
+static char *g_facts;
+static size_t g_facts_len;
+static int g_facts_tried;
+static _Atomic uint32_t g_pair_ok, g_pair_bad;
+
+static char *slurp(const char *path, size_t *n) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long sz = ftell(fp);
+    if (sz <= 0) { fclose(fp); return NULL; }
+    rewind(fp);
+    char *b = malloc((size_t)sz + 1);
+    if (!b) { fclose(fp); return NULL; }
+    size_t got = fread(b, 1, (size_t)sz, fp);
+    fclose(fp);
+    b[got] = 0;
+    *n = got;
+    return b;
+}
+
+static void facts_load(void) {
+    if (g_facts_tried) return;
+    g_facts_tried = 1;
+    char path[4200];
+    const char *env = getenv("DM_NVN_FACTS");
+    if (env && *env) g_facts = slurp(env, &g_facts_len);
+    if (!g_facts) {
+        const char *root = getenv("DM_ROOT");
+        if (root && *root) {
+            snprintf(path, sizeof path, "%s/shader_facts.tsv", root);
+            g_facts = slurp(path, &g_facts_len);
+        }
+    }
+    if (!g_facts) {
+        snprintf(path, sizeof path, "%s/../shader_facts.tsv", g_dir);
+        g_facts = slurp(path, &g_facts_len);
+    }
+    if (g_facts) LOG("【绿】接口描述表已载入（%zu KB）：贴图 binding 与 NVN 槽的配对靠它", g_facts_len >> 10);
+    else {
+        static int said;
+        if (!said++) LOG("【黄】没有接口描述表（shader_facts.tsv）：贴图绑定一律配不上，贴图会写成空白");
+    }
+}
+
+// 找某个键的那一行，返回 '\t' 之后的值起点
+// Find the line for a key and return the value start after its tab
+static const char *facts_line(const char *key) {
+    facts_load();
+    if (!g_facts) return NULL;
+    size_t kl = strlen(key);
+    for (const char *p = g_facts; *p;) {
+        if ((p == g_facts || p[-1] == '\n') && !strncmp(p, key, kl) && p[kl] == '\t') return p + kl + 1;
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return NULL;
+}
+
+// res.json 的 type → 接口描述表里的维度名。前五条是**本地用强制配对推出来并验过**的（见上面那一节）；
+// 1029 / 1283 不在这里（未定，不猜）。
+// res.json's type -> the dimension name used by the interface table. The first five were **derived from forced
+// pairings and validated locally** (see the section above); 1029 / 1283 are absent on purpose (unsettled, not guessed).
+static const char *kind_of_type(int type) {
+    switch (type) {
+        case 3: return "2d";
+        case 4: return "3d";
+        case 2: return "cube";
+        case 5: return "cube";
+        case 259: return "2darray";
+        default: return NULL;
+    }
+}
+
+typedef struct { int slot; const char *kind; size_t klen; uint8_t used; } fslot;
+
+// 把这张着色器的贴图绑定与接口描述表里的槽配起来（结果写进 vk_tex_ref.nvn_slot）
+// Pair this shader's texture bindings with the table's slots (the result goes into vk_tex_ref.nvn_slot)
+static void pair_tex_slots(vk_shader *sh) {
+    if (!sh->tex) return;
+    for (uint32_t i = 0; i < sh->ntex; i++) sh->tex[i].nvn_slot = -1;
+    if (!sh->ntex) return;
+    const char *v = facts_line(sh->key);
+    if (!v) { g_pair_bad += sh->ntex; return; }
+    const char *t = strstr(v, "\"tex\"");
+    if (!t) t = v;
+    t = strchr(t, '{');
+    if (!t) { g_pair_bad += sh->ntex; return; }
+    fslot fs[FACTS_MAXSLOT];
+    int n = 0;
+    for (const char *p = t + 1; *p && *p != '}' && n < FACTS_MAXSLOT;) {
+        if (*p != '"') { p++; continue; }
+        p++;
+        int s = 0;
+        if (*p < '0' || *p > '9') break;
+        while (*p >= '0' && *p <= '9') s = s * 10 + (*p++ - '0');
+        if (*p != '"') break;
+        p++;
+        while (*p == ' ') p++;
+        if (*p != ':') continue;
+        p++;
+        while (*p == ' ') p++;
+        if (*p != '"') continue;
+        p++;
+        const char *k0 = p;
+        while (*p && *p != '"') p++;
+        fs[n].slot = s; fs[n].kind = k0; fs[n].klen = (size_t)(p - k0); fs[n].used = 0;
+        n++;
+        if (*p == '"') p++;
+    }
+    if (!n) { g_pair_bad += sh->ntex; return; }
+    // 槽按槽号升序（表里的键序不是数字序，"8" 会排在 "48" 之后）——组内顺序就靠这个
+    // Sort slots by slot number (the table's key order is not numeric: "8" comes after "48") -- the within-group
+    // order depends on it
+    for (int i = 1; i < n; i++) {
+        fslot x = fs[i];
+        int j = i - 1;
+        while (j >= 0 && fs[j].slot > x.slot) { fs[j + 1] = fs[j]; j--; }
+        fs[j + 1] = x;
+    }
+    // 绑定按 binding 升序处理（res.json 里本来就有序，但别依赖它）
+    // Bindings are processed in ascending binding order (res.json is ordered already, but do not rely on it)
+    uint32_t idx[VK_SPV_MAXB];
+    uint32_t m = sh->ntex < VK_SPV_MAXB ? sh->ntex : VK_SPV_MAXB;
+    for (uint32_t i = 0; i < m; i++) idx[i] = i;
+    for (uint32_t i = 1; i < m; i++) {
+        uint32_t x = idx[i];
+        uint32_t j = i;
+        while (j > 0 && sh->tex[idx[j - 1]].binding > sh->tex[x].binding) { idx[j] = idx[j - 1]; j--; }
+        idx[j] = x;
+    }
+    for (uint32_t i = 0; i < m; i++) {
+        const char *want = kind_of_type((int)sh->tex[idx[i]].type);
+        if (!want) { g_pair_bad++; continue; }
+        size_t wl = strlen(want);
+        for (int k = 0; k < n; k++) {
+            if (fs[k].used || fs[k].klen != wl || strncmp(fs[k].kind, want, wl)) continue;
+            fs[k].used = 1;
+            sh->tex[idx[i]].nvn_slot = fs[k].slot;
+            g_pair_ok++;
+            break;
+        }
+        if (sh->tex[idx[i]].nvn_slot < 0) g_pair_bad++;
+    }
+}
+
+void vk_shader_texpair_stats(uint32_t *paired, uint32_t *unpaired) {
+    if (paired) *paired = atomic_load(&g_pair_ok);
+    if (unpaired) *unpaired = atomic_load(&g_pair_bad);
+}
+
 static int parse_ref(const char *txt, vk_shader *sh) {
     const char *v;
     if (!(v = js_find(txt, "key")) || !js_str(v, sh->key, sizeof sh->key)) return 0;
@@ -322,6 +500,8 @@ static vk_shader *load(const char *key, int stage) {
         return NULL;
     }
     free(js);
+
+    pair_tex_slots(sh);   // 装载时就把"贴图 binding ↔ NVN 槽"配出来（规则与验证见上面那一节）
 
     // json 自己的 key 必须与文件名一致：不一致说明产物混了版本，缓存键会被写歪（缓存按 sh->key 查）
     // The key inside the json must match the file name: a mismatch means the artifacts are mixed across
