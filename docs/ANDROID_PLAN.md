@@ -627,26 +627,24 @@ The port is currently being driven from a Windows machine. These are the traps a
 
 ## 7. Next step
 
-Proceed in the order on this page; after each milestone, tick it off here and record the conclusion. **M3 is at step 3
-now**: the rendering chain's warnings have shrunk from "descriptors falling back to blanks" to a **single** one --
-`uniform buffer: no buffer address` / `storage buffer: no buffer address` / `combined image sampler: writing a blank
-texture` all went to **zero** on 2026-10-14 (the first two via the constant-slot number minus 3 and via deriving a storage
-buffer's slot from `cb_offset`, the third via **buffer textures**, a newly added resource kind -- see the "M3-2k" section).
-That one warning plus the two remaining items form the ladder. What follows is ordered by value:
+Proceed in the order on this page; after each milestone, tick it off here and record the conclusion. **Both items of
+milestone A (the rendering chain's warnings) are now done**: the descriptor blanks (the UBO name number minus 3, the
+storage buffer derived from `cb_offset`, and **buffer textures** as a new resource kind -- see "M3-2k") and the vertex
+attribute test ("M3-2l": two independent faults, one of them caught by a probe). Device readings: `顶点属性` 0,
+`贴图写空白` 0, `拿不到缓冲地址` 0, `target 10 暂不支持` 0. **M2's acceptance (a picture appears) now hinges on the
+rendering chain alone** -- the warnings are cleared, but nobody has yet measured whether the GPU writes colour content
+once they are. What follows is ordered by value:
 
-1. **Fix where the vertex data lands** -- the warning `vertex attribute N (... at position N) has a component type that
-   disagrees with the shader: format NxN vs shader float` says the vertex stream and the format may be paired up wrongly;
-   geometry collapsing entirely is the most likely reason for "draws issued, nothing lands" (pick the stream from the type
-   the shader declares first, then check the stride and offset). **Do one piece of forensics first**: in `vk_spv.c`
-   `OP_TYPE_FLOAT = 21 / OP_TYPE_INT = 22` are **swapped** relative to the SPIR-V spec (see section six of "M3-2k"), so
-   the "shader float" half of that warning may itself come from an inverted test -- fix that first and run again, to see
-   whether the warning disappears, changes shape, or turns into a different one;
-2. **The descriptor shelf is now empty** (kept as a regression gauge): all three blank counters should read 0, and
-   `DM_NO_TEXEL=1` falls the buffer-texture path back to a blank, which is how one confirms the zeroes were bought by
-   this change;
-3. **Scan again once those are fixed** -- `DM_NVN_SHOT_SCAN` answers directly with "has content or not", so there is no
-   more guessing (it is already the instrument for the "you look, I change" loop: pictures and the report land in the same
-   directory);
+1. **Scan first** (cheapest and most informative) -- `DM_NVN_SHOT_SCAN` answers "has content or not" directly: with the
+   warnings cleared, do the targets carry content now? Content means the blocker moves to "does the picture reach the
+   present texture"; still all zero means the rendering chain holds a **third** problem nothing has caught yet (which
+   sends the work back to the readback and the pass/state lines to be measured, rather than guessing on down the warning
+   list);
+2. **Milestone B: the guest stall** -- classify it by sampling `/proc` over several rounds (the one-shot stall sampler
+   and the wait-point dump are both in place). This device normally stalls at 55-60 presents, so the judgement has to be
+   read from "what is it doing across several samples", never against the occasional outlier run;
+3. **That sporadic `VK_ERROR_DEVICE_LOST`** (on the texture-upload path, section six of "M3-2l") deserves a look of its
+   own: who loses the device first, the guest's own commands or our one-off submit plus queue-idle wait;
 4. Docs and cleanup to wrap up (including the interface-description-table code that is no longer called).
 
 ---
@@ -693,7 +691,8 @@ That one warning plus the two remaining items form the ladder. What follows is o
 10. **Read one frame back offscreen** and write it to disk ✓ (step 13 here: the picture really lands on disk, a valid 5,761,403-byte PNG that opens after being pulled);
 11. Use it to ask "where is the picture" ✓ (step 14 here: **no colour content** -> the blocker becomes the rendering chain: where vertex data lands, and descriptors falling back to blanks);
 12. **Descriptors falling back to blanks** cleared ✓ ("M3-2k": the UBO name number minus 3, the storage buffer derived from `cb_offset`, and **buffer textures** as a new resource kind; all three blank counters read zero on the device, and `DM_NO_TEXEL=1` brings them straight back);
-13. Buffer textures land ✓ ("M3-2k": `target 10` -> a texel buffer, the same idea as Apple's; **texture 701's registry entry really does have target 10**, the format is `R32G32B32A32_SFLOAT`, 65536 elements, built straight on the pool buffer).
+13. Buffer textures land ✓ ("M3-2k": `target 10` -> a texel buffer, the same idea as Apple's; **texture 701's registry entry really does have target 10**, the format is `R32G32B32A32_SFLOAT`, 65536 elements, built straight on the pool buffer);
+14. **The vertex-attribute test** corrected ✓ ("M3-2l": two independent faults -- two swapped opcodes and a missing dereference; the probe proves it on the device in three seconds with `float 10294 / uint 870 / sint 0`, matching the offline count item by item; the warning went **1 -> 0**).
 
 One **known latent issue** is recorded in the commit message: on Android `crash.c` always passes `is_write = 0`, and the dirty-page fault hook looks at that bit first, so a write to a write-protected page inside a pool walks into the crash path. The crash report already prints the faulting instruction encoding, which is what a correct read/write decision needs.
 
@@ -1133,3 +1132,180 @@ plain to see). It sits exactly on the judgment behind milestone A's other remain
 class vs the shader's declaration**) -- which means the "shader float" half of the warning
 `顶点属性 2 ... 格式 0x27 vs 着色器 float` may itself come from an inverted test. Following the "change one thing at a
 time" rule, it is left as the next step.
+
+### M3-2l: **two** independent faults hid inside the vertex-attribute test (one reasoned out, one caught by a probe) (2026-10-14)
+
+The hand-off described milestone A's remaining item as "vertex attribute component class vs the shader's declaration" and
+offered one root-cause candidate (the swapped opcodes above). Fixing it for real showed that **two independent faults sat
+on the same reading** -- and the second one was **caught by a probe, not reasoned out**.
+
+**1. Measure first (offline, over the 6923 artifacts)**:
+
+| What was measured | Reading |
+|---|---|
+| The shader the warning names, `3deaf68fd65b5298`: its stage and inputs | A **vertex** shader; locations 0/1/5 are float x4 and **location 2 is uint x4** |
+| The format the game gives it | `0x27` = `R8G8B8A8_UINT` (attribute format table: `(0x27-1) % 12 = 2` -> uint-like) -- **the two sides agree** |
+| Self-proving numbering: opcode x word count | `21` occurs **only** with four words (13846 times), `22` **only** with three (6923 times = one float32 per module) -> 21 = `OpTypeInt`, 22 = `OpTypeFloat` |
+| All vertex inputs in the library | 11164, **all vec4** (float 10294 / uint 870 / sint 0), **no matrix (array) attribute**; 580 vertex shaders carry a uint |
+
+So that warning **had always been a false alarm** (the shader wants uint and the game supplies uint); what was broken was
+the test itself.
+
+**2. Correct the numbering** (`vk_spv.c`): it read `FLOAT = 21 / INT = 22`, so `OpTypeInt` (21) landed in the FLOAT arm
+while `OpTypeFloat` (22) could not enter the INT arm that asks for `wc >= 4` (OpTypeFloat has three words) -- making
+`== OP_TYPE_INT` **never true** (those two word-count guards are part of the test; the comment says to read the pair
+together). The warning also changed from "print the first occurrence" to "the first eight plus one per 1024 plus a
+running count": when the test itself has been wrong, the **total** matters more than a sample.
+
+**3. After the fix, run the probe before the game** (three seconds on the device) -- and the reading **did not move at
+all**: `顶点属性分量：float 11164、uint 0`. "The numbering is fixed and yet the reading is identical" is itself what
+points at the **second fault**: `var_type` holds an `OpTypePointer`, and the attribute block **never dereferenced it**, so
+`comps` stayed 1 and `ct` was the pointer's id (naturally absent from `scalar_op`) -- the class was **always** float.
+Adding "pointer -> input type" is the whole fix (the array arm is deliberately **not** written: all 11164 inputs in the
+library are measured to be vec4, with not one matrix attribute).
+
+**4. Self-proof on the device** (probe, 3.1 seconds): `顶点属性分量：float 10294、uint 870、sint 0`, with samples showing
+`位置 N=uint x4` -- matching the offline Python count **item by item** (10294 / 870 / 0; 11164 inputs; all x4). The probe
+gained this line this round (it used to report binding kinds only), and its value is that **this fix can prove itself
+without running the game** -- and that anyone touching those two opcodes again turns it red immediately.
+
+**5. Device readings** (Redmi K90 / Adreno 830, standard configuration): the `顶点属性` warning went **1 -> 0**;
+`贴图写空白` 0, `拿不到缓冲地址` 0, `target 10 暂不支持` 0 (the previous round's results hold); `图形管线 80（失败 0）`;
+and it stalls exactly where this device normally stalls (56 presents, 6084 draws, the same stage). In other words
+**correcting the test produced no new signal**, and both of milestone A's items are now done (the other being the buffer
+texture of "M3-2k").
+
+**6. One thing recorded for the first time** (**not introduced this round**): one run's log contains
+`【红】上传命令等待失败 VkResult -4` (-4 = `VK_ERROR_DEVICE_LOST`) followed by a cascade of a hundred-plus
+`【红】贴图上传失败 serial=... 格式 ...` lines. Across runs: the 21:27 run (long before this round) has the same line, this
+round's A/B groups both have it, and the 21:47 run does not -- **sporadic, and unrelated to the last two changes**; but it
+shows that "device lost" surfaces on this texture-upload path (a one-off submit plus a queue-idle wait), which deserves a
+look of its own (who loses it first: the guest's own commands, or that one submit of ours).
+
+---
+
+## 9. Optimisation list (**for confirmation**, recorded 2026-10-14)
+
+This is not "what to do next" but one place for the things that **could be faster or more robust** now that milestone A's
+two tests are clear (see "M3-2l"), for item-by-item confirmation. **Not one line of code changes before that
+confirmation.** Each item carries its evidence (`file:line`) and "how to measure".
+
+The order is by value for money (gain over risk), not by effort.
+
+| # | Item | In one line | Risk | When |
+|---|---|---|---|---|
+| 1 | Create a `VkPipelineCache` and persist it | No pipeline cache at all today, so every launch compiles from scratch | Low | first |
+| 2 | Ask for `HOST_CACHED` for the zero-copy type | The 3.7 GB guest heap sits on **host-uncached** memory | Low-medium | alongside 1 |
+| 3 | Stop deriving `renderArea` from the viewport | An offset viewport shrinks the render area, so fragments are silently discarded | Zero to measure | **parallel with the re-scan** |
+| 4 | The per-draw repeated work | Pipeline lookup + two descriptor sets + a full rewrite + rebinding | Medium | after the blocker is measured |
+| 5 | Texture uploads on a resident upload ring | "One-off submit plus a queue-idle wait", and it has already shown `DEVICE_LOST` | Medium | with item 3 of "next steps" |
+| 6 | The hand-rolled pipeline tables are small and destroy on evict | `GPSO_TAB 192` / `CPSO_TAB 256` | Low | after 1 |
+| 7 | 70.5% of the op stream is pure state binding | State is carried twice (record and replay) | High (largest surface) | M3/M4 |
+
+### 1. Create a `VkPipelineCache` and persist it (biggest gain, lowest risk)
+
+**Evidence**: both pipeline creations pass `VK_NULL_HANDLE` (`vk_pipe.c:284`, `vk_pipe.c:660`), and there is no
+`vkCreatePipelineCache` anywhere in the tree.
+
+**What it costs**: no driver-level dedup inside a run, and a from-scratch compile on every run. Android compiles the
+SPIR-V **at runtime** (there is no iOS-style "offline metallib" path), so this item is exactly the Android counterpart of
+the iOS advantage "every shader is translated offline and compiled ahead of time, so entering a new scene compiles
+nothing".
+
+**Suggestion**: one `VkPipelineCache` shared by graphics and compute; `vkGetPipelineCacheData` to app-private storage on
+exit and on backgrounding, loaded back through `VkPipelineCacheCreateInfo::pInitialData` on the next launch. **The blob
+must be stored together with the driver version and the device identity** and discarded when either changes -- the trap
+named by both the official sample and zeux.io's "Robust pipeline cache serialization".
+
+**How to measure**: time to `nnMain` and the first-scene hitch, on one device, two runs (cold cache versus warm).
+
+### 2. Ask for `HOST_CACHED` for the zero-copy memory type
+
+**Evidence**: `vk_device.c:326-327` asks for `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`, and `vk_memory_type`
+(`vk_device.c:154-162`) **returns the first match** -> type 4. The project's own probe (M2 step 1) recorded
+type 6 = `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`.
+
+**What it costs**: the whole 3.7 GB guest heap plus the 512 MB alias region sit on **host-uncached** memory, so every
+guest access takes the uncached path (game logic, vertex/constant building and texture uploads all live there). Apple's
+`MTLResourceStorageModeShared` is cacheable on Apple silicon, so the two sides are not equivalent.
+
+**Suggestion**: ask for `...|HOST_CACHED` first and fall back to the current set (which needs one more rung in
+`vk_memory_type`).
+
+**How to measure**: change only this one place and A/B it -- same scene, same duration, CPU time / frame rate / time into
+a game.
+
+**To verify first**: whether `vkGetMemoryFdKHR` works on type 6 (the probe verified type 4, not type 6) -- settle that
+before changing anything.
+
+### 3. Stop deriving `renderArea` from the viewport (top suspect for the blocker)
+
+**Evidence**: `nvn_vk.c:1806-1810` -- the render area is "the viewport's `x+width` / `y+height`" min'd with the scissor,
+rather than the attachment's extent.
+
+**Why it is a risk**: once the viewport's `x`/`y` is negative or non-zero (not rare in NVN), the `(uint32_t)` cast and the
+min both **shrink** the render area, and **fragments outside the render area are discarded outright**; the device has no
+validation layers to say so. That is one of the exact shapes of "drew, and not one pixel landed". Apple's side and the
+comparable projects (Skyline / Ryujinx) take the **attachment extent** and let the viewport and the scissor do the
+clamping.
+
+**Suggestion**: **measure first** (add readings, change no behaviour): when a pass opens, log the `renderArea` next to the
+attachment size and the viewport/scissor, and look for `w < att_w`, `h < att_h` or a plainly tiny value.
+
+**When**: **in parallel** with item 1 of "next steps" (`DM_NVN_SHOT_SCAN`) -- both answer "does the target hold anything
+now that the warnings are clear".
+
+### 4. The per-draw repeated work
+
+**Evidence**: every draw runs `vk_pipe_graphics` (`nvn_vk.c:2259`), allocates two descriptor sets and rewrites them whole
+(`nvn_vk.c:2287-2290`), and rebinds the pipeline, the descriptor sets and the vertex streams (`nvn_vk.c:2292-2307`); the
+full rewrite lands on `vkUpdateDescriptorSets` at `nvn_vk.c:1728`.
+
+**Against the prior art**: Skyline has a dedicated `descriptor_allocator`, Ryujinx caches descriptor sets by content, and
+both use **dirty flags** to skip unchanged state; here it is "recompute everything per draw" (the header of `nvn_vk.c`
+says M2 aims at semantic equivalence only).
+
+**Suggestion**: (1) remember the last pipeline + descriptor sets + vertex buffers per in-flight slot and skip identical
+binds; (2) cache descriptor sets keyed by the resolved binding contents (the biggest of the three -- 70.5% of the ops are
+bindings); (3) then look at whether the device has `VK_EXT_descriptor_indexing` / `VK_KHR_push_descriptor`.
+
+**When**: **only after "does the GPU write colour content" has been measured** (the project's one-change-at-a-time rule).
+
+### 5. Texture uploads on a resident upload ring
+
+**Evidence**: `vk_tex.c:385-397` -- `one_end` is "submit plus `vkQueueWaitIdle`", all of it inside the queue lock.
+**New evidence** ("M3-2l", section 6): one run shows `【红】上传命令等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`) followed
+by a hundred-plus failed texture uploads; across runs it is **sporadic and unrelated to the last two changes**.
+
+**Suggestion**: (1) settle "who loses it first" (already item 3 of "next steps"); (2) have uploads share the frame's
+command buffer, or build a resident upload ring (the readback path already did this -- a resident staging buffer took a
+readback from about 0.45 s to negligible).
+
+### 6. The hand-rolled pipeline tables are small and destroy on evict
+
+**Evidence**: `GPSO_TAB 192` (`vk_pipe.c:449-451`), `CPSO_TAB 256` (`vk_pipe.c:271-274`), a whole-struct hash with linear
+probing and a `memcmp` (`vk_pipe.c:480-485`), and an eviction that calls `vkDestroyPipeline` (`vk_pipe.c:667-677`).
+
+**Suggestion**: once item 1 lands, recreating a pipeline is cheap and this drops in priority; it is still worth turning
+the per-draw "hash + probe + memcmp of the whole state" into "compare with the last one", and the eviction into a
+use-counted LRU.
+
+### 7. 70.5% of the op stream is pure state binding
+
+**Evidence**: the project's own reading (about 8 million ops per window: `BIND_STATE` 27.8% / `BIND_UBO` 21.9% /
+`STENCIL` 10.3% / `BIND_TEX` 5.3% / `BIND_VBUF` 5.2%); the header of `nvn_vk.c` says M2 carries none of Metal's
+optimisations (allocator rings, deferred merged passes, argument buffers, residency sets).
+
+**Two routes**: (1) merge consecutive `BIND_*` at record time and drop the ones that are overwritten; (2) apply pure
+state into the shadow **at record time** so it never enters the stream at all (only `SET_RT` / `CLEAR` / `DRAW` do). Route
+2 is more thorough and departs furthest from the Apple-shaped structure.
+
+**When**: M3/M4; the largest surface, so the gain has to be shown against the frame budget.
+
+### Suggested order
+
+1. Item 1 of "next steps" (the re-scan) plus item 3 here as a **measurement** -- parallel, zero risk, and it answers
+   "where the blocker is" directly;
+2. item 1 (`VkPipelineCache` + persistence) -- lowest risk, the direct counterpart of iOS's "compiled ahead of time";
+3. item 2 (`HOST_CACHED`) -- verify "can type 6 export an fd" first, then A/B it on its own;
+4. items 4 / 5 / 6 / 7 once the frame budget has been measured.

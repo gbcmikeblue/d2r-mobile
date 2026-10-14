@@ -21,7 +21,21 @@
 
 enum { OP_TYPE_IMAGE = 25, OP_TYPE_SAMPLER = 26, OP_TYPE_SAMPLED_IMAGE = 27, OP_TYPE_ARRAY = 28,
        OP_TYPE_RUNTIME_ARRAY = 29, OP_TYPE_STRUCT = 30, OP_TYPE_POINTER = 32,
-       OP_TYPE_FLOAT = 21, OP_TYPE_INT = 22, OP_TYPE_VECTOR = 23, OP_CONSTANT = 43,
+       // **这两个曾经写反**（原来写着 FLOAT = 21 / INT = 22），后果是"顶点属性分量类型 vs 着色器声明"那条判据
+       // 恒等于 float：`OpTypeInt`（21）落进 FLOAT 那一支、`OpTypeFloat`（22）因为只有 3 个字而落不进 INT 那一支
+       // （它要求 `wc >= 4`），于是 `scalar_op` 要么是 0、要么是 21，`== OP_TYPE_INT` **永不成立** —— 全库 580 份
+       // 顶点着色器声明了 uint 属性，全被判成 float（真机上那条假告警就是这么来的，见 vk_pipe.c 那段）。
+       // 定案用的是**字数普查**而不是意见：全库 6923 份产物里 opcode 21 **只**出现 4 个字（13846 次）、
+       // opcode 22 **只**出现 3 个字（6923 次，正好每份一个 float32），与规范一致。
+       // **These two were once swapped** (it read FLOAT = 21 / INT = 22), which made the "vertex attribute component
+       // class vs the shader's declaration" test constantly say float: `OpTypeInt` (21) landed in the FLOAT arm while
+       // `OpTypeFloat` (22) could not land in the INT arm because that arm asks for `wc >= 4` (OpTypeFloat has three
+       // words), so `scalar_op` was either 0 or 21 and `== OP_TYPE_INT` **never held** -- all 580 vertex shaders in the
+       // library that declare a uint attribute were called float (which is exactly where the device's false warning came
+       // from; see that block in vk_pipe.c). The verdict comes from a **word-count census**, not an opinion: across all
+       // 6923 artifacts opcode 21 occurs **only** with four words (13846 times) and opcode 22 **only** with three
+       // (6923 times, exactly one float32 per module), matching the spec.
+       OP_TYPE_INT = 21, OP_TYPE_FLOAT = 22, OP_TYPE_VECTOR = 23, OP_CONSTANT = 43,
        OP_DECORATE = 71, OP_VARIABLE = 59, OP_FUNCTION = 54 };
 
 // OpTypeImage 的 Dim 里我们只关心这一个：Buffer = 缓冲区贴图（Vulkan 那边是 texel buffer）。
@@ -183,6 +197,11 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap,
                 else if (dec == DEC_LOCATION && wc >= 4) t.in_loc[target] = (int32_t)val;
             }
             break;
+        // 两处字数守卫就是判据的一部分（3 = OpTypeFloat、4 = OpTypeInt），上面那段普查正是按它定案的：
+        // 反过来写会让其中一支**永远进不来**（曾经的 bug 就是这么发生的），所以这一对要一起看。
+        // The two word-count guards are part of the test (three words means OpTypeFloat, four means OpTypeInt) and the
+        // census above is what settled it: writing them the wrong way round makes one arm **unreachable forever**,
+        // which is exactly what the old bug did, so the pair has to be read together.
         case OP_TYPE_FLOAT:   // 结果 id、位宽 | result id, width
             if (wc >= 3 && o[1] < MAX_IDS) t.scalar_op[o[1]] = OP_TYPE_FLOAT;
             break;
@@ -274,8 +293,29 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap,
         int ni = 0;
         for (uint32_t id = 0; id < MAX_IDS && ni < incap; id++) {
             if (!t.has_in[id] || t.in_loc[id] < 0) continue;
+            // 变量的类型是 **OpTypePointer**，要**解引用**才到"输入本身"的类型。这一步早先漏了：于是 `comps` 恒为 1、
+            // `ct` 是指针的 id（`scalar_op` 里当然没有它）→ 分量类别恒为 float。它与"两个 opcode 写反"是**两个**
+            // 独立的错，落到同一句读数上，而**是设备上的探针把第二个照出来的**（`float 11164、uint 0`，
+            // 而离线统计是 870 条 uint 属性）。
+            // The variable's type is an **OpTypePointer**, so it has to be **dereferenced** to reach the input's own
+            // type. That step was missing: `comps` stayed 1 and `ct` was the pointer's id (which of course is absent
+            // from `scalar_op`), so the component class was always float. This is a **second, independent** fault from
+            // the two swapped opcodes, landing on the same reading -- and **the probe on the device is what caught it**
+            // (`float 11164, uint 0` against an offline count of 870 uint attributes).
             uint32_t ty = t.var_type[id], comps = 1, ct = ty;
+            for (int g = 0; g < 8 && ty < MAX_IDS && t.ptr_pointee[ty]; g++) ty = t.ptr_pointee[ty];
+            // 数组那一支不复刻：全库 11164 条顶点输入**实测全是 vec4**（float 10294 / uint 870），没有一条数组
+            // （矩阵）属性 —— 真出现了再写，不先写一堆用不上的代码。
+            // The array arm is not reproduced: all 11164 vertex inputs in the library are **measured to be vec4**
+            // (float 10294 / uint 870) with not a single array (matrix) attribute -- write it when one shows up rather
+            // than writing code nobody uses.
             if (ty < MAX_IDS && t.vec_len[ty]) { comps = t.vec_len[ty]; ct = t.vec_comp[ty]; }
+            // 分量类型：只有**确实**是整型才改判（改前这一句恒等于 F32，见上面的编号注释）。它有两个用处——
+            // 建图形管线时与 NVN 属性格式的分量类别对照（vk_pipe.c），以及格式认不出来时的回退格式。
+            // The component class: it is re-judged only when the scalar really is an integer (before the numbering fix
+            // this line was constantly F32 -- see the note above). It serves two purposes: cross-checking the NVN
+            // attribute format's class when the graphics pipeline is built (vk_pipe.c), and the fallback format used
+            // when the format is unrecognised.
             int ctype = VK_SPV_F32;
             if (ct < MAX_IDS) {
                 if (t.scalar_op[ct] == OP_TYPE_INT) ctype = t.int_signed[ct] ? VK_SPV_I32 : VK_SPV_U32;

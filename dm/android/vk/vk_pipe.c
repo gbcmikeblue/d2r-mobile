@@ -39,6 +39,16 @@ typedef vk_pipe_bind bind_t;   // 与对外的那张表同一个结构（描述�
 
 static uint64_t g_n_dsl, g_n_lay, g_n_cpso, g_n_gpso, g_n_fail;
 
+// "顶点属性的分量类别与着色器声明不符"的累计次数（见下面建管线处那段核对）。**这个计数器是必须的**：
+// 那条判据本身曾经因为两个 opcode 写反而恒等于 float（见 vk_spv.c 的编号注释），于是它报了一次假告警；
+// 修好之后这条要么是 0、要么得给出**总数**才够用，所以按绘制那句日志的同一套写法（前 8 例 + 每满 1024 例）打。
+// Running count of "a vertex attribute's component class disagrees with the shader's declaration" (see the
+// cross-check where the pipeline is built). **The counter is necessary**: the test itself was constantly float for a
+// while because two opcodes were swapped (see the numbering note in vk_spv.c), so it once raised a false warning; after
+// the fix this line has to be either zero or carry a **total**, hence the same idiom as the draw log line (the first
+// eight plus one per 1024).
+static _Atomic uint64_t g_attr_class_bad;
+
 static VkShaderStageFlags stage_flag(int st) {
     switch (st) {
         case VK_STAGE_VS: return VK_SHADER_STAGE_VERTEX_BIT;
@@ -519,11 +529,20 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         // picture later.
         if (mapped) {
             int want = vs->in[i].ctype == VK_SPV_I32 ? 2 : vs->in[i].ctype == VK_SPV_U32 ? 1 : 0;
-            if (attr_fmt_class(st->attr[loc].nvn_fmt) != want) {
-                static int saidc;
-                if (!saidc++) LOG("【黄】顶点属性 %u（%s 位置 %u）的分量类型与着色器声明不符：格式 %#x vs 着色器 %s（若这条假设错了，顶点数据接的槽就不对）",
-                                  loc, vs->key, loc, st->attr[loc].nvn_fmt,
-                                  vs->in[i].ctype == VK_SPV_I32 ? "sint" : vs->in[i].ctype == VK_SPV_U32 ? "uint" : "float");
+            int got = attr_fmt_class(st->attr[loc].nvn_fmt);
+            if (got != want) {
+                // 改前这里只打第一次（`static int saidc`），而**判据本身写反过一次**，所以"只打一条"正好把
+                // 假告警的样子留了下来、把真告警的数量藏了起来。现在两边都把类别写出来，并给累计数。
+                // It used to print only the first occurrence (`static int saidc`), and since **the test itself was once
+                // inverted**, printing one line preserved the look of a false warning while hiding how many real ones
+                // there are. Both classes are named now, and the running count comes with it.
+                uint64_t n = atomic_fetch_add(&g_attr_class_bad, 1) + 1;
+                if (n <= 8 || (n & 1023) == 0)
+                    LOG("【黄】顶点属性 %u（%s 位置 %u）的分量类型与着色器声明不符：格式 %#x 属%s类 vs 着色器声明 %s（第 %llu 例；若这条判据错了，顶点数据接的槽就不对）",
+                        loc, vs->key, loc, st->attr[loc].nvn_fmt,
+                        got == 2 ? " sint" : got == 1 ? " uint" : " float",
+                        vs->in[i].ctype == VK_SPV_I32 ? "sint" : vs->in[i].ctype == VK_SPV_U32 ? "uint" : "float",
+                        (unsigned long long)n);
             }
         }
         // NVN 的"常量流"（步长 0）：有 divisor 可为 0 的扩展就用它表达（每个实例一个元素、不随顶点推进），
