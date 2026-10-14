@@ -578,6 +578,10 @@ uint64_t mtl_sub_commit(void) {
             (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank),
             (unsigned long long)atomic_load(&g_desc_tex_emptysamp), (unsigned long long)atomic_load(&g_desc_tex_nosamp),
             pok, pbad);
+        uint64_t vb = 0, vh = 0, vm = 0;
+        vk_tex_view_stats(&vb, &vh, &vm);
+        LOG("[vk] 视图：底视图 %llu 次、命中子视图 %llu 次、新建子视图 %llu 张",
+            (unsigned long long)vb, (unsigned long long)vh, (unsigned long long)vm);
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;
@@ -996,7 +1000,12 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 if (h) {
                     const treg_e *e = treg_of((uint32_t)h);
                     if (e) {
-                        texv = vk_tex_view(&e->t);
+                        // 注册时存下的 view 在这里**第一次被用上**（以前存了却从没读过）：它可能限定 mip/层范围、
+                        // 重解释格式或目标类型——也就是"按游戏的意思采样"这一步。
+                        // The view stored at registration time is **used here for the first time** (it used to be stored
+                        // and never read): it may limit the mip/layer range or reinterpret the format or target, which is
+                        // what "sampling the way the game means it" takes.
+                        texv = vk_tex_view(&e->t, e->has_v ? &e->v : NULL);
                         // 采样器按**采样器槽**取（不是贴图槽！两套编号：分离贴图在 c2[0x168+8r]、分离采样器在
                         // c2[0x568+8r]，`nvn_sslot` 是从同一个 handle 的第二个字解出来的）。句柄高 20 位是采样器
                         // 池号，但 0xFFF 是"填空槽"的哨兵——那种槽上的绑定本来不会被采样，用默认采样器是对的。
@@ -1073,7 +1082,13 @@ static void pass_begin(void) {
     for (int i = 0; i < g_rs.ncolor && i < 8; i++) {
         const tex_t *t = g_rs.color[i];
         if (!t) continue;
-        VkImageView iv = vk_tex_view(t);
+        // 渲染目标这一路暂时用底视图：SET_RT 的 view 目前没存进影子状态（p_set_rt 里有 cview/has_cview，
+        // 回放层还没接），接上之后这里要把它们传下去——限了 mip 的 view 当附件时尺寸也不同，要一并处理。
+        // The render-target path uses the base view for now: SET_RT's views are not stored in the shadow state yet
+        // (p_set_rt carries cview/has_cview and the replay layer does not wire it up), and once they are, this must
+        // pass them down -- an attachment whose view limits the mip range also has a different size, which has to be
+        // handled along with it.
+        VkImageView iv = vk_tex_view(t, NULL);
         if (!iv) continue;
         vk_tex_transition(t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, cb);
         vk_tex_gpu_written(t);
@@ -1090,7 +1105,7 @@ static void pass_begin(void) {
     VkRenderingAttachmentInfo datt = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     int has_d = 0;
     if (g_rs.depth) {
-        VkImageView dv = vk_tex_view(g_rs.depth);
+        VkImageView dv = vk_tex_view(g_rs.depth, NULL);   // 同上：深度附件的 view 还没接 | likewise: the depth attachment's view is not wired up yet
         if (dv) {
             vk_tex_transition(g_rs.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, cb);
             vk_tex_gpu_written(g_rs.depth);

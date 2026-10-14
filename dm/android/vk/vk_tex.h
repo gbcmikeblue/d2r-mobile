@@ -31,9 +31,18 @@
 int vk_fmt_to_vk(int nvn_fmt, VkFormat *out);
 
 // 取（必要时建 + 上传）这张贴图的 VkImage / 视图；失败返回 VK_NULL_HANDLE。
+// **视图要带 view**：NVN 的 texture view（`view_t`）能限定 mip 范围（base_level/nlevels）、限定层范围
+// （min_layer/nlayers）、**重解释格式**（set_format）、**重解释目标类型**（set_target，例如 3D 当 2D 数组看）。
+// 传 NULL = 底视图。同一张贴图可以注册成多个 view（游戏就这么用，例如每级 mip 各占一个 id 当渲染目标），
+// 所以这一层按 (序号, view 内容) 缓存多张 VkImageView。
 // Get (creating and uploading if needed) this texture's VkImage / view; VK_NULL_HANDLE on failure.
+// **Views matter**: an NVN texture view (`view_t`) can limit the mip range (base_level/nlevels), limit the layer range
+// (min_layer/nlayers), **reinterpret the format** (set_format) and **reinterpret the target** (set_target, e.g. a 3D
+// texture viewed as a 2D array). NULL means the base view. One texture may be registered as several views (the game
+// does exactly that, e.g. one id per mip level as a render target), so this layer caches several VkImageViews per
+// (serial, view content).
 VkImage vk_tex_image(const tex_t *t);
-VkImageView vk_tex_view(const tex_t *t);
+VkImageView vk_tex_view(const tex_t *t, const view_t *v);
 
 // 取（必要时建）这个采样器的 VkSampler；失败返回 VK_NULL_HANDLE。按参数内容缓存——游戏会按值拷贝
 // NVNsampler 对象，同一个参数组合可能有多个对象，所以键是参数而不是对象。
@@ -77,3 +86,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 // 诊断读数：建了多少张、上传多少张/多少字节、CPU 直读多少次、没有对应格式的次数
 // Diagnostic counters: images created, uploads and bytes, direct CPU reads, and format misses
 void vk_tex_stats(uint64_t *created, uint64_t *uploads, uint64_t *bytes, uint64_t *reads, uint64_t *fmt_miss);
+
+// view 的计数：用底视图 / 命中已建子视图 / 新建子视图（三者的存在共同证明 view 这条路在跑）
+// View counters: base view / sub-view cache hit / sub-view created (all three together show the view path runs)
+void vk_tex_view_stats(uint64_t *base, uint64_t *hit, uint64_t *made);

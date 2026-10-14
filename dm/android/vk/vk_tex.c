@@ -272,6 +272,11 @@ VkSampler vk_samp_of(const samp_t *s) {
 
 // ---------- serial → 贴图表（开放寻址，键是序号不是指针）----------
 // ---------- serial -> texture table (open addressing; the key is the serial, not a pointer) ----------
+#define ENT_VIEWS 4   // 每张贴图最多缓存几张子视图（按 view 内容区分）| at most this many sub-views cached per texture
+// view 生效的证据：分别数"用底视图"、"命中已建子视图"、"新建子视图"——三者一起看才知道 view 这条路真的在跑。
+// Evidence that views are in effect: count "base view", "sub-view cache hit" and "sub-view created" separately; only
+// together do they show the view path is really running.
+static _Atomic uint64_t g_vw_base, g_vw_hit, g_vw_made;
 typedef struct {
     uint64_t serial;
     VkImage img; VkImageView view; VkDeviceMemory mem;
@@ -280,6 +285,12 @@ typedef struct {
     int dirty;                // 池被 CPU 改过，下次取用前重传 | pool changed on the CPU; re-upload before the next use
     int gpu_written;          // GPU 写过：池不再是真值，CPU 读回要走 VkImage | the GPU has written it: the pool is no longer the truth and a CPU readback must go through the VkImage
     VkImageLayout lay;        // 当前布局（转换只在这一层发生）| current layout (transitions happen only here)
+    // 按 view 缓存的多张视图（见 vk_tex.h 的说明）：`view` 是底视图，这里是它的"子视图"。
+    // 一个贴图被注册成多少个 view 由游戏决定，实测很少（多数 0~2 个），所以用定长小数组，不做哈希表。
+    // Several views cached per view (see the note in vk_tex.h): `view` is the base view and these are its sub-views.
+    // How many views one texture is registered with is up to the game and measured to be few (0-2 usually), so a
+    // small fixed array beats a hash table here.
+    struct { uint8_t used; view_t v; VkImageView iv; } vw[ENT_VIEWS];
 } ent_t;
 
 static ent_t *g_tab; static int g_cap, g_n;
@@ -365,6 +376,14 @@ static int ent_build(const tex_t *t, ent_t *e) {
     VkImageUsageFlags use = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!e->depth_like) use |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (e->depth_like) use |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // MUTABLE_FORMAT 是 view 重解释格式的前提（view_for 会按 set_format 建子视图）；3D 贴图还要
+    // 2D_ARRAY_COMPATIBLE，否则"3D 当 2D 数组看"这种 view 建不出来。这两个位必须在建图时就给，因为
+    // view 是后来才注册的。
+    // MUTABLE_FORMAT is the precondition for a view reinterpreting the format (view_for builds sub-views from
+    // set_format); a 3D texture also needs 2D_ARRAY_COMPATIBLE, without which a "3D seen as a 2D array" view cannot
+    // be created. Both bits must be given at image creation because views are registered later.
+    if (type == VK_IMAGE_TYPE_3D) iflags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    iflags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     VkImageCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = iflags, .imageType = type,
         .format = e->fmt, .extent = { e->w, e->h, e->d }, .mipLevels = e->levels, .arrayLayers = e->layers,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = use,
@@ -499,7 +518,73 @@ int vk_tex_is_gpu_written(const tex_t *t) {
     return v;
 }
 
-static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *aspect) {
+// 按 view 取（必要时建）视图。view 为空、或它一个"限定/重解释"位都没设，就是底视图。
+// target 的取值与 ent_build 的 switch 同一套（0=1D、1=2D、2=3D、3=1D 数组、4=2D 数组、8=Cube、9=Cube 数组）。
+// Get (creating if needed) a view. An empty view, or one that sets none of the "limit/reinterpret" bits, is the base
+// view. `target` uses the same values as ent_build's switch (0 = 1D, 1 = 2D, 2 = 3D, 3 = 1D array, 4 = 2D array,
+// 8 = cube, 9 = cube array).
+static VkImageView view_for(ent_t *e, const view_t *v) {
+    if (!v || !(v->set_levels || v->set_layers || v->set_format || v->set_target)) { atomic_fetch_add(&g_vw_base, 1); return e->view; }
+    for (int i = 0; i < ENT_VIEWS; i++)
+        if (e->vw[i].used && !memcmp(&e->vw[i].v, v, sizeof *v)) { atomic_fetch_add(&g_vw_hit, 1); return e->vw[i].iv; }
+    int slot = -1;
+    for (int i = 0; i < ENT_VIEWS && slot < 0; i++) if (!e->vw[i].used) slot = i;
+    if (slot < 0) {
+        static int said;
+        if (!said++) LOG("【黄】贴图 serial=%llu 的子视图超过 %d 个：多出来的按底视图用", (unsigned long long)e->serial, ENT_VIEWS);
+        return e->view;
+    }
+    VkFormat fmt = e->fmt;
+    if (v->set_format) {
+        VkFormat f2 = VK_FORMAT_UNDEFINED;
+        if (vk_fmt_to_vk(v->format, &f2) && f2 != VK_FORMAT_UNDEFINED) fmt = f2;
+        else {
+            static int said;
+            if (!said++) LOG("【黄】view 的格式 %d 在 Vulkan 这边没有对应：这张子视图按底图格式建", v->format);
+        }
+    }
+    VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D;
+    switch (v->set_target ? v->target : -1) {
+        case 0: vt = VK_IMAGE_VIEW_TYPE_1D; break;
+        case 1: vt = VK_IMAGE_VIEW_TYPE_2D; break;
+        case 2: vt = VK_IMAGE_VIEW_TYPE_3D; break;
+        case 3: vt = VK_IMAGE_VIEW_TYPE_1D_ARRAY; break;
+        case 4: vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+        case 8: vt = VK_IMAGE_VIEW_TYPE_CUBE; break;
+        case 9: vt = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; break;
+        default: break;   // 没设 target 就用 2D（下面按底图类型兜底）| no target means 2D (the base type backs it up below)
+    }
+    if (!v->set_target) vt = VK_IMAGE_VIEW_TYPE_2D;
+    uint32_t base = (v->set_levels && v->base_level > 0) ? (uint32_t)v->base_level : 0;
+    if (base >= e->levels) base = 0;
+    uint32_t nl = (v->set_levels && v->nlevels > 0) ? (uint32_t)v->nlevels : e->levels - base;
+    if (base + nl > e->levels) nl = e->levels - base;
+    uint32_t lb = (v->set_layers && v->min_layer > 0) ? (uint32_t)v->min_layer : 0;
+    if (lb >= e->layers) lb = 0;
+    uint32_t ln = (v->set_layers && v->nlayers > 0) ? (uint32_t)v->nlayers : e->layers - lb;
+    if (lb + ln > e->layers) ln = e->layers - lb;
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = e->img,
+        .viewType = vt, .format = fmt,
+        .subresourceRange = { e->depth_like ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, base, nl, lb, ln } };
+    if (e->depth_like) {
+        if (e->dsa) vi.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        else vi.subresourceRange.aspectMask &= ~(VkImageAspectFlags)VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+    VkImageView iv = VK_NULL_HANDLE;
+    if (vkCreateImageView(vk_dev(), &vi, NULL, &iv) != VK_SUCCESS) {
+        static int said;
+        if (!said++) LOG("【红】建子视图失败（serial=%llu、格式 %d、viewType %d、级别 %u+%u、层 %u+%u）",
+                         (unsigned long long)e->serial, (int)fmt, (int)vt, base, nl, lb, ln);
+        return e->view;
+    }
+    e->vw[slot].used = 1;
+    e->vw[slot].v = *v;
+    e->vw[slot].iv = iv;
+    atomic_fetch_add(&g_vw_made, 1);
+    return iv;
+}
+
+static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *aspect, const view_t *vw) {
     if (!t || !t->serial || !t->mem) return VK_NULL_HANDLE;
     if (view) *view = VK_NULL_HANDLE;
     pthread_mutex_lock(&g_mu);
@@ -512,14 +597,14 @@ static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *asp
         e->dirty = 0;
     }
     if (aspect) *aspect = e->depth_like ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (e->dsa ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
-    if (view) *view = e->view;
+    if (view) *view = view_for(e, vw);
     VkImage img = e->img;
     pthread_mutex_unlock(&g_mu);
     return img;
 }
 
-VkImage vk_tex_image(const tex_t *t) { return tex_of(t, NULL, NULL); }
-VkImageView vk_tex_view(const tex_t *t) { VkImageView v; return tex_of(t, &v, NULL) ? v : VK_NULL_HANDLE; }
+VkImage vk_tex_image(const tex_t *t) { return tex_of(t, NULL, NULL, NULL); }
+VkImageView vk_tex_view(const tex_t *t, const view_t *v) { VkImageView view; return tex_of(t, &view, NULL, v) ? view : VK_NULL_HANDLE; }
 
 void vk_tex_invalidate(uint64_t serial) {
     pthread_mutex_lock(&g_mu);
@@ -532,6 +617,8 @@ void vk_tex_drop(uint64_t serial) {
     pthread_mutex_lock(&g_mu);
     ent_t *e = find_slot(serial, 0);
     if (e) {
+        for (int i = 0; i < ENT_VIEWS; i++)
+            if (e->vw[i].used && e->vw[i].iv) { vkDestroyImageView(vk_dev(), e->vw[i].iv, NULL); e->vw[i].used = 0; e->vw[i].iv = VK_NULL_HANDLE; }
         if (e->view) vkDestroyImageView(vk_dev(), e->view, NULL);
         if (e->img) vkDestroyImage(vk_dev(), e->img, NULL);
         if (e->mem) vkFreeMemory(vk_dev(), e->mem, NULL);
@@ -567,6 +654,12 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     }
     free(lin);
     atomic_fetch_add(&g_reads, 1);
+}
+
+void vk_tex_view_stats(uint64_t *base, uint64_t *hit, uint64_t *made) {
+    if (base) *base = atomic_load(&g_vw_base);
+    if (hit) *hit = atomic_load(&g_vw_hit);
+    if (made) *made = atomic_load(&g_vw_made);
 }
 
 void vk_tex_stats(uint64_t *created, uint64_t *uploads, uint64_t *bytes, uint64_t *reads, uint64_t *fmt_miss) {
