@@ -272,6 +272,22 @@ typedef struct {
 // Stencil mask defaults: NVN / GL default to all-ones, and the Apple side starts at 0xff too (its state reset)
 static rstate_t g_rs = { .st_vmask = { 0xff, 0xff }, .st_wmask = { 0xff, 0xff } };
 static _Atomic uint64_t g_pass_n, g_clear_n, g_draw_skip, g_shadow_n;
+
+// 渲染目标使用计数：哪张纹理被当渲染目标用过、用了多少次。回答的是"游戏到底往哪张纹理画"——而这件事只能靠数
+// （真机上出图纹理全白、游戏自己的目标全零，光看名字猜不出来）。表很小：超过就并到"其他"。
+// Render-target usage counts: which textures serve as render targets, and how often. It answers "which texture does the
+// game draw into", which only counting can settle (on the device the present texture is all white while the game's own
+// targets are all zero, and the names alone will not tell you). The table is small: anything past it goes to "other".
+static struct { uint64_t ser, n; } g_rt_use[48];
+static int g_rt_n;
+static _Atomic uint64_t g_rt_other;
+
+static void rt_use_bump(uint64_t ser) {
+    if (!ser) return;
+    for (int i = 0; i < g_rt_n; i++) if (g_rt_use[i].ser == ser) { g_rt_use[i].n++; return; }
+    if (g_rt_n < 48) { g_rt_use[g_rt_n].ser = ser; g_rt_use[g_rt_n].n = 1; g_rt_n++; }
+    else atomic_fetch_add(&g_rt_other, 1);
+}
 static void pass_begin(void);
 static void pass_end(void);
 static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途槽回收时重置它的池）| defined in the descriptor section (resets a slot's pool when it is reaped)
@@ -798,6 +814,30 @@ uint64_t mtl_sub_commit(void) {
             (unsigned long long)atomic_load(&g_shadow_n), (unsigned long long)atomic_load(&g_draw_skip),
             (unsigned long long)atomic_load(&g_op_unhandled), vk_shader_set_moved(),
             (unsigned long long)atomic_load(&g_desc_draws), (unsigned long long)atomic_load(&g_desc_tex_ok));
+        // 渲染目标使用前 5 与 T2T 总数：单独一行（上面的行已接近长度上限，见下一段的说明）
+        // The top five render targets and the T2T total on their own line (the line above is already near the length
+        // limit, see the note below)
+        {
+            char rl[320]; int o2 = 0;
+            uint64_t tops[5] = { 0, 0, 0, 0, 0 };
+            uint64_t tot = 0;
+            for (int t = 0; t < g_rt_n; t++) tot += g_rt_use[t].n;
+            for (int k = 0; k < 5; k++) {
+                int best = -1;
+                for (int t = 0; t < g_rt_n; t++) if (g_rt_use[t].n && (best < 0 || g_rt_use[t].n > g_rt_use[best].n)) best = t;
+                if (best < 0 || !g_rt_use[best].n) break;
+                o2 += snprintf(rl + o2, sizeof rl - o2, " 序号 %llu=%llu", (unsigned long long)g_rt_use[best].ser, (unsigned long long)g_rt_use[best].n);
+                tops[k] = g_rt_use[best].ser;
+                g_rt_use[best].n = 0;          // 取走后清零，下一次窗口重新数 | cleared after taking it, so the next window counts afresh
+            }
+            LOG("[vk] 渲染目标前 5（共 %d 张、%llu 次，另 %llu 次超表）：%s", g_rt_n, (unsigned long long)tot,
+                (unsigned long long)atomic_load(&g_rt_other), o2 ? rl : "（无）");
+            LOG("[vk] T2T 累计 %llu 次", (unsigned long long)vk_tex_t2t_count());
+            // 前 5 名的身份逐条问出来：序号、尺寸、格式、是不是窗口贴图 —— "这个序号到底是什么"不看名字猜不出来
+            // Ask each of the top five for its identity: serial, size, format, whether it is a window texture --
+            // "what is this serial" cannot be guessed from the name
+            for (int k = 0; k < 5; k++) if (tops[k]) vk_tex_dump_ser(tops[k]);
+        }
         // 贴图单独一行：上面的行已经接近宿主的长度上限，再挂两项就会被截断（实测过）
         // Textures get their own line: the line above is already close to the host's length limit and two more
         // fields would be cut off (measured)
@@ -1590,6 +1630,7 @@ void mtl_exec(const uint8_t *p) {
             g_rs.ncolor = r->n < 0 ? 0 : (r->n > 8 ? 8 : r->n);
             for (int i = 0; i < 8; i++) {
                 g_rs.color[i] = i < g_rs.ncolor ? r->color[i] : NULL;
+                if (g_rs.color[i]) rt_use_bump(g_rs.color[i]->serial);   // 谁被当渲染目标用过（见 rt_use_bump）| which textures serve as render targets (see rt_use_bump)
                 // 视图一并存下来（见 rstate_t 里那段说明）：渲染目标那一层常常是"底图的某个 mip"
                 g_rs.cview[i] = r->cview[i];
                 g_rs.has_cview[i] = r->has_cview[i];

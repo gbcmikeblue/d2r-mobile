@@ -104,6 +104,13 @@ int vk_tex_same_size_serials(uint32_t w, uint32_t h, uint64_t *out, int cap);
 // scan: see everything at once without filtering by size.
 int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
 
+// 报一张贴图的身份：序号、尺寸、格式、是否窗口贴图、是否 GPU 写过。用来回答"这个序号到底是什么"——
+// 真机上渲染目标前 5 里混着 143/67/68 这种每窗口上千次的序号，它们很像三张轮转的交换链纹理，而那件事必须问清。
+// Report one texture's identity: serial, size, format, whether it is a window texture, whether the GPU has written it.
+// It answers "what is this serial" -- on the device the top render targets are mixed with serials like 143/67/68 used
+// thousands of times per window, which look like three rotating swapchain textures, and that has to be settled.
+void vk_tex_dump_ser(uint64_t serial);
+
 // 贴图 → 贴图拷贝（NVN 的 nvnCommandBufferCopyTextureToTexture）。记进**回放层的命令缓冲**，不另开一次提交
 // ——顺序就是语义：拷贝必须排在产生源内容的那些绘制之后。区域里宽/高/深 <= 0 表示"从偏移到边界"（NVN 的约定）。
 // 放在纹理层是因为只有这里同时知道两边的布局与"池是真值还是 GPU 写过"。

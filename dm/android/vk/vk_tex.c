@@ -636,7 +636,17 @@ int vk_tex_copy_t2t(const tex_t *src, const view_t *sv, const NVNcopyRegion *sr,
     // through the driver side
     vk_tex_gpu_written(dst);
     uint64_t n = atomic_fetch_add(&g_t2t_n, 1) + 1;
-    if (n <= 3) LOG("[vk] T2T 拷贝第 %llu 次：%ux%u（源级 %u、目标级 %u）", (unsigned long long)n, (unsigned)w, (unsigned)h, slv, dlv);
+    // 序号一起报：**"这次拷贝是不是把画面搬进了出图纹理"**只能靠序号回答（真机上出图纹理是窗口贴图 5/6/7，
+    // 而它全白、游戏自己的渲染目标全零——到底谁往谁里搬，看这一行）。每 300 次也报一次，用来判断它是每帧都拷
+    // 还是一次性行为——只报前几次会把这两件事混起来。
+    // The serials are reported too: **"did this copy move the picture into the present texture"** can only be answered by
+    // serial (on the device the present texture is window texture 5/6/7, and it is all white while the game's own render
+    // targets are all zero -- which one moves into which is what this line says). It is also reported every 300th time,
+    // to tell "copies every frame" from "a one-off" -- reporting only the first few would conflate the two.
+    if (n <= 5 || n % 300 == 0)
+        LOG("[vk] T2T 拷贝第 %llu 次：序号 %llu → %llu，%ux%u（源级 %u、目标级 %u；目标%s窗口贴图）", (unsigned long long)n,
+            (unsigned long long)src->serial, (unsigned long long)dst->serial, (unsigned)w, (unsigned)h, slv, dlv,
+            vk_tex_is_window_ser(dst->serial) ? "是" : "不是");
     return 1;
 }
 
@@ -895,6 +905,18 @@ int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap) {
     }
     pthread_mutex_unlock(&g_mu);
     return n;
+}
+
+void vk_tex_dump_ser(uint64_t serial) {
+    pthread_mutex_lock(&g_mu);
+    ent_t *e = find_slot(serial, 0);
+    if (!e || !e->img) {
+        LOG("[vk] 序号 %llu：没有图像（没建过或已回收）", (unsigned long long)serial);
+    } else {
+        LOG("[vk] 序号 %llu：%ux%u 格式 %d、%u 级、%s、%s", (unsigned long long)serial, e->w, e->h, (int)e->fmt, e->levels,
+            win_ser_locked(serial) ? "窗口贴图" : "普通贴图", e->gpu_written ? "GPU 写过" : "没被 GPU 写过");
+    }
+    pthread_mutex_unlock(&g_mu);
 }
 
 int vk_tex_same_size_serials(uint32_t w, uint32_t h, uint64_t *out, int cap) {
