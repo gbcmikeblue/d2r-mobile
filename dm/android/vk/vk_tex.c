@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static _Atomic uint64_t g_created, g_uploads, g_upload_bytes, g_reads, g_fmt_miss;
+static _Atomic uint64_t g_created, g_uploads, g_upload_bytes, g_reads, g_fmt_miss, g_reads_gw;
 
 // ---------- NVN 格式 → VkFormat ----------
 // 数值取自 nvn.h 的 NVN_FORMAT_*（权威来源，别猜）。没列出的按"没有对应"处理并报红一次，
@@ -634,6 +634,16 @@ void vk_tex_drop(uint64_t serial) {
 // The region r gives the origin and extent (0 = the whole level).
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     if (!t || !t->mem || !dst) return;
+    // 量一个判据：游戏到底会不会读回**被 GPU 写过**的贴图？这一层现在对这类贴图仍走"池内存是真值"的直读路径，
+    // 而 GPU 写过的贴图真值在 VkImage 里——那是"从 VkImage 读回"这套机制什么时候**必须**实现的开关（现在它只是
+    // 调试工具）。苹果侧靠"是否预排布"隐式区分，安卓侧已有显式的 gpu_written 位（`vk_tex_gpu_written`，渲染目标
+    // 处会置位），只是从没人查过；这里查一下并计数。
+    // Measuring a judgment: does the game ever read back a **GPU-written** texture? This layer still takes the "pool
+    // memory is the truth" direct path for those, while a GPU-written texture's truth lives in the VkImage -- that is
+    // the switch for when "read back through the VkImage" **must** be implemented (right now it is only a debugging
+    // tool). Apple distinguishes implicitly via "is it pre-laid-out"; Android already has an explicit gpu_written bit
+    // (`vk_tex_gpu_written`, set on render targets) that simply nobody ever queried -- so query it and count.
+    if (vk_tex_is_gpu_written(t)) atomic_fetch_add(&g_reads_gw, 1);
     uint32_t row_bytes = 0, rows = 0, slices = 0; uint64_t base = 0; unsigned th = 0, td = 0, bpb = 0;
     if (nvn_deswizzle_geom(&t->d, level, layer0, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) {
         static int said; if (!said++) LOG("【红】ReadTexels：解排布几何不支持 格式 %#x 目标 %d 级 %u", t->d.format, t->d.target, level);
@@ -655,6 +665,8 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     free(lin);
     atomic_fetch_add(&g_reads, 1);
 }
+
+uint64_t vk_tex_reads_gpu_written(void) { return atomic_load(&g_reads_gw); }
 
 void vk_tex_view_stats(uint64_t *base, uint64_t *hit, uint64_t *made) {
     if (base) *base = atomic_load(&g_vw_base);

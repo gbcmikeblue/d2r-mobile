@@ -582,6 +582,10 @@ uint64_t mtl_sub_commit(void) {
         vk_tex_view_stats(&vb, &vh, &vm);
         LOG("[vk] 视图：底视图 %llu 次、命中子视图 %llu 次、新建子视图 %llu 张",
             (unsigned long long)vb, (unsigned long long)vh, (unsigned long long)vm);
+        // 判据单独一行：宿主的日志有长度上限，挂在别的行上会被截断（这一条踩过）| the judgment gets its own line:
+        // the host's log has a length limit and appending to another line truncates it (learned the hard way)
+        LOG("[vk] ReadTexels 读到 GPU 写过的贴图 %llu 次（0 = 从 VkImage 读回那套暂时还只是工具）",
+            (unsigned long long)vk_tex_reads_gpu_written());
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;

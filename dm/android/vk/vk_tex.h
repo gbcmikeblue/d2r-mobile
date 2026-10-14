@@ -90,3 +90,8 @@ void vk_tex_stats(uint64_t *created, uint64_t *uploads, uint64_t *bytes, uint64_
 // view 的计数：用底视图 / 命中已建子视图 / 新建子视图（三者的存在共同证明 view 这条路在跑）
 // View counters: base view / sub-view cache hit / sub-view created (all three together show the view path runs)
 void vk_tex_view_stats(uint64_t *base, uint64_t *hit, uint64_t *made);
+
+// ReadTexels 里读到"被 GPU 写过"的贴图次数（0 = 那套从 VkImage 读回的机制暂时还只是工具，不是功能缺口）
+// How many ReadTexels calls read a **GPU-written** texture (0 means readback through the VkImage is still only a
+// debugging tool rather than a functional gap)
+uint64_t vk_tex_reads_gpu_written(void);
