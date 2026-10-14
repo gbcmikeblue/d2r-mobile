@@ -7,9 +7,11 @@
 #pragma once
 #include "dm.h"
 typedef struct { const char *name; void *fn; } hle_ent;
+// 登记段的段名、保活与读法见 dm.h（DM_SEC_HLE / DM_SEC_FORCE / DM_SEC_KEEP / DM_SEC_BOUNDS）。
+// The section names, retain marker and accessor live in dm.h (DM_SEC_HLE / DM_SEC_FORCE / DM_SEC_KEEP / DM_SEC_BOUNDS).
 #define HLE(mangled, ret, cname, ...)                                                             \
     static ret cname(__VA_ARGS__);                                                                \
-    __attribute__((used, section("__DATA,swhle"))) static const hle_ent hle_ent_##cname = {mangled, (void *)cname}; \
+    __attribute__((used, DM_SEC_KEEP, section(DM_SEC_HLE))) static const hle_ent hle_ent_##cname = {mangled, (void *)cname}; \
     static ret cname(__VA_ARGS__)
 
 typedef uint32_t Result;   // nn::Result：w0，0 = 成功 | nn::Result: w0, 0 = success
@@ -39,7 +41,7 @@ void guest_clock_freeze_for(int reason, int on);   // 按原因冻结（1 后台
 typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
 #define HLE_FORCE(mangled, why, ret, cname, ...)                                                   \
     static ret cname(__VA_ARGS__);                                                                \
-    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
+    __attribute__((used, DM_SEC_KEEP, section(DM_SEC_FORCE))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
     static ret cname(__VA_ARGS__)
 
 // 运行模式（0 掌机 / 1 主机）：hle_oe.c 持有，hid 的手柄样式跟它走；前端可在运行中切换

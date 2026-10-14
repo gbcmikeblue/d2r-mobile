@@ -209,7 +209,18 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
         module_t *mm = module_of((void *)regs[30]);
         static int nb;
-        LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr);
+        // 消息缓冲也打出来：SDK 的 Panic / Assertion 会把 Result、文件与行号、断言文本放在里面，
+        // 只看 reason 与 Result 判不出是哪儿出的事（安卓第一次跑到这里就是这么卡住的）
+        // Also print the message buffer: the SDK's Panic / Assertion puts the Result, file and line and the assertion text in it,
+        // and reason plus Result alone do not say where it came from (this is exactly where the first Android run stalled)
+        char txt[256]; int tn = 0; txt[0] = 0;
+        if (regs[1] && regs[2]) {
+            const uint8_t *p = (const uint8_t *)regs[1]; uint64_t n = regs[2] < 128 ? regs[2] : 128;
+            for (uint64_t i = 0; i < n && tn < (int)sizeof txt - 1; i++) { uint8_t c = p[i]; txt[tn++] = (c >= 32 && c < 127) ? (char)c : '.'; }
+            txt[tn] = 0;
+        }
+        LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx 缓冲 %#llx+%#llx \"%s\"", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr,
+            (unsigned long long)regs[1], (unsigned long long)regs[2], txt);
         dm_backtrace(regs[29]);
         if (regs[0] & 0x80000000ull) return 0;   // 仅通知，可继续 | notification only, can continue
         _exit(42);

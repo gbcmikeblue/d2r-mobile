@@ -57,7 +57,9 @@ add_library(dmhost_android STATIC
 
 target_include_directories(dmhost_android PRIVATE
   ${DM}/host
+  ${DM}/gfx/nvn
   ${DM}/gfx/nvn/include
+  ${DM}/gfx/tex
   ${COMPAT})
 
 # -include 只强加给 C（汇编文件不能吃 -include 头文件）
@@ -85,3 +87,12 @@ set_target_properties(dmhost_android_bin PROPERTIES OUTPUT_NAME dmhost)
 # Android 15 and later require 16 KiB page alignment; state it explicitly so the binary loads on
 # newer devices
 target_link_options(dmhost_android_bin PRIVATE -Wl,-z,max-page-size=16384)
+# 关掉 --gc-sections：宿主的两张登记表（HLE 直通 swhle、强制接管 swforce）只靠链接器生成的
+# __start_/__stop_ 被引用，GC 会把这两个段整个丢掉——段没了，表就是空的，服务层接管一条都不生效
+# （实测：开着它时段表里根本看不到这两个段）。宿主是可执行文件、不分发体积，关掉没有代价。
+# Turn off --gc-sections: the host's two registry sections (the HLE passthrough swhle and the forced
+# take-over swforce) are reached only through the linker-generated __start_/__stop_, and GC drops both
+# sections entirely -- no sections means empty tables and not a single service-layer take-over applies
+# (measured: with it on, neither section appears in the section table). The host is an executable whose
+# size is not distributed, so turning it off costs nothing.
+target_link_options(dmhost_android_bin PRIVATE -Wl,--no-gc-sections)

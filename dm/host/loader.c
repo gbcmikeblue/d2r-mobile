@@ -189,8 +189,8 @@ static uint64_t resolve_sym(module_t *m, const char *name) {
 // Forced take-over table (hle.h HLE_FORCE, the __DATA,swforce section): a hit overrides the definition inside the module
 static const hle_force_ent *g_force; static unsigned g_nforce; static unsigned *g_force_hits;
 static void force_init(void) {
-    unsigned long sz; g_force = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &sz);
-    g_nforce = g_force ? (unsigned)(sz / sizeof *g_force) : 0;
+    unsigned long sz; DM_SEC_BOUNDS(swforce, "__DATA", hle_force_ent, g_force, sz);
+    g_nforce = (unsigned)sz;
     g_force_hits = calloc(g_nforce + 1, sizeof *g_force_hits);
     for (unsigned i = 0; i < g_nforce; i++)
         for (unsigned j = i + 1; j < g_nforce; j++)

@@ -98,6 +98,43 @@ void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc));
 void dm_guest_write_prep_register(void (*fn)(void *addr, size_t len));
 void dm_res_report_register(void (*fn)(uint32_t tick, const char *why));   // 资源计数回调（图形层注册）：每 250 拍、读取画面已撤、记满退出时调 | Resource count callback (registered by the graphics layer): called every 250 ticks, when the loading screen has been dismissed, and on exit when the record is full
 void (*dm_res_report_cb(void))(uint32_t tick, const char *why);   // 取已注册的资源计数回调（未注册为空） | Get the registered resource count callback (null if not registered)
+// 宿主自己二进制里的登记段（HLE 直通表 swhle、强制接管表 swforce）：段名与读法两个平台都不同。
+// 段名：Mach-O 要「段,节」写法（__DATA,swhle），ELF 只要一个节名（swhle）。
+// 保活：这两个段只靠 __start_/__stop_ 被引用，链接器的 --gc-sections 会把它们整个丢掉
+//       （实测：NDK 默认开着它，段表里根本看不到这两个段、__start_/__stop_ 也不生成）。
+//       ELF 侧因此在链接时显式关掉 --gc-sections（见 dm/android/CMakeLists.txt）；这里不再加
+//       保活属性（clang 的 __attribute__((retain)) 在 NDK 这版里不认）。
+// 读法：Mach-O 用 getsectiondata 按「段,节」查、长度按字节给；ELF 用链接器生成的
+//       __start_<节名> / __stop_<节名> 一对符号（段为空时不定义 ⇒ 判 0）。
+// Registry sections inside the host binary itself (the HLE passthrough table swhle, the forced take-over
+// table swforce). Both the names and the reading side differ per platform.
+// Names: Mach-O wants "segment,section" ("__DATA,swhle"), ELF just a section name ("swhle").
+// Keeping them: these two sections are reached only through __start_/__stop_, so the linker's
+//       --gc-sections would drop them entirely (measured: the NDK enables it by default, and then
+//       neither section appears in the section table and __start_/__stop_ are not generated).
+//       On ELF we therefore pass --no-gc-sections explicitly at link time (see dm/android/CMakeLists.txt)
+//       instead of marking them here (clang's __attribute__((retain)) is not accepted by this NDK version).
+// Reading: Mach-O looks it up with getsectiondata by "segment,section" and gets a byte length; ELF uses
+//       the __start_<name> / __stop_<name> pair the linker generates (undefined when empty, hence the 0 check).
+#if defined(__APPLE__)
+#define DM_SEC_HLE   "__DATA,swhle"
+#define DM_SEC_FORCE "__DATA,swforce"
+#define DM_SEC_KEEP
+#define DM_SEC_BOUNDS(id, segname, type, out, cnt)                                                \
+    do { unsigned long _dm_sz = 0;                                                                \
+         (out) = (const type *)getsectiondata(&_mh_execute_header, segname, #id, &_dm_sz);        \
+         (cnt) = (out) ? (unsigned long)(_dm_sz / sizeof(type)) : 0ul; } while (0)
+#else
+#define DM_SEC_HLE   "swhle"
+#define DM_SEC_FORCE "swforce"
+#define DM_SEC_KEEP  // 保活靠链接选项 --no-gc-sections，见上面的说明 | kept alive via the link option --no-gc-sections, see above
+#define DM_SEC_BOUNDS(id, segname, type, out, cnt)                                                \
+    do { extern const type __start_##id[] __attribute__((weak));                                  \
+         extern const type __stop_##id[] __attribute__((weak));                                   \
+         (out) = __start_##id;                                                                    \
+         (cnt) = ((out) && __stop_##id) ? (unsigned long)(__stop_##id - (out)) : 0ul; } while (0)
+#endif
+
 void dm_guest_write_prepare(void *addr, size_t len);
 // 图形生命周期（hle_nvn.c）：on=1 挂起（之后提交 / 出图阻塞，返回前 GPU 在途工作清空），on=0 恢复；iOS 前端在进出后台时调用
 // Graphics lifecycle (hle_nvn.c): on=1 suspends (afterwards submit / present block, and in-flight GPU work is drained before returning), on=0 resumes; called by the iOS front end when entering and leaving the background
