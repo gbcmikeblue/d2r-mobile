@@ -8,20 +8,32 @@
 // 1) unimpl_entry: stub entry for unimplemented imports, x9 = stub number; save x0-x8+lr and call unimpl_c(idx, regs).
 // 2) dm_gate: the rewriter replaces svc / cntpct reads with "bl to this entry". On entry lr = the gate block return point (gate_dispatch uses it to look up which gate this is),
 //    save x0-x30 to a contiguous area on the stack, call gate_dispatch(ret, regs), write back x0 (gate return value), return.
+//
+// 本文件同时供 Mach-O（苹果）与 ELF（安卓）汇编器使用：两边差别只在 C 符号的前导下划线
+// （Mach-O 有、ELF 没有），收进下面这个宏即可（与 nvn_thunks.S / nvn_entry.S 同一套做法）。
+// This file feeds both the Mach-O (Apple) and ELF (Android) assemblers: the only difference is the
+// leading underscore on C symbols (present in Mach-O, absent in ELF), hidden by the macro below (the
+// same scheme as nvn_thunks.S / nvn_entry.S).
+#if defined(__APPLE__)
+#define DM_SYM(n) _##n
+#else
+#define DM_SYM(n) n
+#endif
+
     .text
-    .globl _unimpl_stubs
+    .globl DM_SYM(unimpl_stubs)
     .p2align 3
-_unimpl_stubs:
+DM_SYM(unimpl_stubs):
     .set k, 0
     .rept 4096                // = hle.c MAX_STUB
     movz x9, #k
-    b _unimpl_entry
+    b DM_SYM(unimpl_entry)
     .set k, k + 1
     .endr
 
-    .globl _unimpl_entry
+    .globl DM_SYM(unimpl_entry)
     .p2align 2
-_unimpl_entry:
+DM_SYM(unimpl_entry):
     stp x29, x30, [sp, #-96]!
     mov x29, sp
     stp x0, x1, [sp, #16]
@@ -31,13 +43,13 @@ _unimpl_entry:
     str x8, [sp, #80]
     mov x0, x9
     add x1, sp, #16
-    bl _unimpl_c
+    bl DM_SYM(unimpl_c)
     ldp x29, x30, [sp], #96
     ret
 
-    .globl _dm_gate
+    .globl DM_SYM(dm_gate)
     .p2align 2
-_dm_gate:
+DM_SYM(dm_gate):
     // 开 256 字节帧，保存 x0..x30（x0..x29 成对，x30 单独），门可读改 x0..x30
     // Open a 256-byte frame and save x0..x30 (x0..x29 in pairs, x30 alone); the gate may read and modify x0..x30
     sub sp, sp, #800
@@ -81,7 +93,7 @@ _dm_gate:
     str x9, [sp, #784]
     mov x0, x30              // 返回点 = 门标识 | Return point = gate identifier
     mov x1, sp               // regs
-    bl _gate_dispatch
+    bl DM_SYM(gate_dispatch)
     ldr x9, [sp, #784]
     msr fpcr, x9
     ldr x9, [sp, #776]
@@ -131,14 +143,14 @@ _dm_gate:
 //    Horizon 线程须经 ExitThread 退出，入口返回即报错。
 // 3) dm_thread_enter(entry, arg, sp): guest thread start. Switch to the guest stack given by the SDK and call entry with x0 = argument;
 //    Horizon threads must exit via ExitThread; returning from entry is reported as an error.
-    .globl _dm_thread_enter
+    .globl DM_SYM(dm_thread_enter)
     .p2align 2
-_dm_thread_enter:
+DM_SYM(dm_thread_enter):
     mov sp, x2
     mov x29, #0
     mov x16, x0
     mov x0, x1
     adr x30, 1f
     br x16
-1:  bl _dm_thread_returned
+1:  bl DM_SYM(dm_thread_returned)
     brk #0

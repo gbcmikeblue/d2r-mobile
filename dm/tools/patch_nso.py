@@ -168,6 +168,18 @@ BUILD_ID = d[0x40:0x50].hex()
 # Build-time product rules: the old original-resource / comparison domain is unchanged by default; the touchscreen version is issued separately as a new version, and guest code is not written at runtime.
 RULESET = os.environ.get('DM_RULESET', 'native')
 assert RULESET in ('native', 'touch-run-v4'), f'未知规则域 {RULESET}'
+# 线程槽的基址寄存器，按目标平台选：
+#   apple（缺省）——苹果的线程 TSD 基址在 tpidrro_el0：EL0 只读，由内核按线程设好，`mrs` 读到的就是它；
+#   linux        ——Linux/Android 上 tpidrro_el0 恒为 0（且 EL0 写不了），bionic 的 TSD 基址在 tpidr_el0，`mrs` 可读。
+# 键槽访问是「mrs 出基址 + 键页里的偏移」，所以只有这一条 mrs 的目标要随平台变；键页偏移由宿主装载时按自己的
+# pthread 实现填（苹果 = 键×8，bionic = 键在 TSD 数组里的实际字节偏移），产物这边不用管。
+# Which register holds the thread slot base, chosen per target platform:
+#   apple (default) -- on Apple the thread TSD base is in tpidrro_el0: read-only at EL0, set per thread by the kernel, so `mrs` returns it;
+#   linux           -- on Linux/Android tpidrro_el0 is always 0 (and EL0 cannot write it), while bionic's TSD base is in tpidr_el0, which `mrs` can read.
+# A slot access is "mrs the base, then add the offset from the key page", so only this one mrs target has to change per platform; the key page offsets
+# are filled in by the host loader according to its own pthread implementation (Apple = key*8, bionic = the key's actual byte offset in the TSD array).
+TLSREG = os.environ.get('DM_TLSREG', 'apple')
+assert TLSREG in ('apple', 'linux'), f'未知 DM_TLSREG {TLSREG}'
 RULE_BUILD = 'db0507f36b84200ac05f75d76ed5026f'
 RULE_RUN = RULESET == 'touch-run-v4' and NAME == 'main'
 if RULE_RUN:
@@ -272,7 +284,10 @@ def STUR(t, n, off): return 0xF8000000 | ((off & 0x1FF) << 12) | (n << 5) | t   
 def LDUR(t, n, off): return 0xF8400000 | ((off & 0x1FF) << 12) | (n << 5) | t   # ldur xt,[xn,#off]
 def LDRX(t, n, imm12=0): return 0xF9400000 | (imm12 << 10) | (n << 5) | t
 def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
-def MRS_TPIDRRO(t): return 0xD53BD060 | t
+def MRS_TPIDRRO(t):
+    # 0xD53BD060 = mrs xT, tpidrro_el0；0xD53BD040 = mrs xT, tpidr_el0（差在 op2 那一位）
+    # 0xD53BD060 = mrs xT, tpidrro_el0; 0xD53BD040 = mrs xT, tpidr_el0 (they differ in the op2 bit)
+    return (0xD53BD040 if TLSREG == 'linux' else 0xD53BD060) | t
 def ADRP(dd, pc, target):
     imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd

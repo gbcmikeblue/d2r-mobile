@@ -28,24 +28,89 @@ static pthread_key_t key_value(unsigned i) {
     case KEY_KASPECT: return g_keyaspect; default: return g_keyaspectui;
     }
 }
+// 客体读线程槽的序列是「mrs xN,<基址寄存器> → 加键页里的偏移 → ldr xN,[xN]」，所以键页里放的偏移必须正好等于
+// 「本平台 pthread 实现里该键的值所在字节偏移」。两个平台不一样：
+//   苹果：pthread_key_t 就是槽号，值在 基址 + 键×8，基址寄存器用 tpidrro_el0；
+//   Linux/安卓：pthread_key_t 不是槽号（bionic 给加了 0x80000000 标志），TSD 数组在 tpidr_el0，每个键还占两个
+//     指针位（实测：键 0x80000001 / 0x80000002 / 0x80000003 的值分别在 tpidr_el0+88 / +104 / +120）。bionic 的
+//     内部编码不该写死在这儿，所以启动时用哨兵键实测出「首个键的偏移」和「相邻键的字节间距」，再线性外推。
+// A guest slot read is "mrs xN,<base register> → add the offset from the key page → ldr xN,[xN]", so the
+// offset stored in the key page must be exactly the byte offset at which this platform's pthread
+// implementation keeps that key's value. The two platforms differ:
+//   Apple: pthread_key_t is the slot number, the value sits at base + key*8, base register tpidrro_el0;
+//   Linux/Android: pthread_key_t is not a slot number (bionic sets a 0x80000000 flag), the TSD array is at
+//     tpidr_el0, and each key takes two pointer-sized slots (measured: keys 0x80000001 / 2 / 3 keep their
+//     values at tpidr_el0+88 / +104 / +120). bionic's internal encoding should not be hard-coded here, so
+//     the offset of the first key and the byte distance between adjacent keys are measured with sentinel
+//     keys at startup and then extrapolated linearly.
+#if defined(__ANDROID__) || defined(__linux__)
+static uint64_t g_slot_off0, g_slot_step;      // 首个键的偏移 / 相邻键的字节间距 | offset of the first key / byte distance between adjacent keys
+static pthread_key_t g_slot_key0;              // 实测时用的首个哨兵键（不释放，免得键号被复用后线性关系看着变了） | the first sentinel key used (not released, so key reuse cannot make the linear relation look wrong)
+static int g_slot_measured;
+static void measure_key_slots(void) {
+    if (g_slot_measured) return;
+    g_slot_measured = 1;
+    pthread_key_t b;
+    if (pthread_key_create(&g_slot_key0, NULL) || pthread_key_create(&b, NULL)) die("建探测键失败");
+    const uint64_t sa = 0x5A5A1234ull, sb = 0x5A5A5678ull;
+    pthread_setspecific(g_slot_key0, (void *)sa); pthread_setspecific(b, (void *)sb);
+    uint64_t base; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(base));
+    if (!base) die("拿不到 tpidr_el0（本平台不是 bionic 那种 TSD 布局？）");
+    const uint64_t *t = (const uint64_t *)(base & ~7ull);
+    long ia = -1, ib = -1;
+    for (long i = 0; i < 512; i++) { if (t[i] == sa) ia = i; if (t[i] == sb) ib = i; }
+    if (ia < 0 || ib < 0 || ib <= ia) die("量线程槽失败：tpidr_el0=%#llx 找到 %ld / %ld", (unsigned long long)base, ia, ib);
+    g_slot_off0 = (uint64_t)ia * 8;
+    g_slot_step = (uint64_t)(ib - ia) * 8 / (uint64_t)(b - g_slot_key0);
+    LOG("线程槽量测：首个键 %#x 在 tpidr_el0+%llu，键间距 %llu 字节",
+        (unsigned)g_slot_key0, (unsigned long long)g_slot_off0, (unsigned long long)g_slot_step);
+}
+// 键 → 键页里要放的字节偏移 | key -> the byte offset to store in the key page
+static uint64_t key_slot_offset(pthread_key_t k) {
+    measure_key_slots();
+    return g_slot_off0 + (uint64_t)(k - g_slot_key0) * g_slot_step;
+}
+#else
+static void measure_key_slots(void) { }
+static uint64_t key_slot_offset(pthread_key_t k) { return (uint64_t)k * 8; }
+#endif
 static void create_keys(void) {
+    measure_key_slots();   // 必须赶在建真键之前：量测要拿「第一个键」当零点 | must run before the real keys: the measurement uses the first key as its zero
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("创建宿主键失败");
     // 参数位键一律建（不按产物有没有用到判断：iOS 包里没有 params.tsv，按文件判断会漏建、键页写成 0 → 游戏读到 TSD 0 号槽）
     // Parameter slot keys are always created (not decided by whether the build output uses them: an iOS app has no params.tsv, so deciding by file would miss creating them and the key page would be written as 0 → the game reads TSD slot 0)
     if (pthread_key_create(&g_keyres[0], NULL) || pthread_key_create(&g_keyres[1], NULL) ||
         pthread_key_create(&g_keyaspect, NULL) || pthread_key_create(&g_keyaspectui, NULL)) die("创建参数位键失败");
-    LOG("键号 K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu KRES0=%lu KRES1=%lu KASPECT=%lu KASPECTUI=%lu",
-        g_key18, g_keytls, g_keytlr, g_keygate, g_keyres[0], g_keyres[1], g_keyaspect, g_keyaspectui);
+    // pthread_key_t 在苹果与 bionic 上都是 32 位：按 %lu 传会被读成 8 字节，后面几个数全是垃圾
+    // pthread_key_t is 32 bits on both Apple and bionic: passing it to %lu makes it read 8 bytes and every following number comes out as garbage
+    LOG("键号 K18=%u KTLS=%u KTLR=%u KGATE=%u KRES0=%u KRES1=%u KASPECT=%u KASPECTUI=%u",
+        (unsigned)g_key18, (unsigned)g_keytls, (unsigned)g_keytlr, (unsigned)g_keygate,
+        (unsigned)g_keyres[0], (unsigned)g_keyres[1], (unsigned)g_keyaspect, (unsigned)g_keyaspectui);
 }
 
 // K 槽校验：pthread TSD 布局固定，槽 = tpidrro_el0 + 8*key
 // K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
 static void tsd_check(void) {
     pthread_setspecific(g_key18, (void *)0x1234);
-    uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
+    uint64_t base;
+#if defined(__ANDROID__) || defined(__linux__)
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(base));     // 与产物同一套约定：安卓的基址在 tpidr_el0 | same convention as the build output: on Android the base is in tpidr_el0
+    if (!base) die("tpidr_el0 是 0——线程槽基址取不到");
+#else
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
+#endif
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
-    if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD 布局不符");
+    // 按客体那两步照做：基址 + 键页偏移，再取一次 | do exactly what the guest does: base + key page offset, then one load
+    if (*(uint64_t *)(base + off) != 0x1234)
+        die("TSD 布局不符（基址 %#llx + 键页偏移 %#llu）：产物是按另一种线程槽基址寄存器出的？"
+            "本平台的产物要用 DM_TLSREG=%s 重出", (unsigned long long)base, (unsigned long long)off,
+#if defined(__ANDROID__) || defined(__linux__)
+            "linux"
+#else
+            "apple"
+#endif
+            );
     pthread_setspecific(g_key18, 0);
 }
 
@@ -179,9 +244,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: 键页越界", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < 4; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
-    page[m->key_idx[KEY_KRES0]] = (uint64_t)g_keyres[0] * 8; page[m->key_idx[KEY_KRES1]] = (uint64_t)g_keyres[1] * 8;
-    page[m->key_idx[KEY_KASPECT]] = (uint64_t)g_keyaspect * 8; page[m->key_idx[KEY_KASPECTUI]] = (uint64_t)g_keyaspectui * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = key_slot_offset(key_value(i));
     for (int k = 0; k < 8; k++) if (!page[m->key_idx[k]]) die("%s: 键页第 %d 项为 0（宿主键没建）——游戏会读到 TSD 0 号槽", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s 键页 mprotect", m->name);
 }

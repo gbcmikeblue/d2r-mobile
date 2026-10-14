@@ -26,6 +26,11 @@ set(COMPAT ${CMAKE_CURRENT_SOURCE_DIR}/compat)
 file(GLOB HOST_SRC ${DM}/host/*.c)
 list(REMOVE_ITEM HOST_SRC ${DM}/host/touch_mac.c)
 
+# main.c 以 -Dmain=dm_main 编入（与 iOS 同一条路，见 dm/ios/Sources/main.m）：安卓入口在 main_android.c
+# main.c is compiled with -Dmain=dm_main (the same route as iOS, see dm/ios/Sources/main.m); the
+# Android entry point lives in main_android.c
+set_source_files_properties(${DM}/host/main.c PROPERTIES COMPILE_DEFINITIONS "main=dm_main")
+
 # 图形层：.c 与 .S（.m 是 Metal 专有，M2 才换成 Vulkan）
 # Graphics: only .c and .S (.m is Metal-specific and gets replaced by Vulkan in M2)
 file(GLOB GFX_SRC ${DM}/gfx/*.c ${DM}/gfx/nvn/*.c ${DM}/gfx/tex/*.c)
@@ -41,6 +46,8 @@ set(LIBDEFLATE
 
 add_library(dmhost_android STATIC
   ${COMPAT}/dm_android_compat.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/front_android.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/gfx_stub_android.c
   ${HOST_SRC}
   ${DM}/host/entry.S
   ${GFX_SRC}
@@ -63,3 +70,18 @@ target_compile_options(dmhost_android PRIVATE
 # Follow-up: warnings are off during M1 so that "it builds and runs" comes first; turn them on and
 # work through them after M1's acceptance.
 target_compile_options(dmhost_android PRIVATE -w)
+
+# M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
+# 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；
+# 打成 APK 留到 M2 之后（那时才有画面）。
+# The executable used for M1 acceptance: no window, no graphics backend, run directly on the device.
+# Push it to /data/local/tmp with adb and execute it there (that path is executable for the shell
+# user); the goal is the game's UNIMPL lines showing up in the log. Packaging an APK is left until
+# after M2, when there is something to show.
+add_executable(dmhost_android_bin ${CMAKE_CURRENT_SOURCE_DIR}/main_android.c)
+target_link_libraries(dmhost_android_bin PRIVATE dmhost_android)
+set_target_properties(dmhost_android_bin PROPERTIES OUTPUT_NAME dmhost)
+# 安卓 15 起要求 16 KiB 页对齐；显式声明以免在新设备上装不上 / 跑不起来
+# Android 15 and later require 16 KiB page alignment; state it explicitly so the binary loads on
+# newer devices
+target_link_options(dmhost_android_bin PRIVATE -Wl,-z,max-page-size=16384)
