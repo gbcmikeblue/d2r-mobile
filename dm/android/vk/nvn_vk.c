@@ -1591,8 +1591,19 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 // the device (which cost a while to figure out).
                 if (atomic_fetch_add(&g_desc_tex_blank, 1) < 8) {
                     int stg = st->stage >= 0 && st->stage < 6 ? st->stage : 0;
-                    LOG("【黄】binding %u（%s）贴图写空白：res.json 说 cbuf_slot=%d handle=0x%x；该阶段贴图句柄 %llx/%llx/%llx、常量段 %llx/%llx/%llx/%llx",
+                    // 差的那条读数：这处空白到底是"槽没绑"还是"绑的句柄 tid 不在注册表"。
+                    // res.json 的 handle **不是贴图号**，是 c2 的字偏移 → 解成贴图槽（见 vk_shader.c 的 decode_slots）：
+                    // 这里把"解出来的槽"、"该槽上绑的句柄"、"注册表里查不查得到"一起打出来。
+                    // The missing reading: is this blank "the slot was never bound" or "the bound handle's tid is not in the
+                    // registry"? res.json's handle is **not a texture id** but a c2 word offset -> resolved into a texture
+                    // slot (see decode_slots in vk_shader.c); this prints the resolved slot, the handle bound on it, and
+                    // whether the registry has it.
+                    int nsl = tr ? tr->nvn_slot : -1;
+                    uint64_t bh = (nsl >= 0 && nsl < 128) ? g_rs.tex[stg][nsl] : 0;
+                    LOG("【黄】binding %u（%s）贴图写空白：res.json 说 cbuf_slot=%d handle=0x%x → 槽 %d；该槽绑的句柄 %#llx（低 20 位 %u，注册表 %s），注册表共 %llu 项；该阶段贴图句柄 %llx/%llx/%llx、常量段 %llx/%llx/%llx/%llx",
                         b[i].binding, vk_spv_kind_name(b[i].kind), tr ? tr->cbuf_slot : -999, tr ? (unsigned)tr->handle : 0u,
+                        nsl, (unsigned long long)bh, (unsigned)(bh & 0xfffffu),
+                        bh && treg_of((uint32_t)bh) ? "命中" : "不在", (unsigned long long)atomic_load(&g_treg_n),
                         (unsigned long long)g_rs.tex[stg][0], (unsigned long long)g_rs.tex[stg][1], (unsigned long long)g_rs.tex[stg][2],
                         (unsigned long long)g_rs.ubo[stg][0].addr, (unsigned long long)g_rs.ubo[stg][1].addr,
                         (unsigned long long)g_rs.ubo[stg][2].addr, (unsigned long long)g_rs.ubo[stg][3].addr);
