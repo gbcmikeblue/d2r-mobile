@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
+#include "dm_uctx.h"
 #include <unistd.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
@@ -133,15 +134,21 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
     if (sig == SIGSEGV || sig == SIGBUS) {
+#if DM_UC_HAVE_ESR
         int is_write = (int)((uc->uc_mcontext->__es.__esr >> 6) & 1);   // ESR 的 WnR 位 | The WnR bit of ESR
+#else
+        // 安卓的 sigcontext 没有 ESR：拿不到「读还是写」，先按「读」处理（见 dm_uctx.h）
+        // Android's sigcontext carries no ESR: the read/write bit is unavailable, treat it as a read (see dm_uctx.h)
+        int is_write = 0;
+#endif
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
     }
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
-    off("addr", (uint64_t)si->si_addr); off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
-    fprintf(stderr, " sp=%#llx\n", uc->uc_mcontext->__ss.__sp);
-    for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? "\n" : " ");
+    off("addr", (uint64_t)si->si_addr); off("pc", DM_UC_PC(uc)); off("lr", DM_UC_LR(uc));
+    fprintf(stderr, " sp=%#llx\n", DM_UC_SP(uc));
+    for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, DM_UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
-    dm_backtrace(uc->uc_mcontext->__ss.__fp);
+    dm_backtrace(DM_UC_FP(uc));
     if (g_dump_hook) g_dump_hook();
     _exit(128 + sig);
 }

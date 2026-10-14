@@ -157,6 +157,31 @@ English: [ANDROID_PLAN.md](ANDROID_PLAN.md)
 - [ ] 跑 `nnMain`，观察日志
 - [ ] **验收**：APK 装在真机上，画面全黑，但日志里出现游戏的 `UNIMPL` 行
 
+**M1 进展记录（进行中，2026-10-14）**
+
+- [x] **改写产物已出**：`dm/tools/patch_nso.py` 三种产物 × 三个模块跑通，代号 `3.3.94012-r41`；`keypage`（M1 采用）25 个文件齐全。
+- [x] **安卓兼容层**：`dm/android/compat/`（12 个头 + 1 个 `.c`，用 `-include` 强制包含）。宿主层从**31 个文件 / 1090 行错误**降到 **0**。
+- [x] **平台差异逐项落地**（改源码，一律 `#if defined(__ANDROID__)` 分支 + 中英双语注释）：
+
+| 项 | 处理方式 |
+|---|---|
+| 汇编 Mach-O 语法（1053 处） | `nvn_thunks.S` 改**生成器** `gen_protos.py`：平台差异收进两个宏分支（C 符号前导下划线、`@PAGE/@PAGEOFF` ↔ `:lo12:`），展开体保持平台中立；`nvn_entry.S` 用同一套做法手改 |
+| `mcontext_t` 结构差异（31 处） | 新增 `dm/host/dm_uctx.h`：寄存器访问统一成 `DM_UC_PC/LR/SP/FP/X` 宏（必须是左值，故不带转型），`crash.c` / `diag.c` 改用 |
+| xattr 参数个数（3 处） | `hle_fs.c` 加安卓分支（Bionic 是 4 / 5 / 2 参，macOS 是 6 / 6 / 3 参） |
+| `dispatch/dispatch.h`（1 处） | `hle_lifecycle.c` 用**两条普通线程**顶替 GCD（1.5 秒兜底 + `sigwait` 收 SIGTERM）；`hle_audio.c` 只用到信号量，由兼容层的 `dispatch/dispatch.h` 提供 |
+| `AudioToolbox`（1 处） | `hle_audio.c` 加安卓分支：AudioUnit 调用全部变空操作、`au` 恒为 NULL，一律走静音接收端（M1 暂不出声） |
+| `thread_policy_get` 参数个数 | 兼容层签名补齐（Apple 是 5 参） |
+
+- [x] **宿主编译通过**：`dm/android/CMakeLists.txt` 用 NDK 工具链配置后 `ninja` → **0 错误**，产出 `libdmhost_android.a`（约 9.0 MB，88 个目标文件）。
+- [ ] 尚未进行：加载器接入、`front_android` 最小实现、链接成可执行文件、真机运行。
+
+**待办（M1 期间先放过，验收后必须补回来）**
+
+- 兼容层里的 MD5 / SHA1 / SHA256 目前是**占位实现**（定长零输出），`hle_tact.c` 的取样核对与 `dm_padmode.c` 的原文串识别会因此不准；
+- `mach-o` 段查找一律按"找不到"返回，`F_GETPATH`、`sysctl(KERN_PROC_PID)` 未实现；
+- 安卓侧 SIGSEGV 拿不到 ESR 的「读 / 写」位，暂按「读」处理（影响缺页钩子的判定）；
+- 构建暂时用 `-w` 关掉了警告，M1 验收后打开逐项处理。
+
 ### M2 —— 最小 Vulkan 回放层（最大工作量）
 
 - [ ] 搭 Vulkan 骨架：设备、队列、`ANativeWindow` 交换链

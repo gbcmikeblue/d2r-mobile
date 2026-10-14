@@ -113,7 +113,16 @@ static Result mount(const char *name, const char *dir, int ro) { return mount_ex
 #define FS_GUEST_NAME "org.d2rmobile.guest-name"
 static int guest_name(const char *parent, const char *physical, char *out, size_t n) {
     char p[1280]; snprintf(p, sizeof p, "%s/%s", parent, physical);
+#if defined(__ANDROID__)
+    // Bionic 的 getxattr 没有 position / options 两个参数（安卓兼容层也不该去包装系统同名函数）。
+    // 这里的路径都是普通文件/目录、不涉及符号链接，所以 macOS 的 XATTR_NOFOLLOW 语义等价于默认行为。
+    // Bionic's getxattr takes neither position nor options (and the Android compat layer should not wrap
+    // same-named system functions). These paths are ordinary files/dirs with no symlinks, so macOS's
+    // XATTR_NOFOLLOW semantics are equivalent to the default here.
+    ssize_t k = getxattr(p, FS_GUEST_NAME, out, n - 1);
+#else
     ssize_t k = getxattr(p, FS_GUEST_NAME, out, n - 1, 0, XATTR_NOFOLLOW);
+#endif
     if (k >= 0) { out[k] = 0; return 1; }
     if (errno != ENOATTR) return 0;
     strlcpy(out, physical, n); return 1;
@@ -225,8 +234,15 @@ static int set_guest_name(const char *hp, const char *path) {
     if (k >= sizeof guest) { errno = ENAMETOOLONG; return -1; }
     memcpy(guest, start, k); guest[k] = 0;
     const char *physical = strrchr(hp, '/') + 1;
+#if defined(__ANDROID__)
+    // 同 guest_name：Bionic 的 setxattr 是 5 参、removexattr 是 2 参（见上）
+    // As in guest_name: Bionic's setxattr takes 5 arguments and removexattr takes 2 (see above)
+    if (strcmp(physical, guest)) return setxattr(hp, FS_GUEST_NAME, guest, strlen(guest), 0);
+    if (!removexattr(hp, FS_GUEST_NAME) || errno == ENOATTR) return 0;
+#else
     if (strcmp(physical, guest)) return setxattr(hp, FS_GUEST_NAME, guest, strlen(guest), 0, XATTR_NOFOLLOW);
     if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR) return 0;
+#endif
     return -1;
 }
 static Result err_res(const char *op, const char *path) {

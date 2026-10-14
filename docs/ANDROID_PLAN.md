@@ -143,19 +143,32 @@ The output lives in `.work/spv/` (gitignored; not committed).
 
 ### M1 — host runs headless
 
-- [ ] Add `dm/android/` and set up the project skeleton (form to be decided)
+- [x] Add `dm/android/` and set up the project skeleton
 - [ ] Write a minimal `front_android.*`: `front_run` runs the guest on the current thread, `front_metal_layer` returns NULL
-- [ ] **Platform-independence work**: add `__ANDROID__` branches beside Apple-specific sections of the host
-  - [ ] `hle_fs.c`: `clonefile()` / `xattr` → `copy_file_range` / a replacement table
-  - [ ] `hle_audio.c`: start with the **null sink** (`null_sink`, plain POSIX, reusable as is)
-  - [ ] `crash.c` / `diag.c`: mach, signal stacks → `/proc`, `backtrace`, or weaken for now
-  - [ ] `dm_i18n.c`: CoreFoundation → standard C
-  - [ ] `dm_padmode.c`, `diag.c`: CommonCrypto → an in-tree implementation or another library
-  - [ ] `memstat.m`: mach → drop or rewrite against `/proc`
-  - [ ] `loader.c`, `main.c`: an Android branch beside the `TARGET_OS_IPHONE` one
+- [x] **Platform-independence work**: add `__ANDROID__` branches beside Apple-specific sections of the host
+  - [x] `hle_fs.c`: xattr argument counts (Bionic takes 4 / 5 / 2 where macOS takes 6 / 6 / 3)
+  - [x] `hle_audio.c`: every AudioUnit call becomes a no-op and `au` stays NULL, so the **null sink** always runs (no real audio in M1)
+  - [x] `crash.c` / `diag.c`: the new `dm/host/dm_uctx.h` unifies register access behind `DM_UC_*` macros
+  - [x] `hle_lifecycle.c`: two ordinary threads stand in for GCD (a 1.5-second fallback plus `sigwait` for SIGTERM)
+  - [x] `nvn_thunks.S` / `nvn_entry.S`: Mach-O → dual Mach-O/ELF, with the platform difference emitted as two macro branches by `gen_protos.py`
+  - [x] everything else (mach, CommonCrypto, dispatch semaphores, Apple headers) is covered by the compat layer in `dm/android/compat/`, force-included
 - [ ] Load the rewritten output: ship `patched.bin` in the app assets and map it for execution (mind `PROT_EXEC` and W^X)
 - [ ] Run `nnMain` and watch the log
 - [ ] **Acceptance**: the APK installs on the device, the screen is black, but the log shows the game's `UNIMPL` lines
+
+**M1 progress log (in progress, 2026-10-14)**
+
+- [x] **Rewritten output produced**: `dm/tools/patch_nso.py` ran all three product kinds across all three modules; code name `3.3.94012-r41`, and `keypage` (the one M1 uses) has all 25 files.
+- [x] **Android compatibility layer**: `dm/android/compat/` (12 headers plus one `.c`, force-included). The host layer went from **31 files / 1090 error lines** down to **0**.
+- [x] **The host compiles**: `cmake -S dm/android -B build/android` with the NDK toolchain, then `ninja` → **0 errors**, producing `libdmhost_android.a` (about 9.0 MB, 88 object files).
+- [ ] Not started yet: wiring the loader, a minimal `front_android`, linking an executable, running on the device.
+
+**Follow-ups (skipped during M1, must come back after acceptance)**
+
+- MD5 / SHA1 / SHA256 in the compat layer are **placeholders** (fixed-length zero output), so `hle_tact.c`'s sample checks and `dm_padmode.c`'s original-string matching will be wrong;
+- Mach-O section lookup always reports "not found"; `F_GETPATH` and `sysctl(KERN_PROC_PID)` are unimplemented;
+- Android's SIGSEGV carries no ESR, so the read/write bit is assumed to be a read (this affects the page-fault hook's decision);
+- The build currently passes `-w` to silence warnings; turn them on after M1's acceptance.
 
 ### M2 — minimal Vulkan replay layer (the largest item)
 

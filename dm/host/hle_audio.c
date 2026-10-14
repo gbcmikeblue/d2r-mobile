@@ -7,11 +7,28 @@
 //       iOS defaults to real audio output (the product must have sound), tests that want silence set DM_AUDIO=0 explicitly; Mac defaults to the silent sink (replay / gate checks are silent), DM_AUDIO=1 for real audio output.
 // The contents of AudioOut / AudioOutBuffer / AudioOutParameter are read and written only through the interfaces below; the host defines its own internal layout and only writes the front part of the structs.
 #include "hle.h"
+#if !defined(__ANDROID__)
 #include <AudioToolbox/AudioToolbox.h>
+#endif
 #include <TargetConditionals.h>
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
 #include <unistd.h>
+
+#if defined(__ANDROID__)
+// 安卓暂无真出声（M1 先只走静音接收端，见 docs/ANDROID_PLAN）：把 AudioUnit 的调用一律变成空操作，
+// aout.au 恒为 NULL，于是 Start / Stop / Suspend 全都落到静音接收端那一支上。
+// No real audio output on Android yet (M1 uses the silent sink only, see docs/ANDROID_PLAN): every
+// AudioUnit call becomes a no-op and aout.au stays NULL, so Start / Stop / Suspend all land on the
+// silent-sink branches.
+#define DM_AU_STOP(au)    ((void)(au))
+#define DM_AU_START(au)   (0)
+#define DM_AU_DISPOSE(au) ((void)(au))
+#else
+#define DM_AU_STOP(au)    AudioOutputUnitStop(au)
+#define DM_AU_START(au)   AudioOutputUnitStart(au)
+#define DM_AU_DISPOSE(au) do { AudioUnitUninitialize(au); AudioComponentInstanceDispose(au); } while (0)
+#endif
 
 enum { FMT_PCM16 = 2, STATE_STARTED = 0, STATE_STOPPED = 1, RATE = 48000 };
 
@@ -26,7 +43,11 @@ typedef struct {
     gbuf *q[QMAX]; _Atomic uint32_t q_head, q_tail;       // 待播：游戏侧写，出声端读 | Pending: written by the game side, read by the output side
     gbuf *rel[RELMAX]; _Atomic uint32_t rel_head, rel_tail; // 已释放：出声端写，游戏侧读 | Released: written by the output side, read by the game side
     uint64_t pos;                      // 当前块已播字节 | Bytes already played of the current block
+#if defined(__ANDROID__)
+    void *au;                          // 安卓：恒为 NULL（暂无真出声）| Android: always NULL (no real output yet)
+#else
     AudioUnit au;
+#endif
     pthread_t null_th; _Atomic int null_run;
     dispatch_semaphore_t notify_sem;
     pthread_t notify_th; _Atomic int notify_run, notify_pending, notify_armed;
@@ -89,6 +110,7 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
 
 static _Atomic uint64_t g_render_calls;   // 声卡回调累计（生命周期验证：恢复后须继续增长） | Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
 uint64_t dm_audio_render_calls(void) { return atomic_load_explicit(&g_render_calls, memory_order_relaxed); }
+#if !defined(__ANDROID__)
 static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *bl) {
     (void)f; (void)ts; (void)bus; (void)frames;
     aout *a = ctx;
@@ -115,6 +137,7 @@ static void au_open(aout *a) {
         AudioUnitSetProperty(a->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb) ||
         AudioUnitInitialize(a->au)) die("AudioUnit 设置失败");
 }
+#endif   // !__ANDROID__：安卓走静音接收端，不建 AudioUnit | !__ANDROID__: Android uses the silent sink and builds no AudioUnit
 // 静音接收端：每 5 ms 按 48 kHz 实时消耗
 // Silent sink: consumes in real time at 48 kHz every 5 ms
 static void *null_sink(void *p) {
@@ -158,14 +181,16 @@ HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKN
     g_aos[slot] = a;
     pthread_mutex_unlock(&g_aos_lock);
     LOG("audio::OpenAudioOut %s 声道 %d %s", name ? name : "(默认)", ch, real_audio() ? "真出声" : "静音接收端");
+#if !defined(__ANDROID__)
     if (real_audio()) au_open(a);
+#endif   // 安卓没有 AudioUnit：一律由静音接收端接管 | no AudioUnit on Android: the silent sink always takes over
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", "开始播放", Result, h_au_Start, void *g) {
     aout *a = ao(g);
     pthread_mutex_lock(&a->m); int was = atomic_load_explicit(&a->state, memory_order_relaxed); atomic_store_explicit(&a->state, STATE_STARTED, memory_order_release); pthread_mutex_unlock(&a->m);
     if (was == STATE_STARTED) return RES_OK;
-    if (a->au && !g_suspended) { if (AudioOutputUnitStart(a->au)) die("AudioUnit 启动失败"); }
+    if (a->au && !g_suspended) { if (DM_AU_START(a->au)) die("AudioUnit 启动失败"); }
     else { atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); }
     return RES_OK;
 }
@@ -174,7 +199,7 @@ HLE_FORCE("_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE", "停止播放", void, h_
     pthread_mutex_lock(&a->m); int was = atomic_load_explicit(&a->state, memory_order_relaxed); atomic_store_explicit(&a->state, STATE_STOPPED, memory_order_release); pthread_mutex_unlock(&a->m);
     if (was != STATE_STARTED) return;
     pthread_mutex_lock(&g_aos_lock); int susp = g_suspended; pthread_mutex_unlock(&g_aos_lock);
-    if (a->au && !susp) AudioOutputUnitStop(a->au);
+    if (a->au && !susp) DM_AU_STOP(a->au);
     else { atomic_store_explicit(&a->null_run, 0, memory_order_release); pthread_join(a->null_th, NULL); }   // 静音接收端（含暂停期间接手的） | Silent sink (including one that took over during suspension)
 }
 HLE_FORCE("_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE", "关闭音频输出", void, h_au_Close, void *g) {
@@ -186,7 +211,7 @@ HLE_FORCE("_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE", "关闭音频输出", v
     pthread_mutex_lock(&g_aos_lock);
     for (int i = 0; i < AOMAX; i++) if (g_aos[i] == a) g_aos[i] = NULL;
     pthread_mutex_unlock(&g_aos_lock);
-    if (a->au) { AudioUnitUninitialize(a->au); AudioComponentInstanceDispose(a->au); }
+    if (a->au) { DM_AU_DISPOSE(a->au); }
     dispatch_release(a->notify_sem);
     pthread_mutex_destroy(&a->m); free(a);
 }
@@ -239,9 +264,13 @@ void dm_audio_suspend(int on) {
             if (!a || !a->au || atomic_load_explicit(&a->state, memory_order_acquire) != STATE_STARTED) continue;
             // 暂停期间改由静音接收端按实时消耗：否则缓冲不再释放，FMOD 输出线程永久等待、游戏音频节奏卡死（来电打断同理）
             // While suspended the silent sink consumes in real time instead: otherwise buffers are no longer released, the FMOD output thread waits forever and the game's audio pacing stalls (same for an incoming call interruption)
-            if (on) { AudioOutputUnitStop(a->au); atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); }
+            if (on) { DM_AU_STOP(a->au); atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); }
             else { atomic_store_explicit(&a->null_run, 0, memory_order_release); pthread_join(a->null_th, NULL);
+#if defined(__ANDROID__)
+                   int st = DM_AU_START(a->au);   // 安卓恒为 0：没有 AudioUnit 可恢复，静音接收端继续顶着 | always 0 on Android: there is no AudioUnit to resume, the silent sink keeps covering
+#else
                    OSStatus st = AudioOutputUnitStart(a->au);
+#endif
                    if (st) {   // 会话还被别人占着（通话没挂就切回游戏、打断结束时人还在别的 App）：不致命，继续由静音接收端顶着，等下一次恢复再试 | The session is still held by someone else (switched back to the game with a call not yet hung up, or the user is still in another app when the interruption ends): not fatal, the silent sink keeps covering, and we retry at the next resume
                        LOG("【红】AudioUnit 恢复失败（状态 %d）：保持静音接收端，等下次恢复重试", (int)st);
                        atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); failed = 1; } }
