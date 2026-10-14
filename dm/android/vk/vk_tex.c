@@ -77,7 +77,123 @@ int vk_fmt_to_vk(int f, VkFormat *out) {
     case 0x4E: *out = VK_FORMAT_BC7_SRGB_BLOCK; return 1;
     case 0x4F: *out = VK_FORMAT_BC6H_SFLOAT_BLOCK; return 1;
     case 0x50: *out = VK_FORMAT_BC6H_UFLOAT_BLOCK; return 1;
-    default: return 0;   // 其余（UI2F / I2F 那一批 0x51 起、以及更小的 R/RG 系列）待实测补 | the rest (the UI2F / I2F batch from 0x51, and the smaller R/RG series) to be added from measurements
+    // ---- 低段：单/双通道系列（0x01..0x1A）。真机实测遇到的缺项正在这一段（0x1 R8、0x6 R16、0xb R32UI、0xd RG8）——
+    //      掩码图、查找表、高度图这类贴图都落在这里，游戏里很常见。
+    // ---- the low range: single/dual-channel formats (0x01..0x1A). The gaps the device reported live exactly here
+    //      (0x1 R8, 0x6 R16, 0xb R32UI, 0xd RG8) -- masks, lookup tables and height maps land here and are common.
+    case 0x01: *out = VK_FORMAT_R8_UNORM; return 1;
+    case 0x02: *out = VK_FORMAT_R8_SNORM; return 1;
+    case 0x03: *out = VK_FORMAT_R8_UINT; return 1;
+    case 0x04: *out = VK_FORMAT_R8_SINT; return 1;
+    case 0x05: *out = VK_FORMAT_R16_SFLOAT; return 1;
+    case 0x06: *out = VK_FORMAT_R16_UNORM; return 1;
+    case 0x07: *out = VK_FORMAT_R16_SNORM; return 1;
+    case 0x08: *out = VK_FORMAT_R16_UINT; return 1;
+    case 0x09: *out = VK_FORMAT_R16_SINT; return 1;
+    case 0x0A: *out = VK_FORMAT_R32_SFLOAT; return 1;
+    case 0x0B: *out = VK_FORMAT_R32_UINT; return 1;
+    case 0x0C: *out = VK_FORMAT_R32_SINT; return 1;
+    case 0x0D: *out = VK_FORMAT_R8G8_UNORM; return 1;
+    case 0x0E: *out = VK_FORMAT_R8G8_SNORM; return 1;
+    case 0x0F: *out = VK_FORMAT_R8G8_UINT; return 1;
+    case 0x10: *out = VK_FORMAT_R8G8_SINT; return 1;
+    case 0x11: *out = VK_FORMAT_R16G16_SFLOAT; return 1;
+    case 0x12: *out = VK_FORMAT_R16G16_UNORM; return 1;
+    case 0x13: *out = VK_FORMAT_R16G16_SNORM; return 1;
+    case 0x14: *out = VK_FORMAT_R16G16_UINT; return 1;
+    case 0x15: *out = VK_FORMAT_R16G16_SINT; return 1;
+    case 0x16: *out = VK_FORMAT_R32G32_SFLOAT; return 1;
+    case 0x17: *out = VK_FORMAT_R32G32_UINT; return 1;
+    case 0x18: *out = VK_FORMAT_R32G32_SINT; return 1;
+    case 0x19: *out = VK_FORMAT_R8G8B8_UNORM; return 1;
+    case 0x1A: *out = VK_FORMAT_R8G8B8_SNORM; return 1;
+    // ---- UI2F / I2F（0x51..0x68）：数据按整数存、取样时转成浮点——Vulkan 的 **_USCALED / _SSCALED 正是这个语义**，
+    //      不是近似值，所以照直映射。**但只有 8 / 16 位通道有这两个变体**：32 位的 UI2F / I2F 在 Vulkan 里
+    //      没有对应物（映射成 UINT/SINT 会让着色器读到整数而不是浮点，那是在猜），所以照规矩报出来。
+    // ---- UI2F / I2F (0x51..0x68): the data is stored as integers and converted to float when sampled -- Vulkan's
+    //      **_USCALED / _SSCALED are exactly that semantic**, not an approximation, so they map straight across.
+    //      **Those two variants only exist for 8- and 16-bit channels**, though: the 32-bit UI2F / I2F have no
+    //      counterpart in Vulkan (mapping them to UINT/SINT would hand the shader integers where it expects floats,
+    //      which is guessing), so they are reported instead.
+    case 0x51: *out = VK_FORMAT_R8_USCALED; return 1;
+    case 0x52: *out = VK_FORMAT_R8_SSCALED; return 1;
+    case 0x53: *out = VK_FORMAT_R16_USCALED; return 1;
+    case 0x54: *out = VK_FORMAT_R16_SSCALED; return 1;
+    case 0x57: *out = VK_FORMAT_R8G8_USCALED; return 1;
+    case 0x58: *out = VK_FORMAT_R8G8_SSCALED; return 1;
+    case 0x59: *out = VK_FORMAT_R16G16_USCALED; return 1;
+    case 0x5A: *out = VK_FORMAT_R16G16_SSCALED; return 1;
+    case 0x5D: *out = VK_FORMAT_R8G8B8_USCALED; return 1;
+    case 0x5E: *out = VK_FORMAT_R8G8B8_SSCALED; return 1;
+    case 0x5F: *out = VK_FORMAT_R16G16B16_USCALED; return 1;
+    case 0x60: *out = VK_FORMAT_R16G16B16_SSCALED; return 1;
+    case 0x63: *out = VK_FORMAT_R8G8B8A8_USCALED; return 1;
+    case 0x64: *out = VK_FORMAT_R8G8B8A8_SSCALED; return 1;
+    case 0x65: *out = VK_FORMAT_R16G16B16A16_USCALED; return 1;
+    case 0x66: *out = VK_FORMAT_R16G16B16A16_SSCALED; return 1;
+    case 0x69: *out = VK_FORMAT_A2B10G10R10_SNORM_PACK32; return 1;
+    case 0x6A: *out = VK_FORMAT_A2B10G10R10_SINT_PACK32; return 1;
+    // 0x6B / 0x6C（RGB10A2_UI2F / I2F）：Vulkan 的 10:10:10:2 没有 scaled 变体，不猜，留给报出机制
+    // 0x6B / 0x6C (RGB10A2_UI2F / I2F): Vulkan's 10:10:10:2 has no scaled variant, so it is not guessed and is left
+    // to the reporting mechanism
+    // ---- RGBX（0x6D..0x78）：X 通道不参与采样，按 RGBA 承接（与上面 0x37 同一个做法）----
+    // ---- RGBX (0x6D..0x78): the X channel is not sampled, so it is taken as RGBA (the same treatment as 0x37 above)
+    case 0x6D: *out = VK_FORMAT_R8G8B8A8_UNORM; return 1;
+    case 0x6E: *out = VK_FORMAT_R8G8B8A8_SNORM; return 1;
+    case 0x6F: *out = VK_FORMAT_R8G8B8A8_UINT; return 1;
+    case 0x70: *out = VK_FORMAT_R8G8B8A8_SINT; return 1;
+    case 0x71: *out = VK_FORMAT_R16G16B16A16_SFLOAT; return 1;
+    case 0x72: *out = VK_FORMAT_R16G16B16A16_UNORM; return 1;
+    case 0x73: *out = VK_FORMAT_R16G16B16A16_SNORM; return 1;
+    case 0x74: *out = VK_FORMAT_R16G16B16A16_UINT; return 1;
+    case 0x75: *out = VK_FORMAT_R16G16B16A16_SINT; return 1;
+    case 0x76: *out = VK_FORMAT_R32G32B32A32_SFLOAT; return 1;
+    case 0x77: *out = VK_FORMAT_R32G32B32A32_UINT; return 1;
+    case 0x78: *out = VK_FORMAT_R32G32B32A32_SINT; return 1;
+    // ---- ASTC（0x79..0x94）：Switch 贴图的主力压缩格式，而 Adreno 原生支持 ASTC —— 这几条映射直接决定贴图能不能出。
+    //      14 种块尺寸 × (UNORM, SRGB)，一个不多一个不少。----
+    // ---- ASTC (0x79..0x94): the Switch's main compressed texture format, and Adreno supports ASTC natively -- these
+    //      mappings decide whether textures appear at all. Fourteen block sizes x (UNORM, SRGB), no more and no less.
+    case 0x79: *out = VK_FORMAT_ASTC_4x4_UNORM_BLOCK; return 1;
+    case 0x7A: *out = VK_FORMAT_ASTC_5x4_UNORM_BLOCK; return 1;
+    case 0x7B: *out = VK_FORMAT_ASTC_5x5_UNORM_BLOCK; return 1;
+    case 0x7C: *out = VK_FORMAT_ASTC_6x5_UNORM_BLOCK; return 1;
+    case 0x7D: *out = VK_FORMAT_ASTC_6x6_UNORM_BLOCK; return 1;
+    case 0x7E: *out = VK_FORMAT_ASTC_8x5_UNORM_BLOCK; return 1;
+    case 0x7F: *out = VK_FORMAT_ASTC_8x6_UNORM_BLOCK; return 1;
+    case 0x80: *out = VK_FORMAT_ASTC_8x8_UNORM_BLOCK; return 1;
+    case 0x81: *out = VK_FORMAT_ASTC_10x5_UNORM_BLOCK; return 1;
+    case 0x82: *out = VK_FORMAT_ASTC_10x6_UNORM_BLOCK; return 1;
+    case 0x83: *out = VK_FORMAT_ASTC_10x8_UNORM_BLOCK; return 1;
+    case 0x84: *out = VK_FORMAT_ASTC_10x10_UNORM_BLOCK; return 1;
+    case 0x85: *out = VK_FORMAT_ASTC_12x10_UNORM_BLOCK; return 1;
+    case 0x86: *out = VK_FORMAT_ASTC_12x12_UNORM_BLOCK; return 1;
+    case 0x87: *out = VK_FORMAT_ASTC_4x4_SRGB_BLOCK; return 1;
+    case 0x88: *out = VK_FORMAT_ASTC_5x4_SRGB_BLOCK; return 1;
+    case 0x89: *out = VK_FORMAT_ASTC_5x5_SRGB_BLOCK; return 1;
+    case 0x8A: *out = VK_FORMAT_ASTC_6x5_SRGB_BLOCK; return 1;
+    case 0x8B: *out = VK_FORMAT_ASTC_6x6_SRGB_BLOCK; return 1;
+    case 0x8C: *out = VK_FORMAT_ASTC_8x5_SRGB_BLOCK; return 1;
+    case 0x8D: *out = VK_FORMAT_ASTC_8x6_SRGB_BLOCK; return 1;
+    case 0x8E: *out = VK_FORMAT_ASTC_8x8_SRGB_BLOCK; return 1;
+    case 0x8F: *out = VK_FORMAT_ASTC_10x5_SRGB_BLOCK; return 1;
+    case 0x90: *out = VK_FORMAT_ASTC_10x6_SRGB_BLOCK; return 1;
+    case 0x91: *out = VK_FORMAT_ASTC_10x8_SRGB_BLOCK; return 1;
+    case 0x92: *out = VK_FORMAT_ASTC_10x10_SRGB_BLOCK; return 1;
+    case 0x93: *out = VK_FORMAT_ASTC_12x10_SRGB_BLOCK; return 1;
+    case 0x94: *out = VK_FORMAT_ASTC_12x12_SRGB_BLOCK; return 1;
+    // ---- BGR 系列（0x95..0x9C）：Vulkan 有 BGR 变体，照直映射；只有 BGR5（0x96）没有对应物 ----
+    // ---- the BGR series (0x95..0x9C): Vulkan has BGR variants and they map straight across; only BGR5 (0x96) has
+    //      no counterpart
+    case 0x95: *out = VK_FORMAT_B5G6R5_UNORM_PACK16; return 1;
+    case 0x96: return 0;
+    case 0x97: case 0x98: *out = VK_FORMAT_B5G5R5A1_UNORM_PACK16; return 1;
+    case 0x99: case 0x9A: *out = VK_FORMAT_B8G8R8A8_UNORM; return 1;
+    case 0x9B: case 0x9C: *out = VK_FORMAT_B8G8R8A8_SRGB; return 1;
+    // 认不出来就不猜：报出来（设备日志里出现哪个就按那一个补），硬边界不变
+    // Unrecognised formats are not guessed but reported (whichever shows up in a device log is added then); the hard
+    // boundary is unchanged
+    default: return 0;
     }
 }
 

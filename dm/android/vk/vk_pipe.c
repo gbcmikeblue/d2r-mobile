@@ -35,7 +35,7 @@
 // count：这条绑定的元素个数，直接来自 SPIR-V（见 vk_spv.h）——不写死 1，那会是个静默假设
 // count: how many elements this binding has, straight from the SPIR-V (see vk_spv.h) -- not hardcoded to 1, which
 // would be a silent assumption
-typedef struct { uint32_t binding, count; VkDescriptorType type; VkShaderStageFlags stage; } bind_t;
+typedef struct { uint32_t binding, count; VkDescriptorType type; VkShaderStageFlags stage; int kind; } bind_t;
 
 static uint64_t g_n_dsl, g_n_lay, g_n_cpso, g_n_gpso, g_n_fail;
 
@@ -53,19 +53,26 @@ static VkShaderStageFlags stage_flag(int st) {
 // 往合并表里加一条：同号则并入阶段（类型不一致要报红——同一号两种类型是翻译产物本身有问题）
 // Add one entry to the merged table: an existing number merges its stages (a type mismatch is reported as a
 // failure -- one number with two types means the translated artifacts themselves are inconsistent)
-static int add_bind(bind_t *b, int *nb, int cap, uint32_t binding, uint32_t count, VkDescriptorType type, VkShaderStageFlags sf) {
+static int add_bind(bind_t *b, int *nb, int cap, uint32_t binding, uint32_t count, VkDescriptorType type, VkShaderStageFlags sf,
+                    const char *skey, int kind) {
     for (int i = 0; i < *nb; i++) {
         if (b[i].binding != binding) continue;
         if (b[i].type != type) {
+            // 两个阶段对同一条 binding 的解读不同：说清是哪两个着色器、各是什么种类——只报 VkDescriptorType 的数字
+            // 看不出是谁（真机上出现过一次"8 与 1"）。
+            // The two stages read the same binding differently: name the two shaders and their kinds -- reporting only
+            // the VkDescriptorType numbers leaves no way to tell who is who (the device showed "8 versus 1" once).
             static int said;
-            if (!said++) LOG("【红】binding %u 的类型不一致（%d 与 %d）：按先见到的那个建布局", binding, (int)b[i].type, (int)type);
+            if (!said++) LOG("【红】binding %u 的类型不一致：%s 说是 %s（VkDescriptorType %d），%s 说是 %s（%d）；按先见到的建布局——两个阶段不一致本身就值得查",
+                             binding, b[i].stage & VK_SHADER_STAGE_VERTEX_BIT ? "顶点" : b[i].stage & VK_SHADER_STAGE_FRAGMENT_BIT ? "片元" : "计算",
+                             vk_spv_kind_name(b[i].kind), (int)b[i].type, skey, vk_spv_kind_name(kind), (int)type);
         }
         if (count > b[i].count) b[i].count = count;   // 两个阶段各声明一个数组时取大的那个 | when both stages declare an array, keep the larger count
         b[i].stage |= sf;
         return 0;
     }
     if (*nb >= cap) return -1;
-    b[*nb].binding = binding; b[*nb].count = count ? count : 1; b[*nb].type = type; b[*nb].stage = sf;
+    b[*nb].binding = binding; b[*nb].count = count ? count : 1; b[*nb].type = type; b[*nb].stage = sf; b[*nb].kind = kind;
     (*nb)++;
     return 0;
 }
@@ -112,7 +119,7 @@ static int merge_binds(const vk_shader *const *sh, int n, bind_t *out, int cap) 
                 static int said2;
                 if (!said2++) LOG("【黄】着色器 %s 的 binding %u 种类认不出来：按存储缓冲建（可能要改 vk_spv.c）", s->key, b->binding);
             }
-            if (add_bind(out, &nb, cap, b->binding, b->count, desc_type_of(b->kind), sf) < 0) return -1;
+            if (add_bind(out, &nb, cap, b->binding, b->count, desc_type_of(b->kind), sf, s->key, b->kind) < 0) return -1;
         }
     }
     qsort(out, (size_t)nb, sizeof *out, cmp_bind);
