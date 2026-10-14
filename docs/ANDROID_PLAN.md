@@ -494,7 +494,7 @@ The next step is the replay layer itself (`nvn_vk.c`): implementing `mtl_init` /
 - [x] Map Texture / Sampler / TextureView (format table 154/157, samplers cached by parameters, sub-views built per view; **the render-target path's views are still to be wired up**)
 - [x] Program: build `VkShaderModule` / pipelines from SPIR-V (descriptor writing and real draws work: 1.22 million draws, 83 pipelines, no failures)
 - [x] Minimal command set: `SetRenderTargets`, clear, `DrawArrays`, `DrawIndexed` (`Present` waits for M3)
-- [ ] **Acceptance**: a picture appears (a solid clear first, then progressively up to the main menu) -- there is **no window**, and the only way to "see" it right now is to read one frame back offscreen and write it to disk
+- [ ] **Acceptance**: a picture appears (a solid clear first, then progressively up to the main menu) -- there is **no window**; reading one frame back offscreen and writing it to disk is in place (step 13) and what it measured is that **the GPU has written no colour content at all** (step 14): **the blocker is the rendering chain itself**, not the ability to see it
 
 ### M3 — front end + touch + audio
 
@@ -569,17 +569,23 @@ The port is currently being driven from a Windows machine. These are the traps a
 
 ## 7. Next step
 
-Proceed in the order on this page; after each milestone, tick it off here and record the conclusion. **M2 is current**:
-descriptor writing and real draws work (step 10), textures and samplers resolve by NVN slot (step 11) and views are wired
-up (step 12). What follows is ordered by value:
+Proceed in the order on this page; after each milestone, tick it off here and record the conclusion. **M2 is at step 14
+now**: descriptor writing and real draws ✓ (step 10), textures and samplers resolved by NVN slot ✓ (step 11), views and
+**the render targets' views** ✓ (steps 12 and 14), and **the present-screenshot instrument is in place and has been used
+to reach a conclusion** ✓ (steps 13 and 14). **M2's acceptance (a picture appears) is now blocked by the rendering chain
+itself** -- the GPU has written no colour content. What follows is ordered by value:
 
-1. Get `p_set_rt`'s views into the shadow state -- the device reading "0 sub-views created" points exactly here (the
-   views that limit mip levels or layers belong to render targets, and the SET_RT path still passes the base view), and
-   handle "an attachment whose view limits the mip range has a different size" with it;
-2. **Read one frame back offscreen and write it to disk** -- with no window this is the only way to "see" the picture
-   (the judgment is already measured: this window had `ReadTexels` read a GPU-written texture 0 times, so it is still a
-   debugging tool rather than a functional gap);
-3. Docs and cleanup to wrap up.
+1. **Fix where the vertex data lands** -- the warning `vertex attribute N (... at position N) has a component type that
+   disagrees with the shader: format NxN vs shader float` says the vertex stream and the format may be paired up wrongly;
+   geometry collapsing entirely is the most likely reason for "draws issued, nothing lands" (pick the stream from the type
+   the shader declares first, then check the stride and offset);
+2. **Fix the descriptors falling back to blanks** -- `combined image sampler: writing a blank texture` (the handle source
+   that `res.json` calls `cbuf_slot=-N`) and `uniform buffer: no buffer address`; both leave the shader reading an empty
+   texture or empty constants;
+3. **Scan again once those are fixed** -- `DM_NVN_SHOT_SCAN` answers directly with "has content or not", so there is no
+   more guessing (it is already the instrument for the "you look, I change" loop: pictures and the report land in the same
+   directory);
+4. Docs and cleanup to wrap up (including the interface-description-table code that is no longer called).
 
 ---
 
@@ -606,6 +612,10 @@ up (step 12). What follows is ordered by value:
 | Front-end sig=11 | Root cause: a **96 KB guest thread stack**, sized for the original libc, was overrun by the host's bionic (the push landed on the PROT_NONE page below the stack) -> `MapMemory` opens a 1 MB margin on the side the stack grows. After the fix: **5285 frames over 177 seconds with no crash**, and the graceful SIGTERM shutdown completes |
 | Replay submission machinery | Eight rotating slots with fences and a command stream interpreter (a small program shaped like the Metal one); CPU-visible effects fire in fence order. 4179 frames on the device with no crash |
 | Op distribution, measured | About 8 million ops per window: `BIND_STATE` 27.8% / `BIND_UBO` 21.9% / `STENCIL` 10.3% / `BIND_TEX` 5.3% / `BIND_VBUF` 5.2% (the top five are 70.5%, all of them state and resource binds) |
+| Render targets' views land | `p_set_rt`'s `cview/dview` enter the shadow state: sub-views **0 -> 33**, 34,193 hits; the render area is clamped to the attachment (1600x900 against 800x450 on the device, exactly one level apart) |
+| Present-screenshot chain | A self-contained minimal PNG writer plus a driver-side readback and `mtl_present`; `DM_NVN_SHOT/ALL/SCAN` share Apple's names and meanings. The device wrote a 1600x900 PNG (5,761,403 bytes) that opens after being pulled |
+| Two real bugs the screenshot exposed | (1) a swapchain texture **has no guest memory** (the driver owns it) so the texture layer refused an image and the render-target path **skipped it in silence** (now registered as storage ownership); (2) **an attachment that cannot produce an image used to be skipped in silence** (now it speaks up). `COPY_T2T` landed along the way (its first one on the device is a full-screen 1600x900) |
+| **Step 14: the measured conclusion** | At frames 300 and 800, each scan covered 64 textures of 256x256 or larger: the readable colour targets are **all zero** and the present texture is **all white** -> **the GPU has written no colour content**; the blocker is the rendering chain (two warnings point at where vertex data lands and at descriptors falling back to blanks) |
 
 **Next, in the order the measurements dictate (including what is done)**
 
@@ -616,8 +626,10 @@ up (step 12). What follows is ordered by value:
 5. The pipeline layer ✓ (step 9 below: descriptor set layouts, pipeline layouts, compute pipelines, graphics pipelines);
 6. The replay layer's shadow binding storage plus the state interpretation -> really issuing `DRAW` / `DRAW_IDX` ✓ (step 10 here: 1.22 million draws on the device, 83 pipelines, no failures);
 7. Textures and samplers resolved by NVN slot ✓ (step 11 here: decoded exactly from the handle, 520k bound, "sampler id not found" 0);
-8. Views land ✓ (step 12 here: sub-views built per view; **the render-target path is still to be wired up**);
-9. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it) -- **next**.
+8. Views land ✓ (step 12 here);
+9. **The render targets' views** into the shadow state ✓ (step 14 here: sub-views 0 -> 33, 34,193 hits; the render area is clamped to the attachment);
+10. **Read one frame back offscreen** and write it to disk ✓ (step 13 here: the picture really lands on disk, a valid 5,761,403-byte PNG that opens after being pulled);
+11. Use it to ask "where is the picture" ✓ (step 14 here: **no colour content** -> the blocker becomes the rendering chain: where vertex data lands, and descriptors falling back to blanks).
 
 One **known latent issue** is recorded in the commit message: on Android `crash.c` always passes `is_write = 0`, and the dirty-page fault hook looks at that bit first, so a write to a write-protected page inside a pool walks into the crash path. The crash report already prints the faulting instruction encoding, which is what a correct read/write decision needs.
 
@@ -835,3 +847,52 @@ has a different size" along with it.
 **The same device run measured that judgment too**: `ReadTexels read a GPU-written texture 0 times` -- this window never
 reads back a GPU-written texture, so "read back through the VkImage" is still only a **debugging tool** rather than a
 functional gap (the offscreen screenshot rides on it).
+
+### M2 step 13: the present-screenshot chain (self-contained minimal PNG + driver-side readback + present/on-demand shots)
+
+**This step exists so that the picture can be seen at all**: M2's acceptance is "a picture appears", and with no window
+(that arrives in M3) the only way is to read a frame back to disk. Four pieces: (1) **`vk_png.c`, a self-contained minimal
+PNG writer** (8-bit RGBA, DEFLATE stored blocks, no dependencies), because the picture has to land as a file that opens
+directly and Android cannot link Apple's imaging frameworks; (2) **`vk_tex_grab_ser`, a driver-side readback** (copy into
+a host-visible buffer and map it) complementing "read the pool directly", since once the GPU has written a texture the
+pool is no longer the truth; (3) **`mtl_present` landing** -- the guest hands over the **swapchain texture** when it
+presents, the **authoritative** answer to "which picture does the game mean to show" (no guessing among hundreds of render
+targets); (4) `DM_NVN_SHOT=<frame>:<path>`, `DM_NVN_SHOT_ALL`, `DM_NVN_SHOT_SCAN` and `dm_gfx_shot_at`, sharing Apple's
+**names and meanings**, so scripts and know-how carry over.
+
+**On the device the picture really lands on disk** -- `screenshot 1600x900 format 0x25 -> shot_900.png 成功`, 5,761,403
+bytes = 1600x900x4 plus a PNG header, and it opens after being pulled. And its very first use **exposed two real bugs**
+(both fixed): (1) **a window (swapchain) texture has no guest memory** (the driver owns its storage) while the texture
+layer refuses to build an image without memory, so the render-target path only **skipped it in silence**; "window texture"
+is now a kind of **storage-ownership registration** (`vk_tex_mark_window_ser`, reported by the guest when it builds a
+window) and such a texture still gets an image, skips the upload and enters as "the GPU has written it"; (2) **an
+attachment that cannot produce an image used to be skipped in silence** -- exactly why (1) stayed hidden so long, and now
+it speaks up. **`COPY_T2T`** landed along the way (texture-to-texture copy, previously a counting stub); its very first
+one on the device is a **full-screen 1600x900**, which is precisely how "move the picture into a texture" works.
+
+### M2 step 14: the measured conclusion -- **the GPU has written no colour content** (where M2's acceptance actually stands)
+
+With the instrument in place, the first question asked of it was "where is the picture", and the answer is **there is
+none** (two scans, at frames 300 and 800, 64 textures of 256x256 or larger each):
+
+| What was looked at | Result |
+|---|---|
+| Readable colour render targets (serial 28 `RGBA16F`, serial 23 `B10G11R11`, both 1600x900) | **all zero** (raw peak 0.000) |
+| The present texture (swapchain serials 5/6/7) | **all white** (mean luminance 255, the same at frames 300 and 900) |
+| Why the other 62 large textures cannot be read | **not one of them is a picture**: BC3 compressed (format 138), depth/stencil, `R32_UINT` integer, `R16_UNORM` single channel |
+
+**Conclusion**: close to **a million draws** are issued in that window and **not one pixel lands** in any target, so what
+blocks progress is **the rendering chain itself**, not the ability to see it (the same readback chain has already produced
+a valid 1600x900 PNG). Two warnings in the same log point at the causes:
+
+- `combined image sampler: writing a blank texture (res.json says cbuf_slot=-N ...)` and
+  `uniform buffer: no buffer address (address N, slot resolution N): writing a blank`
+  -> descriptors **fall back to blanks in large numbers**: the shader samples an empty texture and reads empty constants;
+- `vertex attribute N (... at position N) has a component type that disagrees with the shader: format NxN vs shader float`
+  -> the vertex stream a format lands on may be wrong, and the geometry may collapse entirely.
+
+**Also worth recording**: so that a scan is actually usable, the readback covers the formats this device really uses (8-bit
+RGBA/BGRA, `RGBA16F`, `RGBA16_UNORM`, `RGBA32F`, `B10G11R11_UFLOAT` -- the numbers were **checked against the NDK header**,
+not guessed); every screenshot reports **mean/min/max luminance** (so "white" and "black" are numbers in the log); caching
+the staging buffer took each readback from about 0.45 s to negligible; and a scan only covers 256x256 and up (a picture
+cannot be a 16x24 sprite, and every read waits on the queue once).
