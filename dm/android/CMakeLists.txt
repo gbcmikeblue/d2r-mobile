@@ -63,6 +63,9 @@ add_library(dmhost_android STATIC
   # Minimal PNG writer (self-contained, no dependencies): a present screenshot has to land on disk as a file that can
   # be looked at directly, see vk_png.h
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_png.c
+  # 窗口/交换链/上屏（M3）：让宿主这一个设备也能把画面上到手机屏上，见 vk_win.h
+  # Window, swapchain and present (M3): let the host's single device put a picture on the phone screen, see vk_win.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
   ${HOST_SRC}
   ${DM}/host/entry.S

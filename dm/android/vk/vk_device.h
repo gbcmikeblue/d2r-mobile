@@ -13,6 +13,19 @@
 void vk_device_init(void);
 
 // 没建起来就返回 VK_NULL_HANDLE | returns VK_NULL_HANDLE when bring-up failed
+// 窗口（M3）：装成 APK 之后才有。**必须在 vk_device_init 之前**告诉它 —— 因为"能不能上屏"决定了实例要不要开
+// 安卓 surface 扩展、设备要不要开交换链扩展、以及挑哪个队列族（要能呈现）。控制台宿主不调它，一切照旧。
+// The window (M3): only exists once installed as an APK. It **must be handed over before vk_device_init** -- whether
+// presenting is possible decides if the instance enables the Android surface extension, if the device enables the
+// swapchain extension, and which queue family is picked (it has to support presenting). The console host never calls
+// this, so nothing changes there.
+void vk_device_set_window(void *native_window);   // ANativeWindow*（用 void* 让这个头保持平台无关）| ANativeWindow* (void* keeps this header platform neutral)
+void *vk_device_window(void);
+void vk_device_make_surface(void);                // 实例已在、窗口刚设好时（重）建 surface | (re)create the surface when the instance exists and a window was just set
+void vk_device_drop_surface(void);                // TERM_WINDOW：销毁 surface 并清掉窗口 | TERM_WINDOW: destroy the surface and clear the window
+VkSurfaceKHR vk_dev_surface(void);                // 没窗口时为 VK_NULL_HANDLE | VK_NULL_HANDLE when there is no window
+int vk_dev_present_family(void);                  // 能呈现的队列族；-1 = 没有 | the queue family that can present; -1 = none
+
 VkInstance vk_instance(void);
 VkDevice vk_dev(void);
 VkQueue vk_queue(void);

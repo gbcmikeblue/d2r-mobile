@@ -9,6 +9,15 @@
 // has VK_KHR_external_memory_fd (the memory overlay needs it to export Vulkan memory as an fd) and does not
 // have VK_EXT_external_memory_host (see M2 step 3 in docs/ANDROID_PLAN). Enabling one that is absent makes
 // vkCreateDevice fail, so everything is looked up before it is enabled.
+// 安卓 surface / VK_KHR_swapchain（M3 的窗口要用）：**这个宏必须排在所有包含之前** —— vk_device.h 自己会把
+// vulkan.h 带进来，而 vulkan.h 的包含卫一旦生效，后面再定义这个宏就没有 `VkAndroidSurfaceCreateInfoKHR` 那一批
+// 类型了（踩过一次：编译报的全是"未声明的类型"，看不出是宏位置的问题）。这个文件是安卓专有的，定义它没有副作用。
+// Android surface / VK_KHR_swapchain (needed by the M3 window): **this macro has to come before every include** --
+// vk_device.h pulls in vulkan.h itself, and once vulkan.h's include guard is set, defining the macro later leaves the
+// `VkAndroidSurfaceCreateInfoKHR` family undeclared (learned the hard way: the compiler only says "unknown type name",
+// which does not point at the macro's position). This file is Android-only, so defining it has no side effects.
+#define VK_USE_PLATFORM_ANDROID_KHR 1
+#include <android/native_window.h>   // ANativeWindow（surface 的窗口类型）| ANativeWindow, the surface's window type
 #include "vk_device.h"
 #include "dm.h"
 #include <stdlib.h>
@@ -27,6 +36,9 @@ static int g_fill_non_solid;                   // 非实心多边形模式（线
 static int g_attr_divisor, g_attr_divisor_zero; // 顶点流每实例步进 > 1 / 可为 0 | per-instance vertex stream step > 1 / may be 0
 static int g_aniso;                            // 各向异性过滤（采样器用）| anisotropic filtering (for samplers)
 static VkExtensionProperties *g_exts; static uint32_t g_nexts;
+static void *g_window;                         // 窗口（M3）：有它才开 surface / 交换链 / 呈现队列 | the window (M3): with it, surface, swapchain and the present queue are enabled
+static VkSurfaceKHR g_surf;
+static int g_present_fam = -1;                 // 能呈现的队列族；-1 = 没有 | the queue family that can present; -1 = none
 
 VkInstance vk_instance(void) { return g_inst; }
 VkDevice vk_dev(void) { return g_dev; }
@@ -34,6 +46,30 @@ VkQueue vk_queue(void) { return g_queue; }
 uint32_t vk_queue_family(void) { return g_qfi; }
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void) { return &g_mem; }
 uint32_t vk_zero_copy_type(void) { return g_zero_copy; }
+
+void vk_device_set_window(void *w) { g_window = w; }
+// 窗口换代（TERM_WINDOW 之后再 INIT_WINDOW）：旧的 surface 必须销毁，否则第二次拿到的窗口和旧 surface 对不上。
+// 实例已经建好时，这里就地（重）建 surface —— 因为 vk_device_init 只会跑一次（g_tried），不能指望它再来一遍。
+// A new window (INIT_WINDOW after TERM_WINDOW): the old surface must be destroyed, or the second window will not match
+// it. When the instance already exists the surface is (re)created right here, since vk_device_init only ever runs once
+// (g_tried) and cannot be relied on to do it again.
+void vk_device_drop_surface(void) {
+    if (g_surf) { vkDestroySurfaceKHR(g_inst, g_surf, NULL); g_surf = VK_NULL_HANDLE; }
+    g_window = NULL;
+    g_present_fam = -1;
+}
+void vk_device_make_surface(void) {
+    if (!g_inst || !g_window || g_surf) return;
+    VkAndroidSurfaceCreateInfoKHR sci = { .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+                                          .window = (ANativeWindow *)g_window };
+    if (vkCreateAndroidSurfaceKHR(g_inst, &sci, NULL, &g_surf) != VK_SUCCESS) {
+        LOG("【红】由 ANativeWindow 建 surface 失败：窗口那一条退掉，其余照旧");
+        g_window = NULL;
+    } else LOG("[vk] 界面就绪：surface 建好（窗口 %p）", g_window);
+}
+void *vk_device_window(void) { return g_window; }
+VkSurfaceKHR vk_dev_surface(void) { return g_surf; }
+int vk_dev_present_family(void) { return g_present_fam; }
 
 int vk_have_ext(const char *name) {
     for (uint32_t i = 0; i < g_nexts; i++) if (!strcmp(g_exts[i].extensionName, name)) return 1;
@@ -101,8 +137,17 @@ void vk_device_init(void) {
     VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "dmhost-android",
                              .apiVersion = VK_API_VERSION_1_1 };
     VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai };
+    // 有窗口就开安卓 surface 那两个实例扩展（**必须在建实例时就开**，所以窗口要在 init 之前告诉它）
+    // With a window, the two Android surface instance extensions are enabled (they **must** be enabled at instance
+    // creation, which is why the window has to be handed over before init)
+    const char *iext[4]; uint32_t niec = 0;
+    if (g_window) { iext[niec++] = "VK_KHR_surface"; iext[niec++] = "VK_KHR_android_surface"; }
+    ici.enabledExtensionCount = niec;
+    ici.ppEnabledExtensionNames = niec ? iext : NULL;
     VkResult r = vkCreateInstance(&ici, NULL, &g_inst);
     if (r != VK_SUCCESS) { LOG("【红】建 Vulkan 实例失败：VkResult %d", (int)r); g_inst = VK_NULL_HANDLE; return; }
+
+    vk_device_make_surface();   // 有窗口就建 surface（同一个函数也用于"实例已在、窗口刚设好"那种情况）| build the surface when there is a window (the same function serves the "instance exists, window just set" case)
 
     uint32_t n = 0;
     if (vkEnumeratePhysicalDevices(g_inst, &n, NULL) != VK_SUCCESS || !n) { LOG("【红】没有 Vulkan 设备"); return; }
@@ -125,7 +170,18 @@ void vk_device_init(void) {
     VkQueueFamilyProperties *qf = calloc(nq, sizeof *qf);
     vkGetPhysicalDeviceQueueFamilyProperties(g_phys, &nq, qf);
     g_qfi = UINT32_MAX;
-    for (uint32_t i = 0; i < nq; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { g_qfi = i; break; }
+    // 有窗口就先找「既能画又能上屏」的族（真机上是同一个）；找不到不硬上，退回图形族并说清代价
+    // With a window, look for the family that can both draw and present first (the same one on the device); if there is
+    // none it does not force it, falling back to the graphics family and saying what that costs
+    if (g_surf) {
+        for (uint32_t i = 0; i < nq; i++) {
+            VkBool32 pres = VK_FALSE;
+            vkGetPhysicalDeviceSurfaceSupportKHR(g_phys, i, g_surf, &pres);
+            if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && pres) { g_qfi = i; g_present_fam = (int)i; break; }
+        }
+        if (g_qfi == UINT32_MAX) LOG("【黄】没有「既能画又能上屏」的队列族：交换链会建不出来");
+    }
+    if (g_qfi == UINT32_MAX) for (uint32_t i = 0; i < nq; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { g_qfi = i; break; }
     free(qf);
     if (g_qfi == UINT32_MAX) { LOG("【红】没有图形队列族"); return; }
 
@@ -167,6 +223,14 @@ void vk_device_init(void) {
     // 各向异性过滤：采样器要用（NVN 的 aniso 参数直接对应 Vulkan 的 maxAnisotropy），问一下再开
     // Anisotropic filtering: samplers need it (NVN's aniso maps straight to Vulkan's maxAnisotropy); ask first
     g_aniso = core.samplerAnisotropy ? 1 : 0;
+
+    // 有 surface 就要开交换链扩展（同样先查再开：设备没有就别开，否则 vkCreateDevice 直接失败）
+    // With a surface the swapchain extension is enabled (again looked up first: enabling one that is absent makes
+    // vkCreateDevice fail outright)
+    if (g_surf) {
+        if (vk_have_ext("VK_KHR_swapchain")) en[nec++] = "VK_KHR_swapchain";
+        else { LOG("【红】设备没有 VK_KHR_swapchain：交换链建不出来"); g_surf = VK_NULL_HANDLE; }
+    }
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,

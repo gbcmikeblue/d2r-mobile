@@ -524,6 +524,17 @@ and what it does not is an A/B measurement**:
 | `allow` (granted) | ✗ `errno 13` | **✓ works** | ✓ |
 | `default` (not granted) | ✗ `errno 13` | ✗ `errno 1` (EPERM) | ✓ |
 
+**Second piece: the window and the game share one device (working)** -- the first version's window built **its own** Vulkan
+set inside the app (instance, device, swapchain), but **textures cannot cross between two devices**, so "the window shows
+the texture the game drew" was impossible. The window's Vulkan now belongs to the host: `vk_device_set_window()` hands the
+window over **before** `vk_device_init()` (which decides whether the instance enables the Android surface extension,
+whether the device enables `VK_KHR_swapchain`, and which queue family is picked), the swapchain and present moved into
+`vk_win.c`, and the app only "paints one frame of host-memory RGBA8 and hands it over". On the device: `libdm.so` grew
+from 245 KB to **322 KB** (the host is linked in) and the picture is a **scaled, centred test pattern** (1600x900 fitted
+into 1156x2510, leaving black bars top and bottom), which shows that presenting really goes through the host's single
+device. That present path is also exactly the one the next step's texture viewer will take: host pixels ->
+`vk_win_present_rgba` -> the phone screen.
+
 In other words: **it does not buy write access to `/data/local/tmp`** (that path is SELinux's `shell_data_file` and no
 permission reaches it), and what it does buy is "**data in a place the user can see and replace with a file manager at any
 time**" (`/sdcard/d2rm`, the very fallback path the entry already knows).
