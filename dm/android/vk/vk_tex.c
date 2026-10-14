@@ -302,23 +302,27 @@ typedef struct {
 static ent_t *g_tab; static int g_cap, g_n;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static VkCommandPool g_pool; static VkCommandBuffer g_cb;
+static VkCommandBuffer g_cb_up;   // 上传专用的那条（见下面"两条，各管一段"）| the upload-only one (see "two of them, one per section" below)
 
 // 读回（以及对照清除）**必须串行**：读回会被**两个线程**同时发起 —— 出图/扫描在客体线程、查看器在前端线程 ——
 // 而它们共用同一块常驻中转缓冲（`stg_get`，会销毁重建）与同一块命令缓冲（`g_cb`）。早先只锁了"队列提交"那一段，
 // 于是"一边在录命令，另一边把中转缓冲销毁重建/映射"直接踩进未定义行为：真机现场是
 // `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0`（用到了一个已经销毁或还没映射成的指针）。这把锁覆盖从
 // "拿中转缓冲"到"读完解映射"整段。
-// **上传不在里面**：调用方持着 `g_mu` 调上传，而这把锁与 `g_mu` 的顺序是 `one_mu → g_mu`，上传一拿就成环
-//（真机：启动停住、出图 0 次）。上传要脱离这条，得用自己的命令缓冲，见「M3-2n」。
+// **上传不在里面**：上传走**自己那条命令缓冲**（`g_cb_up`），所以它既不需要这把锁、也不会与读回相撞
+//（为什么必须这样分，见下面"两条，各管一段"）。曾经把上传也纳进来，结果是锁序反转：调用方持着 `g_mu` 调上传，
+// 而这把锁的顺序是 `one_mu → g_mu`，一拿就成环 —— 真机表现是"启动就停住、出图 0 次"（「M3-2n」第三节）。
 // Readbacks (and the control clear) **must be serialised**: a readback can be started by **two threads** at once --
 // present/scan on the guest thread, the viewer on the front-end thread -- and they share one resident staging buffer
 // (`stg_get`, which destroys and recreates it) and one command buffer (`g_cb`). Only the "queue submit" stretch used to
 // be locked, so "one side records commands while the other destroys/recreates/maps the staging buffer" went straight
 // into undefined behaviour: the device's scene is `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0` (a pointer that had been
 // destroyed or never mapped). This lock spans "take the staging buffer" through "unmap after reading".
-// **Uploads are not in it**: the caller holds `g_mu` when it uploads, and this lock orders as `one_mu -> g_mu`, so an
-// upload taking it would form a cycle (on the device: a stall at boot, zero presents). Uploads need their own command
-// buffer to leave this path -- see "M3-2n".
+// **Uploads are not in it**: uploads run on **their own command buffer** (`g_cb_up`), so they neither need this lock nor
+// collide with the readback (why the split is mandatory is in "two of them, one per section" below). Folding uploads in
+// once produced a lock-order inversion -- the caller holds `g_mu` when it uploads while this lock orders as
+// `one_mu -> g_mu`, which forms a cycle -- showing on the device as "a stall at boot with zero presents" (part three of
+// "M3-2n").
 static pthread_mutex_t g_one_mu = PTHREAD_MUTEX_INITIALIZER;
 static void one_lock(void) { pthread_mutex_lock(&g_one_mu); }
 static void one_unlock(void) { pthread_mutex_unlock(&g_one_mu); }
@@ -384,38 +388,53 @@ static ent_t *find_slot(uint64_t serial, int create) {
     }
 }
 
-// ---------- 一次性的命令缓冲（上传用）----------
-// ---------- one-off command buffer (for uploads) ----------
-static int one_begin(void) {
+// ---------- 一次性命令缓冲：**两条，各管一段** ----------
+// ---------- one-off command buffers: **two of them, one per section** ----------
+// `g_cb` 给**读回与对照清除**，`g_cb_up` 给**上传**。为什么必须分开：读回会被**两个线程**同时发起（查看器 /
+// 出图·扫描），所以那一段有自己的一把锁（`g_one_mu`）；而上传这条路的调用方 `tex_of` 正**持着 `g_mu`**，
+// **不能**再拿读回那把锁 —— 那会形成锁序反转，真机表现是"**启动就停住、出图 0 次**"（「M3-2n」第三节）。
+// 两条命令缓冲各管一段之后，"谁跟谁共用一块缓冲"这件事就不存在了；剩下要串行的只有"队列提交"，而那一段
+// 本来就有队列锁。
+// `g_cb` serves the **readback and the control clear**, `g_cb_up` serves **uploads**. Why they must be separate: a
+// readback can be started by **two threads** at once (viewer / present-scan) so that section has its own lock
+// (`g_one_mu`), while the upload path's caller `tex_of` holds **`g_mu`** and therefore **cannot** take that lock --
+// doing so inverts the order, which on the device is "**a stall at boot with zero presents**" (part three of "M3-2n").
+// With two command buffers there is no buffer sharing left to reason about, and the only thing that still needs
+// serialising -- the queue submit -- has the queue lock already.
+static int one_begin_on(VkCommandBuffer *slot) {
     vk_device_init();
     if (vk_dev() == VK_NULL_HANDLE) return 0;
     if (!g_pool) {
         VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk_queue_family() };
         if (vkCreateCommandPool(vk_dev(), &pci, NULL, &g_pool) != VK_SUCCESS) return 0;
+    }
+    if (!*slot) {
         VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = g_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-        if (vkAllocateCommandBuffers(vk_dev(), &ai, &g_cb) != VK_SUCCESS) return 0;
+        if (vkAllocateCommandBuffers(vk_dev(), &ai, slot) != VK_SUCCESS) { *slot = VK_NULL_HANDLE; return 0; }
     }
-    if (vkResetCommandBuffer(g_cb, 0) != VK_SUCCESS) return 0;
+    if (vkResetCommandBuffer(*slot, 0) != VK_SUCCESS) return 0;
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    return vkBeginCommandBuffer(g_cb, &bi) == VK_SUCCESS;
+    return vkBeginCommandBuffer(*slot, &bi) == VK_SUCCESS;
 }
-static int one_end(void) {
-    if (vkEndCommandBuffer(g_cb) != VK_SUCCESS) return 0;
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_cb };
+static int one_end_on(VkCommandBuffer cb) {
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) return 0;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
     // 提交与"等队列空闲"是一件事（一次性命令缓冲的语义），整段拿队列锁（见 vk_device.h）
     // The submit and the queue-idle wait are one thing for a one-off command buffer, so the whole span takes the
     // queue lock (see vk_device.h)
-    vk_queue_note("上传：一次性提交 + 等空闲");
+    vk_queue_note("一次性提交 + 等空闲");
     vk_queue_lock();
     if (vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) { vk_queue_unlock(); return 0; }
     VkResult r = vkQueueWaitIdle(vk_queue());
     vk_queue_unlock();
-    if (r != VK_SUCCESS) { LOG("【红】上传命令等待失败 VkResult %d", (int)r); return 0; }
+    if (r != VK_SUCCESS) { LOG("【红】一次性提交等待失败 VkResult %d", (int)r); return 0; }
     return 1;
 }
+static int one_begin(void) { return one_begin_on(&g_cb); }        // 读回 / 对照清除 | readback / control clear
+static int one_end(void) { return one_end_on(g_cb); }
 
 // ---------- 建 / 上传 ----------
 static int ent_build(const tex_t *t, ent_t *e) {
@@ -506,17 +525,17 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     void *smap = NULL;
     if (vkMapMemory(vk_dev(), sm, 0, VK_WHOLE_SIZE, 0, &smap) != VK_SUCCESS) { vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
 
-    // **上传这里不能拿 `g_one_mu`**：调用方 `tex_of` 正**持着 `g_mu`** 调进来，而读回那边是 `one_mu → g_mu`
-    // （见 `vk_tex_grab_ser`）—— 两边凑起来就是锁序反转。真机现场是**启动就停住、`出图 0 次`**，看门狗只报
-    // `拍 0`，看着像"游戏卡了"，其实是两把锁互相等。要真正消掉"上传与读回共用 `g_cb`"这条，得让上传**用自己的
-    // 命令缓冲**，那是**下一处改动**（见 docs/ANDROID_PLAN 的「M3-2n」），本轮不夹带。
-    // **Uploads must not take `g_one_mu` here**: the caller `tex_of` holds **`g_mu`** when it calls in, while the
-    // readback path is `one_mu -> g_mu` (see `vk_tex_grab_ser`) -- together that is a lock-order inversion. On the
-    // device it shows as a **stall right at boot with zero presents**, the watchdog reporting only "beat 0", which
-    // looks like "the game hung" but is really two locks waiting on each other. Actually removing the `g_cb` sharing
-    // between uploads and readbacks needs uploads to have **their own command buffer**, which is the **next change**
-    // (see "M3-2n" in docs/ANDROID_PLAN) and is deliberately not carried along with this one.
-    if (!one_begin()) { vkUnmapMemory(vk_dev(), sm); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
+    // **上传走自己那条命令缓冲（`g_cb_up`），也不拿 `g_one_mu`**。两件都要：调用方 `tex_of` 正**持着 `g_mu`** 调进来，
+    // 而读回那边是 `one_mu → g_mu` —— 上传若去拿读回那把锁就是锁序反转，真机表现是"**启动就停住、出图 0 次**"
+    // （「M3-2n」第三节，踩过一次）；而"共用一块命令缓冲"这件事，由"各用各的"直接消掉。于是这里既不需要锁，
+    // 也不会与读回那条路相撞。剩下要串行的只有队列提交，那一段本来就有队列锁。
+    // **Uploads use their own command buffer (`g_cb_up`) and do not take `g_one_mu`.** Both are needed: the caller
+    // `tex_of` holds **`g_mu`** when it calls in, while the readback path is `one_mu -> g_mu`, so an upload taking the
+    // readback's lock would invert the order -- on the device, "**a stall at boot with zero presents**" (part three of
+    // "M3-2n"; walked into once). And "sharing one command buffer" disappears by construction once each section has its
+    // own, so this site needs no lock and cannot collide with the readback path. The only thing left to serialise is the
+    // queue submit, which has the queue lock already.
+    if (!one_begin_on(&g_cb_up)) { vkUnmapMemory(vk_dev(), sm); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
     // 拷贝前的布局转换：新建是 UNDEFINED，目标 TRANSFER_DST
     // Layout transition before the copy: newly created is UNDEFINED, the target is TRANSFER_DST
     VkImageMemoryBarrier b0 = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -524,7 +543,7 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = e->img,
         .subresourceRange = { aspect, 0, e->levels, 0, e->layers },
         .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
-    vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
+    vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
 
     VkDeviceSize off = 0; int ok = 1;
     for (uint32_t l = 0; l < e->levels && ok; l++) {
@@ -537,7 +556,7 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
             VkBufferImageCopy r = { .bufferOffset = off, .bufferRowLength = 0, .bufferImageHeight = 0,
                 .imageSubresource = { aspect, l, layer, 1 },
                 .imageOffset = { 0, 0, 0 }, .imageExtent = { w, h, 1 } };
-            vkCmdCopyBufferToImage(g_cb, stg, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            vkCmdCopyBufferToImage(g_cb_up, stg, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
             off += (VkDeviceSize)row_bytes * rows * (slices ? slices : 1);
         }
     }
@@ -546,8 +565,8 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
-    int done = ok && one_end();
+    vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
+    int done = ok && one_end_on(g_cb_up);
 
     vkUnmapMemory(vk_dev(), sm);
     vkDestroyBuffer(vk_dev(), stg, NULL);

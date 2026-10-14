@@ -637,11 +637,11 @@ at frame 50, **0 with content**). The "the viewer reads content at level 1" foun
 a **wrong pitch**, and with the pitch fixed both sides agree (part six of "M3-2m") -- **step 14's conclusion stands**;
 what changed is that the instrument is now trustworthy. What follows is ordered by value:
 
-1. **Get uploads off `g_cb`** (part four of "M3-2n") -- the readback's concurrency crash is **fixed** ("M3-2n"), but
-   uploads still share the one-shot command buffer with readbacks; giving uploads **their own command buffer** is what
-   makes this loop clean as a whole. **Mind the lock order**: the upload path is `tex_of` holding **`g_mu`** calling in, so
-   it must not be given "the same lock as the readback" -- that is exactly the "looks like a hung game" deadlock in part
-   three of "M3-2n".
+1. **Chase that device loss** (part two of "M3-2o" and part six of "M3-2l") -- `【红】一次性提交等待失败 VkResult -4` is
+   still **sporadic** (about once per run), followed by a hundred-plus `贴图上传失败` lines. Uploads **are already** off
+   the shared command buffer ("M3-2o") and it did not go away, so the cause lies elsewhere: the next candidate is "**who
+   loses it first**", the guest's own commands or this one one-shot submit of ours (what else was on the queue at that
+   moment, and whether the guest had already lost the device on its side).
    The level-by-level scan is **already in** (part six): 33 level reads at frame 50, **0 with content**. The next round has
    to scan a **later frame** -- this device normally stalls at 55-60 presents, so the scan points have to sit inside what
    it can actually reach (50/54/57, say), or "scanned" and "never got there" cannot be told apart;
@@ -1317,6 +1317,31 @@ two consecutive runs with **no `CRASH`**; the viewer read **301 / 361 times** su
 the scan did **33 level reads** each (frames 50 and 54), and presents reached **50 / 56** before falling on **this
 device's usual stall** (`CharacterCreate:Hover:Barbarian`) -- the "look at the picture" loop is usable again, and the
 stall is unrelated to it.
+
+### M3-2o: uploads get **their own command buffer** -- a real hazard removed; the device loss did **not** go with it (2026-10-14, device)
+
+The item left open by part four of "M3-2n": uploads shared one one-shot command buffer (`g_cb`) with readbacks. This round
+moves uploads to `g_cb_up` (`one_begin_on` / `one_end_on` take the slot; `one_begin` / `one_end` stay with the readback
+and the control clear). **Two threads recording into one command buffer** is undefined behaviour in itself and is now
+gone by construction; uploads therefore also **no longer need** the readback's lock (the premise of the lock-order
+inversion in part three of "M3-2n" disappears with it).
+
+**1. Readings after the change** (Redmi K90 / Adreno 830, `DM_WIN_SRC=28`, `DM_WIN_LEVEL=1`, level-by-level scan, three
+consecutive runs): **no `CRASH`** in any of them; the viewer read **541 / 661 / 361 times** successfully (concurrent with
+the guest); the level-by-level scan behaved; the stall is still this device's usual one (`CharacterCreate:Hover:Barbarian`,
+with one run at `MainMenuHD:CheckUpdateLinks`). The upload path reported **no failures**: `deswizzle failed` 0,
+`VkImage creation failed` 0, `texture memory alloc/bind failed` 0, `VkImageView creation failed` 0.
+
+**2. But that device loss did **not** go away**: one run still shows `【红】一次性提交等待失败 VkResult -4`
+(-4 = `VK_ERROR_DEVICE_LOST`) **once**, followed by **110** `贴图上传失败` lines. In other words, **"sharing a command
+buffer" was not its cause** -- the frequency looks unchanged after the split (the old build: 1 per run in two runs; the new
+build: 1 in three runs; the sample is far too small to claim more than "no change"). Item 4 of "next steps" **stays**, but
+one candidate has now been **ruled out**.
+
+**3. A trap of my own (recorded for the record)**: I renamed the log line in `one_end` to "一次性提交等待失败" while the
+tally was still counting the old string `上传命令等待失败` -- so the first pass read "0 lines", and only just failed to
+record "not fixed" as "fixed". **Changing a log line's text changes the measuring stick**: the script that reads it has to
+change too, or count both strings before concluding.
 
 ---
 
