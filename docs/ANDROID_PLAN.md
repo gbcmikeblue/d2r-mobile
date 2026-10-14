@@ -597,10 +597,64 @@ After each milestone, tick it off here and record the conclusion.
 | Replay submission machinery | Eight rotating slots with fences and a command stream interpreter (a small program shaped like the Metal one); CPU-visible effects fire in fence order. 4179 frames on the device with no crash |
 | Op distribution, measured | About 8 million ops per window: `BIND_STATE` 27.8% / `BIND_UBO` 21.9% / `STENCIL` 10.3% / `BIND_TEX` 5.3% / `BIND_VBUF` 5.2% (the top five are 70.5%, all of them state and resource binds) |
 
-**Next, in the order the measurements dictate**
+**Next, in the order the measurements dictate (including what is done)**
 
-1. Turn the bind ops into **shadow state** (70% of the stream; binds only record state and cost almost nothing);
-2. Land `SET_RT` / `CLEAR` / `DRAW` / `DRAW_IDX` as real render passes (low frequency, but they decide the picture);
-3. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it).
+1. Turn the bind ops into **shadow state** ✓ (70% of the stream; binds only record state and cost almost nothing);
+2. The texture layer ✓ (format table, serial-keyed table, deswizzle upload, direct CPU read);
+3. Render-state shadow plus the pass machinery ✓ (`CLEAR` reaches the GPU for the first time);
+4. Shader loading ✓ (step 8 below) -> next, land `DRAW` / `DRAW_IDX` as real pipelines (pipeline layout, descriptor sets, vertex input);
+5. **Read back one frame offscreen** and write it to disk to confirm the picture (there is no window yet, so this is the only way to "see" it).
 
 One **known latent issue** is recorded in the commit message: on Android `crash.c` always passes `is_write = 0`, and the dirty-page fault hook looks at that bit first, so a write to a write-protected page inside a pool walks into the crash path. The crash report already prints the faulting instruction encoding, which is what a correct read/write decision needs.
+
+### M2 step 8: shader loading (verified artifact by artifact on a device)
+
+**The key uses the same algorithm as the Apple side**: the first 16 hex digits of `sha256(control segment, 0x880 bytes)`
+(that is exactly what `prog_get` in `nvn_mtl.m` computes). At run time `nvnProgramSetShaders` receives the control-segment
+pointer and the replay layer derives the key the artifacts are named by. **This nearly became a blocker**: the Android
+compat layer's `CC_SHA256` was a **placeholder** (fixed-length zero output), which would give every shader the same key and
+make not a single pipeline buildable; it is now a real FIPS 180-4 implementation, checked against the standard vectors on
+a device (`dm/android/tests/t_digest.c`, seven out of seven).
+
+**The reflection comes from a different place than on Apple.** Apple reads `<key>_b.json` from `dmsh_build.py` (MSL types,
+the c1 segment, driver-segment reads -- things only Metal's argument buffers need); Android reads `<key>.res.json` straight
+from the translator (`tools/dmsh_xlate`). That file says exactly one thing: **which guest resource each SPIR-V binding
+corresponds to** (the c slot of a uniform buffer, a storage buffer's address at `c[cb_slot][cb_offset]`, where a
+texture/sampler handle comes from), which is precisely the minimum needed to build descriptor sets. The repository has no C
+JSON reader (`nvn_refl.h` goes through Foundation), so a tiny scanner rides along: it serves only this machine-generated,
+regular format and picks fields out in a single pass.
+
+**On-device self-check** (`dm/android/vk/vk_shader_probe.c` really creates a `VkShaderModule` for every `<key>.spv` in the
+directory and parses the matching json):
+
+```
+[green] shader artifacts ready: /data/local/tmp/dm/spv (6923 .spv, 6923 .res.json)
+stage split: vertex 2343, pixel 4556, compute 22, other 2
+bindings: uniform 34890, storage 11379, texture/image 44156 (across 6923 shaders)
+loaded: 6923 ok, 0 missing, 0 broken        took 8.5 s
+all SPIR-V accepted by this driver, all reflection parsed
+```
+
+**This retires a large risk**: the Adreno 830 rejected none of the 6,923 translated SPIR-V modules. If a pipeline fails
+from here on, only the state machinery can be at fault.
+
+**Offline cross-check**: the artifact file names against the `dm_ctl_sha16` column of `shader_map.tsv` -- 6927 keys in the
+table versus 6923 artifacts, with **stage counts agreeing almost exactly** (table: vertex 2344 / pixel 4559 / compute 22 /
+hull 1; artifacts: vertex 2343 / pixel 4556 / compute 22 / other 2), which shows the key and stage derivation is the same
+scheme as the shipped table. The five keys the table has but no artifact exists for are **logged and counted** by the replay
+layer as designed (the hard boundary is unchanged).
+
+**How the artifacts get onto the device (all three ways measured, Redmi K90 / f2fs)**:
+
+| way | local prep | push | extract on device | per deploy |
+|---|---|---|---|---|
+| push the full set (20,770 files / 665 MB) | 0 | 37.1 s (1.8 ms/file, 17.9 MB/s) | 0 | 37 s |
+| push the runtime subset (13,847 / 606 MB) | 0 | ~25 s | 0 | ~25 s |
+| **push a cached tar** (616 MB, one file) | 60 s once (cacheable) | **5.0 s** (122 MB/s) | **1.9 s** | **~7 s** |
+| prewarm subset (the 179 shaders of `pso_manifest` / 358 files) | 0 | **1.4 s** | 0 | 1.4 s |
+
+Three counter-intuitive points: **many small files are not slow** (1.8 ms/file, 37 s for 20,770 of them); **one big file is
+about 7x faster** (122 vs 17.9 MB/s), so a tar pays off only when deploying **repeatedly**; and **extraction is nearly free**
+(13,848 files in 1.9 s, f2fs plus toybox tar). The two ways are indistinguishable at run time -- both end up as ordinary
+files with the same names -- so **no packing or indexing code was written for either**. The cached tar lives at
+`.work/spv.tar` (covered by `.gitignore`; it contains shaders and must never enter the repository).

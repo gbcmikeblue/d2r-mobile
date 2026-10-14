@@ -56,6 +56,7 @@ add_library(dmhost_android STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_tex.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
   ${HOST_SRC}
   ${DM}/host/entry.S
@@ -118,6 +119,16 @@ target_include_directories(vk_hostmem_probe PRIVATE ${COMPAT})
 add_executable(t_digest ${CMAKE_CURRENT_SOURCE_DIR}/tests/t_digest.c)
 target_link_options(t_digest PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(t_digest PRIVATE ${COMPAT})
+
+# 着色器产物的自检：把每一个 <键>.spv 都真的建成 VkShaderModule、解析同名的 res.json。
+# 这是"建管线"之前唯一能独立验的两件事——驱动收不收这份 SPIR-V、反射解析对不对。
+# Self-check of the shader artifacts: create a VkShaderModule for every <key>.spv and parse the matching
+# res.json. These are the only two things verifiable independently before pipelines exist -- whether the driver
+# accepts the SPIR-V and whether the reflection parses.
+add_executable(vk_shader_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c)
+target_link_libraries(vk_shader_probe PRIVATE vulkan)
+target_link_options(vk_shader_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk_shader_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DM}/host ${COMPAT})
 
 add_executable(vk_fdmap_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_fdmap_probe.c)
 target_link_libraries(vk_fdmap_probe PRIVATE vulkan)
