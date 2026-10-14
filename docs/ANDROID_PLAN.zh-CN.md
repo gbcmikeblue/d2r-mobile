@@ -534,6 +534,13 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
 - **多步命令写成 `.bat` / `.cmd` 再执行**，不要在 PowerShell 里拼 `cmd /c "..."`（引号嵌套极易出错）。
 - 需要"收集全部错误"时用 `ninja -k 0`，输出重定向到日志后再统一分析。
 - **`sdkmanager` 已被官方弃用**，且在无 TTY 环境下无法接受许可；改用 `android sdk install`（启动时展示 ToS 后自动接受）。
+- **XML 注释里不能出现 `--`**。`AndroidManifest.xml` 的注释里写了英文破折号 `--`，aapt2 报的是
+  `AndroidManifest.xml:10: error: not well-formed (invalid token)` —— 报的行号在注释中间，看不出是注释的错。
+- **本机打 APK 不走 gradle**（没有 gradle、PATH 上也没有 java，但装了 JDK 21）：用
+  `aapt2 link`（要 `platforms/android-<ver>/android.jar`）→ 把 `lib/arm64-v8a/*.so` 以**不压缩**方式写进包
+  （PowerShell 的 `ZipArchive` 就能做）→ `zipalign -p 4` → `apksigner sign`（要 `JAVA_HOME`，密钥用
+  `keytool` 生成、只放在 `.work` 里）。清单里 `android:hasCode="false"` 时**不需要 dex**，于是整条链不需要
+  一行 Java。脚本：`dm/android/apk/build_apk.cmd` 与 `install_apk.cmd`。
 
 ## 七、下一步
 

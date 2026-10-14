@@ -566,6 +566,15 @@ The port is currently being driven from a Windows machine. These are the traps a
 - **Write multi-step commands as `.bat` / `.cmd` and run those**, rather than assembling `cmd /c "..."` inside PowerShell (quote nesting breaks easily).
 - To **collect all errors**, use `ninja -k 0` and redirect to a log, then analyse it.
 - **`sdkmanager` is deprecated** and cannot accept licences without a TTY; use `android sdk install` instead (it accepts the ToS automatically after showing it).
+- **An XML comment may not contain `--`**. With an English em-dash written as `--` inside `AndroidManifest.xml`'s comment,
+  aapt2 reports `AndroidManifest.xml:10: error: not well-formed (invalid token)` -- and the line number points into the
+  middle of the comment, so it does not look like the comment's fault.
+- **APKs on this machine are built without gradle** (there is no gradle and no java on PATH, but JDK 21 is installed): use
+  `aapt2 link` (which needs `platforms/android-<ver>/android.jar`), write `lib/arm64-v8a/*.so` into the package
+  **uncompressed** (PowerShell's `ZipArchive` can do that), then `zipalign -p 4` and `apksigner sign` (which needs
+  `JAVA_HOME`; the key is made with `keytool` and kept under `.work` only). With `android:hasCode="false"` in the
+  manifest **no dex is needed**, so the whole chain needs no Java source at all. Scripts: `dm/android/apk/build_apk.cmd`
+  and `install_apk.cmd`.
 
 ## 7. Next step
 
