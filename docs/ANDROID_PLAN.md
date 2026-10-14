@@ -228,6 +228,80 @@ Established and ruled out so far:
 
 **Next step (disassembly route)**: the SDK's `Panic` helper is only reached through function pointers, so the caller must be found by address in the sdk (`adrp/ldr` to fetch the table entry, then `blr`) and followed back to the failing check; at the same time `0x1f` (by ordinal likely `GetSystemTickFrequency` and friends) and `0x21` should be implemented in `hle_svc.c` according to their semantics instead of staying placeholders.
 
+### M1 wrap-up: the root cause was not the SDK but how the host is linked (2026-10-14)
+
+Using the repository's own symbol-aware disassembler `dm/tools/sdis.py` (it annotates with dynsym and PLT
+import names) to resolve the backtrace cracked the whole chain at once:
+
+```
+nninitInitializeSdkModule
+└→ nndiagStartup                     <- goes through the PLT, so the host's forced take-over should have replaced it
+   └→ nn::lm::Initialize             <- connect to the lm log service
+      └→ nn::lm::CreateLogServiceByHipc
+         └→ nn::sf::hipc::InitializeHipcServiceResolution
+            └→ AbortImpl → VAbortImpl → svcBreak
+```
+
+`nndiagStartup` was in the host's take-over list all along ("connect to the lm log service; diagnostics go
+straight to the host's output") and `force` reported "all hit" -- but **it was not in the table at all**.
+Dumping both registry sections and comparing:
+
+| | swforce | swhle |
+|---|---|---|
+| sum over all object files | 263 entries | 55 entries |
+| actually in the binary | **80 entries** | **1 entry** |
+
+The cause is **the on-demand extraction of a static library**. Inside `libdmhost_android.a`, `hle_sdkinit.c`
+(the seven service-layer take-overs) and `hle_table.c` (the libc passthrough table) contribute **nothing but
+registry entries** -- they hold only `static` functions and `static const` table entries and define no
+external symbol, so the linker considers the whole member useless and never pulls it in. `--gc-sections`
+was already turned off in the previous section, so this was not GC but the archive extraction rule.
+
+On Apple the `Makefile` compiles every `.c` straight into the executable **without a static library**, so
+every translation unit is present -- **this is the last piece of "works on Apple, panics on Android"**.
+
+The fix (`dm/android/CMakeLists.txt`): link with `-Wl,--whole-archive ... -Wl,--no-whole-archive` to pull
+every member in. Measured after the fix: 264 / 64 entries, and `nndiagStartup` is back in the table.
+
+**Device result after the fix**:
+
+```
+[dm] init take-over: nndiagStartup (no-op)          <- all seven service-layer take-overs now apply
+[dm] init take-over: oe::Initialize (no-op)
+[dm] init take-over: aoc::Initialize (no-op)
+[dm] init take-over: err::InitializeContextWriterApi (no-op)
+[dm] init take-over: fs::InitializeForApplication (no-op)
+[dm] init take-over: pctl::Initialize (no-op)
+[dm] init take-over: diag::InitializeApplicationAbortObserver (no-op)
+[dm] >>> nninitStartup
+[dm] SetHeapSize: first heap set succeeded, 3728 MB (application pool 3797 MB - images 68 MB; 34 earlier refusals)
+[dm] main: DT_INIT +0x30 (852 init_array entries)
+[dm] sdk: DT_INIT +0x30 (115 init_array entries)
+[dm] save flush throttle: main+0x20cefa8 30 -> 3 s
+[dm] >>> nnMain                                    <- M1's goal
+[dm] fs mount $: -> .../RomFS (read-only); ^: -> .../temp
+[dm] ToCalendarTime: first conversion ... (time zone CST, offset 28800 s)
+[dm] nnMain returned
+```
+
+In other words: **on Android the host loads the rewritten output, relocates it, applies every
+service-layer take-over, finishes SDK initialisation and enters `nnMain`.** It returns immediately
+because M1 has no graphics backend (`front_metal_layer()` is NULL and NVN runs on the null device), so the
+guest's first real act -- creating a window / swapchain -- finds nothing and it exits. That is exactly
+what M2 supplies.
+
+The `svcBreak` handler was strengthened too: besides the SDK message buffer it prints any of x0..x7 that
+look like pointers to a printable string (`VAbortImpl`'s signature is exactly expr/file/func/line), so an
+abort shows the assertion text directly.
+
+**How M1 is deployed on the device** (currently): the `dmhost` produced by the `dm/android/build` target and
+the rewriter's output are pushed with `adb push` to `/data/local/tmp/dm/{dmhost, patched/}`, then
+`./dmhost ./patched main sdk` is run from `/data/local/tmp/dm`. Packaging an APK waits until after M2, when
+there is something to show.
+
+**M1 conclusion**: the acceptance criterion -- "the host runs and the log shows the game's `UNIMPL` lines" --
+is met, and exceeded all the way to `nnMain`. Next comes M2.
+
 ### M2 — minimal Vulkan replay layer (the largest item)
 
 - [ ] Vulkan skeleton: device, queue, `ANativeWindow` swapchain

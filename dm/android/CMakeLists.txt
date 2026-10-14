@@ -81,7 +81,25 @@ target_compile_options(dmhost_android PRIVATE -w)
 # user); the goal is the game's UNIMPL lines showing up in the log. Packaging an APK is left until
 # after M2, when there is something to show.
 add_executable(dmhost_android_bin ${CMAKE_CURRENT_SOURCE_DIR}/main_android.c)
-target_link_libraries(dmhost_android_bin PRIVATE dmhost_android)
+# --whole-archive 是必须的，不是优化：静态库默认只抽取「能解决某个未定义符号」的成员，而宿主里有一批
+# 编译单元**只**贡献登记项（hle_sdkinit.c 的服务层接管、hle_table.c 的 libc 直通表）——它们只有 static
+# 函数与 static const 表项，不对外定义任何符号，于是整个成员不会被拉进来，登记段里就少了它们。
+# 实测：不加这一对开关时，各目标文件合计 swforce 263 条 / swhle 55 条，成品只剩 80 条 / 1 条，
+# 结果 nndiagStartup 等 7 条服务层接管全部失效、SDK 初始化在 nn::lm 那里 Panic。
+# 苹果那边是 Makefile 把所有 .c 直接编进可执行文件、不经静态库，所以每个编译单元都在——这正是
+# 「苹果能跑、安卓崩」的最后一块拼图。
+# --whole-archive is required here, not an optimisation: a static library only extracts the members that
+# resolve some undefined symbol, and the host has translation units that contribute nothing but registry
+# entries (hle_sdkinit.c's service-layer take-overs, hle_table.c's libc passthrough table) -- they hold
+# only static functions and static const table entries and define no external symbol, so the whole member
+# is never pulled in and the registry sections lose them.
+# Measured: without this pair, the object files add up to 263 swforce / 55 swhle entries while the binary
+# keeps only 80 / 1, which kills all seven service-layer take-overs including nndiagStartup and makes SDK
+# initialisation panic inside nn::lm. On Apple the Makefile compiles every .c straight into the executable
+# without a static library, so every translation unit is there -- this is the last piece of "works on
+# Apple, panics on Android".
+target_link_libraries(dmhost_android_bin PRIVATE
+  -Wl,--whole-archive dmhost_android -Wl,--no-whole-archive)
 set_target_properties(dmhost_android_bin PROPERTIES OUTPUT_NAME dmhost)
 # 安卓 15 起要求 16 KiB 页对齐；显式声明以免在新设备上装不上 / 跑不起来
 # Android 15 and later require 16 KiB page alignment; state it explicitly so the binary loads on

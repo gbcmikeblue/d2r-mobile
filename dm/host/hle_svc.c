@@ -221,6 +221,21 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx 缓冲 %#llx+%#llx \"%s\"", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr,
             (unsigned long long)regs[1], (unsigned long long)regs[2], txt);
+        // 中止的实参（断言文本 / 文件名 / 函数名）通常还在 x0..x7 里：只看 reason 与 Result 判不出是哪条检查报的，
+        // 把前 8 个寄存器里像指针且指向可打印字串的那些一并打出来（nn::diag::detail::VAbortImpl 的签名就是
+        // expr/file/func/line，所以这几条字串基本可以直接当结论用）。
+        // The abort's actual arguments (assertion text / file name / function name) are usually still in
+        // x0..x7: reason plus Result alone do not say which check failed, so print the first eight
+        // registers that look like pointers to a printable string (VAbortImpl's signature is exactly
+        // expr/file/func/line, so these strings can be read as the conclusion).
+        char args[768]; int an = 0;
+        for (int i = 0; i < 8; i++) {
+            const char *s = (const char *)(uintptr_t)regs[i];
+            if ((uintptr_t)s < 0x1000) continue;
+            int n = 0; while (n < 96 && s[n] >= 32 && s[n] < 127) n++;
+            if (n >= 4 && (n == 96 || s[n] == 0)) an += snprintf(args + an, sizeof args - an, " x%d=\"%.96s\"", i, s);
+        }
+        if (an) LOG("Break 实参：%s", args);
         dm_backtrace(regs[29]);
         if (regs[0] & 0x80000000ull) return 0;   // 仅通知，可继续 | notification only, can continue
         _exit(42);

@@ -240,6 +240,63 @@ English: [ANDROID_PLAN.md](ANDROID_PLAN.md)
 
 **下一步（反汇编路线）**：sdk 的 `Panic` 小函数只被函数指针间接调用，所以要在 sdk 里按地址反查调用者（`adrp/ldr` 取表项后 `blr`），顺藤摸到真正失败的那处检查；同时把 `0x1f`（按序号推断为 `GetSystemTickFrequency` 一类）与 `0x21` 在 `hle_svc.c` 里按语义实现，而不是继续占位。
 
+### M1 收尾：根因不在 SDK，在宿主的链接方式（2026-10-14）
+
+用仓库自带的**带符号反汇编工具** `dm/tools/sdis.py`（用 dynsym 与 PLT 导入名标注）解析回溯，一次把整条链解了出来：
+
+```
+nninitInitializeSdkModule
+└→ nndiagStartup                      ← 走 PLT，本应被宿主的强制接管换掉
+   └→ nn::lm::Initialize              ← 连 lm 日志服务
+      └→ nn::lm::CreateLogServiceByHipc
+         └→ nn::sf::hipc::InitializeHipcServiceResolution
+            └→ AbortImpl → VAbortImpl → svcBreak
+```
+
+`nndiagStartup` 本来就在宿主的接管清单里（「连 lm 日志服务；诊断日志改由宿主直接输出」），`force` 也报「全部命中」——但**它根本没进表**。把 `swforce` / `swhle` 两段 dump 出来对比：
+
+| | swforce | swhle |
+|---|---|---|
+| 各目标文件合计 | 263 条 | 55 条 |
+| 成品里实际有 | **80 条** | **1 条** |
+
+原因：**静态库的按需抽取**。`libdmhost_android.a` 里，`hle_sdkinit.c`（7 条服务层接管）与 `hle_table.c`（libc 直通表）**只贡献登记项**——里面只有 `static` 函数与 `static const` 表项，不对外定义任何符号，链接器因此认为整个成员无用，**根本不会把它拉进来**。`--gc-sections` 已按上一节关掉，所以这不是 GC 的问题，是静态库的抽取规则。
+
+苹果那边是 `Makefile` 把所有 `.c` 直接编进可执行文件、**不经静态库**，所以每个编译单元都在——**这就是「苹果能跑、安卓崩」的最后一块拼图**。
+
+改法（`dm/android/CMakeLists.txt`）：链接时用 `-Wl,--whole-archive … -Wl,--no-whole-archive` 把库成员全部拉进来。修完实测 264 条 / 64 条，`nndiagStartup` 回到表里。
+
+**修完的真机结果**：
+
+```
+[dm] init 接管：nndiagStartup（空操作）            ← 7 条服务层接管全部生效
+[dm] init 接管：oe::Initialize（空操作）
+[dm] init 接管：aoc::Initialize（空操作）
+[dm] init 接管：err::InitializeContextWriterApi（空操作）
+[dm] init 接管：fs::InitializeForApplication（空操作）
+[dm] init 接管：pctl::Initialize（空操作）
+[dm] init 接管：diag::InitializeApplicationAbortObserver（空操作）
+[dm] >>> nninitStartup
+[dm] SetHeapSize：首次设堆成功 3728 MB（应用内存池 3797 MB − 映像 68 MB；此前被拒 34 次）
+[dm] main: DT_INIT +0x30（init_array 852 项）
+[dm] sdk: DT_INIT +0x30（init_array 115 项）
+[dm] 存档落盘节流：main+0x20cefa8 30 → 3 秒
+[dm] >>> nnMain                                    ← ★ M1 的目标
+[dm] fs 挂载 $: → …/RomFS（只读）；^: → …/temp
+[dm] ToCalendarTime：首次换算 …（时区 CST，偏移 28800 秒）
+[dm] nnMain returned
+```
+
+也就是：**宿主在安卓上装载改写产物、重定位、把服务层全部接管、跑完 SDK 初始化、进了 `nnMain`。** `nnMain` 随即返回，是因为 M1 没有图形后端（`front_metal_layer()` 为 NULL、NVN 走空设备），客体第一件事实质上就是建窗口 / 交换链，拿不到东西就退出了——这正是 M2 要补的。
+
+顺带把 `svcBreak` 的处理加强了：除 SDK 消息缓冲外，还打印 x0..x7 里「像指针且指向可打印字串」的实参（`VAbortImpl` 的签名正是 expr/file/func/line），崩溃时能直接看到断言文本。
+
+**M1 的真机部署方式**（当前）：产物目录 `dm/android/build` 里出的 `dmhost` 与改写产物用 `adb push` 推到
+`/data/local/tmp/dm/{dmhost, patched/}`，然后在 `/data/local/tmp/dm` 下执行 `./dmhost ./patched main sdk`。
+打成 APK 留到 M2 之后（那时才有画面）。
+
+**M1 结论**：验收判据「宿主跑起来、日志出现游戏的 `UNIMPL`」已达成，并超出到 `nnMain`。下一步进入 M2。
+
 ### M2 —— 最小 Vulkan 回放层（最大工作量）
 
 - [ ] 搭 Vulkan 骨架：设备、队列、`ANativeWindow` 交换链
