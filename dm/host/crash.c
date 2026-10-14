@@ -26,6 +26,7 @@ static char g_watch_stage[2][256] = {"启动", "启动"};
 static unsigned g_watch_stall;
 static void (*g_dump_hook)(void);
 static void (*g_wait_dump)(void);
+static void (*g_stall_sample)(void);   // 定义在后面（diag.c 注册）；看门狗要用，所以在这里先声明 | Defined further down (registered by diag.c); declared here because the watchdog uses it
 
 static uint64_t watch_now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -66,6 +67,7 @@ static void *watchdog_main(void *arg) {
             int idx = atomic_load(&g_watch_stage_idx);
             LOG("【红】看门狗：第 %llu 秒起无进展，卡在 拍 %u / 阶段 %s", (unsigned long long)sec,
                 atomic_load(&g_watch_tick), g_watch_stage[idx]);
+            if (g_stall_sample) g_stall_sample();   // 先取一次 PC（在转储之前：转储很长，抢在后面容易看不出来）| Take one PC sample first (before the dump: the dump is long and this is easy to lose behind it)
             if (g_dump_hook) g_dump_hook();
             if (g_wait_dump) g_wait_dump();   // 图形侧所有阻塞等待点的状态（nvn_mtl.m / nvn_vk.c 初始化时注册） | State of all blocking wait points on the graphics side (registered when nvn_mtl.m / nvn_vk.c initializes)
             // 退出前给日志一点时间：安卓那边宿主 stderr 是**管道**，落盘由另一条线程（app 的日志泵）做，
@@ -94,6 +96,15 @@ void crash_off(const char *tag, uint64_t a) {   // diag.c 也用 | Also used by 
     Dl_info di;
     if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
     else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+    // 没有符号名的动态库（安卓厂商驱动正是如此：dladdr 只给路径）也要报出**哪个 .so + 偏移**——一串裸地址
+    // 分不清是驱动、libc 还是我们自己（真机上 "pc=0x79b6…" 这种就是它）。
+    // A dynamic library without symbols (Android vendor drivers are exactly like that: dladdr gives only the path) must
+    // still report **which .so plus the offset** -- a bare address does not tell the driver from libc from our own code
+    // (the "pc=0x79b6..." lines on the device are this case).
+    else if (dladdr((void *)a, &di) && di.dli_fname) {
+        const char *b = strrchr(di.dli_fname, '/'); b = b ? b + 1 : di.dli_fname;
+        fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", b, (unsigned long long)(a - (uint64_t)di.dli_fbase));
+    }
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
 // 帧指针回溯：x29 链 [fp]=上一帧 fp、[fp+8]=返回地址；只走 8 字节对齐、单调上升的帧
@@ -139,9 +150,17 @@ static int (*g_trap_hook)(ucontext_t *uc);
 void crash_set_trap_hook(int (*fn)(ucontext_t *uc)) { g_trap_hook = fn; }
 void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
 void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
+// 卡住时的一次性采样（diag.c 注册）：给"在用户态空转"的线程各发一次信号、把 pc 取出来。
+// 为什么单独一个钩子：它的**时机**很讲究——要在"已经判定卡住"之后、转储之前跑，且只能跑一次；
+// 常开的 DM_SAMPLE 采样在安卓上会落在 svc 里（见 dialg.c 里那段实测说明），不能代替它。
+// One-shot sampling when stalled (registered by diag.c): send each thread spinning in user mode one signal and read its pc.
+// Why a separate hook: its **timing** matters -- it has to run after "stalled" has been decided and before the dumps,
+// and only once; the always-on DM_SAMPLE sampler lands on an svc on Android (see the measurements in diag.c) and cannot
+// replace it.
+void crash_set_stall_sample(void (*fn)(void)) { g_stall_sample = fn; }
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
-void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_stall_sample) g_stall_sample(); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
 // 崩在客体地址上时，把 /proc/self/maps 里覆盖该地址的那一行打出来。
 // 理由：安卓没有 ESR 的读写位（见 dm_uctx.h），光看寄存器分不清「这一页根本没映射」还是「这一页被写保护」——
 // 两者的修法完全不同（前者是宿主没铺到那页，后者是脏页跟踪的缺页钩子没接住），所以现场必须带上这一行。

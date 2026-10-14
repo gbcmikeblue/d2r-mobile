@@ -31,21 +31,29 @@ VkDevice vk_dev(void);
 VkQueue vk_queue(void);
 uint32_t vk_queue_family(void);
 
-// 队列的外部同步。Vulkan 要求 vkQueueSubmit / vkQueueWaitIdle / vkQueuePresentKHR / vkAcquireNextImageKHR
-// 对**同一个 VkQueue** 由调用方串行化，而这里天然是两个线程在用同一条队列：客体在后台线程提交（回放层），
-// 前端在主线程上屏与读回。少了这把锁，驱动内部会偶发互锁，真机上看到的三种形态其实是同一件事——
-// 查看器一开就崩（主线程读回撞客体提交）、前端启动约 3 秒后不再刷新、客体跑到第 70 次出图后停住。
-// 用法：只在"提交/等待队列空闲/取图像/上屏"这几处成对加锁，别把长时间的计算或等待放进临界区。
-// External synchronisation for the queue. Vulkan requires the caller to serialise vkQueueSubmit /
-// vkQueueWaitIdle / vkQueuePresentKHR / vkAcquireNextImageKHR on **one VkQueue**, and here two threads use the same
-// queue by construction: the guest submits on a worker thread (the replay layer) while the front end presents and
-// reads back on the main thread. Without this lock the driver deadlocks intermittently, and the three shapes seen on
-// the device are really one thing: the viewer crashing the moment it is turned on (main-thread readback colliding
-// with a guest submit), the front end stopping about 3 s after start, and the guest stopping after present 70.
-// Usage: take it around submitting, waiting for the queue to go idle, acquiring an image and presenting, and never
-// around long computations or waits.
+// 窗口（前端）那条队列：能呈现的族上多要一条，取不到就退回主队列。
+// 为什么要分开：Vulkan 要求同一条队列上的提交/等待/取图/上屏由调用方串行化，而客体（后台线程）与前端（主线程）
+// 天然是两个线程。只加一把锁实测会**互相堵死**：客体在队列调用里等驱动时仍持锁，前端就卡在取锁上（真机现场：
+// 在用户态空转的线程 pc 在 libc、返回点 = vk_win_present_rgba+0x260，前端的 1 秒心跳同时消失）。
+// 分成两条队列后，两边各用各的，谁都不用等谁；只有退回同一队列时才需要那把锁。
+// The window (front end) queue: ask for a second one on the presenting family, falling back to the main queue.
+// Why separate: Vulkan requires submit / queue-idle waits / image acquisition / present on one queue to be serialised by
+// the caller, and the guest (worker thread) and the front end (main thread) are two threads by construction. A single
+// lock was measured to **deadlock them**: while the guest waits for the driver inside a queue call it still holds the
+// lock, so the front end sits on the lock (device scene: the user-mode spinning thread had its pc in libc with a return
+// address of vk_win_present_rgba+0x260, and the front end's one-second heartbeat stopped at the same time). With two
+// queues each side uses its own and neither waits for the other; the lock is needed only in the fallback case.
+VkQueue vk_queue_win(void);
+
+// 队列的外部同步（说明见上面）：提交 / 等队列空闲 / 取图 / 上屏都走它。
+// 调用方在**取锁前**用 vk_queue_note 说明自己要干什么：卡住时现场导出会打出"谁持有、在做什么"。
+// External synchronisation for the queue (see above): submit / queue-idle waits / image acquisition / present take it.
+// Callers use vk_queue_note **before** locking to say what they are about to do; a stall dump then prints who holds the
+// lock and what for.
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
+void vk_queue_note(const char *phase);
+int vk_queue_lock_state(char *buf, size_t cap);   // 写一行"持有者 tid / 在做什么"；返回 1 = 有人持有 | Writes one line "holder tid / what for"; 1 = held
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void);
 
 // 在满足 need_bits 的类型里找属性最贴近 want 的一个；找不到返回 UINT32_MAX。

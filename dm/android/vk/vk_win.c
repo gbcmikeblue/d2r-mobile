@@ -130,6 +130,7 @@ void vk_win_shutdown(void) {
     // Tearing the window down waits for the whole device to go idle while the guest thread is still submitting: take
     // the queue lock first to keep queue work out (full device-level serialisation is not done yet; this covers the
     // queue side, and window teardown is rare).
+    vk_queue_note("窗口拆除：等设备空闲");
     vk_queue_lock();
     vkDeviceWaitIdle(vk_dev());
     vk_queue_unlock();
@@ -205,27 +206,25 @@ int vk_win_present_rgba(const uint8_t *rgba, uint32_t w, uint32_t h) {
     vkUnmapMemory(vk_dev(), g_smem);
 
     vkWaitForFences(vk_dev(), 1, &g_fence, VK_TRUE, UINT64_MAX);
-    // 取图像与上屏都要与客体线程的提交串行（见 vk_device.h）：这条队列是共用的。
-    // 交换链那张图只有我们碰，所以"锁 + 一次取图"不会与客体的活互相等。
-    // Acquiring an image and presenting must be serialised against the guest thread's submits (see vk_device.h): the
-    // queue is shared. Only this side touches the swapchain images, so "lock plus one acquisition" cannot make the
-    // guest's work wait on us in turn.
-    vk_queue_lock();
+    // 前端走**自己的那条队列**（能呈现的族上的第二条，见 vk_device.h）：这样取图/上屏不必与客体的提交争一把锁。
+    // 只有退回同一条队列时才加锁 —— 实测共用一条时两边会互相堵死（客体在队列调用里等驱动仍持锁 → 前端卡在取锁上）。
+    // The front end uses **its own queue** (the second one on the presenting family, see vk_device.h), so acquiring and
+    // presenting do not contend for a lock with the guest's submits. The lock is taken only in the fallback case where
+    // both share one queue -- measured, sharing deadlocks the two ends (the guest still holds the lock while waiting for
+    // the driver inside a queue call, so the front end sits on the lock).
+    VkQueue q = vk_queue_win();
+    int lock = q == vk_queue();
+    if (lock) { vk_queue_note("前端：取图/上屏"); vk_queue_lock(); }
     uint32_t idx = 0;
-    // 取图像**给超时**，绝不长占队列锁：屏幕关掉 / 合成器忙的时候交换链可能长时间没有可用图像，
-    // 而锁一旦被它占住，客体线程的提交就全堵在那里 —— 实测过这一幕：两端一起停住，等待点显示
-    // 客体卡在"正在录制、通道开着"，前端的 1 秒心跳也一起没了。超时就放掉这一帧，下一帧再来。
-    // Acquire **with a timeout** and never hold the queue lock through it: with the screen off, or the compositor
-    // busy, the swapchain can have no image available for a long time, and while that holds the lock every guest
-    // submit piles up behind it -- measured exactly so: both sides stopped, and the wait-point dump showed the guest
-    // stuck "recording, pass open" while the front end's one-second heartbeat was gone too. On timeout the frame is
-    // simply skipped and the next one retries.
+    // 取图像**给超时**：屏幕关掉 / 合成器忙的时候交换链可能长时间没有可用图像；共用队列时那段时间还会把客体堵住。
+    // Acquire **with a timeout**: with the screen off, or the compositor busy, the swapchain can have no image available
+    // for a long time, and when the queue is shared that also blocks the guest.
     VkResult r = vkAcquireNextImageKHR(vk_dev(), g_sc, 100000000ull, g_acq, VK_NULL_HANDLE, &idx);   // 100 ms
     // 交换链过期（窗口尺寸变了之类）：拆掉重建，这一帧就算了，下一帧自然重来
     // Out-of-date swapchain (the window was resized and such): tear down and rebuild; this frame is skipped and the next
     // one simply retries
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { vk_queue_unlock(); sc_destroy(); return 0; }
-    if (r != VK_SUCCESS) { vk_queue_unlock(); return 0; }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { if (lock) vk_queue_unlock(); sc_destroy(); return 0; }
+    if (r != VK_SUCCESS) { if (lock) vk_queue_unlock(); return 0; }
 
     // 保持比例缩放并居中，多出来的地方留黑（所以先整幅清黑）
     // Scaled to fit with the aspect preserved and centred, black around it (hence the full clear first)
@@ -278,11 +277,11 @@ int vk_win_present_rgba(const uint8_t *rgba, uint32_t w, uint32_t h) {
         .pWaitDstStageMask = &wait, .commandBufferCount = 1, .pCommandBuffers = &g_cb,
         .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rdy };
     vkResetFences(vk_dev(), 1, &g_fence);
-    if (vkQueueSubmit(vk_queue(), 1, &si, g_fence) != VK_SUCCESS) { vk_queue_unlock(); return 0; }
+    if (vkQueueSubmit(q, 1, &si, g_fence) != VK_SUCCESS) { if (lock) vk_queue_unlock(); return 0; }
     VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
         .pWaitSemaphores = &g_rdy, .swapchainCount = 1, .pSwapchains = &g_sc, .pImageIndices = &idx };
-    VkResult pr = vkQueuePresentKHR(vk_queue(), &pi);
-    vk_queue_unlock();   // 取图像 → 提交 → 上屏这一段都在锁里 | acquire -> submit -> present is the whole critical section
+    VkResult pr = vkQueuePresentKHR(q, &pi);
+    if (lock) vk_queue_unlock();   // 共用队列时：取图像 → 提交 → 上屏整段都在锁里 | when shared: acquire -> submit -> present is one critical section
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) sc_destroy();
     return 1;
 }

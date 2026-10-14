@@ -21,6 +21,7 @@
 #include "vk_device.h"
 #include "dm.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,9 +51,26 @@ uint32_t vk_queue_family(void) { return g_qfi; }
 // 做成普通互斥量即可：临界区里只有一次驱动调用，不在里面做别的活。
 // The queue's external synchronisation (see vk_device.h): one process-wide lock taken by submit / queue-idle waits /
 // image acquisition / present. A plain mutex is enough -- the critical section holds a single driver call and nothing else.
+static VkQueue g_queue_win;                    // 窗口那条队列（见 vk_device.h）；为 VK_NULL_HANDLE 时退回主队列 | the window queue (see vk_device.h); falls back to the main queue when VK_NULL_HANDLE
+VkQueue vk_queue_win(void) { return g_queue_win ? g_queue_win : g_queue; }
+
 static pthread_mutex_t g_qmu = PTHREAD_MUTEX_INITIALIZER;
-void vk_queue_lock(void) { pthread_mutex_lock(&g_qmu); }
-void vk_queue_unlock(void) { pthread_mutex_unlock(&g_qmu); }
+static _Atomic int g_qholder;                  // 持锁线程的 tid（0 = 无人持有）| tid of the lock holder (0 = free)
+static const char *volatile g_qphase;          // 它打算干什么（见 vk_queue_note）| what it is about to do (see vk_queue_note)
+void vk_queue_note(const char *phase) { g_qphase = phase; }
+void vk_queue_lock(void) {
+    pthread_mutex_lock(&g_qmu);
+    atomic_store(&g_qholder, (int)pthread_gettid_np(pthread_self()));
+}
+void vk_queue_unlock(void) {
+    atomic_store(&g_qholder, 0);
+    pthread_mutex_unlock(&g_qmu);
+}
+int vk_queue_lock_state(char *buf, size_t cap) {
+    int h = atomic_load(&g_qholder);
+    snprintf(buf, cap, h ? "持有者 tid %d（%s）" : "无人持有", h, g_qphase ? g_qphase : "?");
+    return h != 0;
+}
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void) { return &g_mem; }
 uint32_t vk_zero_copy_type(void) { return g_zero_copy; }
 
@@ -242,8 +260,22 @@ void vk_device_init(void) {
     }
 
     float prio = 1.0f;
+    // 有窗口且这个族能给出两条队列就要两条：一条客体用、一条前端用（见 vk_device.h 里"为什么分开"）。
+    // With a window, ask for two queues when the family has them: one for the guest, one for the front end (see the
+    // "why separate" note in vk_device.h).
+    uint32_t want_q = 1;
+    if (g_surf) {
+        uint32_t nq2 = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(g_phys, &nq2, NULL);
+        VkQueueFamilyProperties *all = nq2 ? calloc(nq2, sizeof *all) : NULL;
+        if (all) {
+            vkGetPhysicalDeviceQueueFamilyProperties(g_phys, &nq2, all);
+            if (g_qfi < nq2 && all[g_qfi].queueCount >= 2) want_q = 2;
+            free(all);
+        }
+    }
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                    .queueFamilyIndex = g_qfi, .queueCount = 1, .pQueuePriorities = &prio };
+                                    .queueFamilyIndex = g_qfi, .queueCount = want_q, .pQueuePriorities = &prio };
     // 开特性：核心特性走 VkPhysicalDeviceFeatures2，扩展特性走各自的特性结构，一条链挂起来
     // Enabling features: core features ride VkPhysicalDeviceFeatures2 and extension features their own structures,
     // all chained together
@@ -268,6 +300,12 @@ void vk_device_init(void) {
     r = vkCreateDevice(g_phys, &dci, NULL, &g_dev);
     if (r != VK_SUCCESS) { LOG("【红】建 Vulkan 逻辑设备失败：VkResult %d", (int)r); g_dev = VK_NULL_HANDLE; return; }
     vkGetDeviceQueue(g_dev, g_qfi, 0, &g_queue);
+    if (want_q >= 2) {
+        vkGetDeviceQueue(g_dev, g_qfi, 1, &g_queue_win);
+        LOG("[vk] 两条队列：客体用 #0、前端（取图/上屏）用 #1（各自不需要串行化）");
+    } else {
+        LOG("【黄】这个队列族只给了一条队列：前端与客体共用它，必须靠 vk_queue_lock 串行化（两边会互相等）");
+    }
 
     // 1.3 的入口从设备上取（桩库不导出，见 vk_device.h）。取不到就把动态渲染关掉，让渲染通道那一层退回只记状态。
     // Fetch the 1.3 entry points from the device (the stub library does not export them; see vk_device.h). If the

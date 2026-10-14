@@ -999,8 +999,39 @@ exactly the mean of (0, 201, 255) that the clear colour (0, 0.6, 1.0) gamma-maps
 In other words this is **not "stuck in the driver or a lock"** (that would be S + futex) but **the game itself spinning in user
 space, waiting for a job that never completes** -- the same shape as the state documented in Apple's comment (the main thread
 spinning in the job pool's "help while waiting", see the `thr_bt` note in `nvn_mtl.m`). Getting its PC is the next step:
-Android has no ptrace permission, so the way in is **signal sampling** (send `SIGPROF` to the thread, read the pc out of the
+Android has no ptrace permission, so the way in is **signal sampling** (send a signal to the thread, read the pc out of the
 `ucontext` in the handler, symbolize module + offset).
+
+**How the existing sampler (`DM_SAMPLE=<ms>[:thread]`) behaves on Android** (it is already in the repo; no code was changed,
+recorded for reference): it sends `SIGUSR2` to a thread of our own, copies pc / lr / the frame-pointer chain into a ring buffer
+in the handler, and a sampler thread symbolizes and prints. It **works** (the device produced `thr=0x1001 pc=... lr=ioctl+0xa0`,
+showing the guest main thread going in and out of syscalls at that moment), but two things need care:
+
+- at a **10 ms** interval the process hit `CRASH sig=11` **1.4 s** after start (`pc` inside libc's svc stub, so the interrupt
+  likely landed on an `svc` instruction);
+- at a **100 ms** interval the samples **stopped** after about **9 s** (the guest was never interrupted again) -- from that
+  moment the signal is either blocked by the guest or the target thread is no longer in user mode, so it cannot yet answer
+  "which function is it spinning in".
+
+Two changes would make it usable: (1) only send the signal while `/proc/self/task/<tid>/syscall` says `running` (that is, while
+the thread really is in user code); (2) symbolize host-module pcs as well (only the guest modules `main` / `sdk` are recognized
+today). Also, the frame chain in the handler goes through `vm_read_overwrite` and is always empty on Android, so no backtrace.
+
+**Both were added the same day**: (1) the always-on sampler now interrupts only while `/proc` says `running`; (2) a **one-shot
+sampler for stalls** (`crash_set_stall_sample`, called by the watchdog and by `crash_dump_now`) sends one signal each to the
+threads whose state is R and which are not inside a syscall; (3) `crash_off` now reports **which .so plus the offset** when a
+dynamic library carries no symbols (Android vendor drivers are like that; it used to print a bare address).
+**Its first run caught it**: the thread spinning in user mode was the **front end** (`thr=0`, `pc=libc.so+0x991ac`, return
+address `vk_win_present_rgba+0x260`) -- in other words it was stuck on the **queue lock** that had just been added (the guest
+still holds the lock while waiting for the driver inside a queue call, so the front end sits on it and the one-second heartbeat
+stops at the same moment).
+
+**The fix that followed**: give the window **its own queue** (a second one on the presenting family, `vk_queue_win`), so the
+front end's acquire/present no longer contends for the lock with the guest; the shared-queue plus lock path remains only for
+families that hand out a single queue. The device reads `两条队列：客体用 #0、前端（取图/上屏）用 #1` and the **front end's
+heartbeat no longer disappears**; the guest still stops at present 59, but that is now a separate guest-side matter (the
+wait-point dump shows our side idle: no pass open, 1/8 slots in flight, queue lock unheld). The lock also records "holder /
+what for" (`vk_queue_note`) and the wait-point dump prints it, so the next mutual block is visible at a glance.
 
 **A hypothesis that was disproved (worth recording so it is not walked again)**: when the device stopped at
 `CharacterCreate:Hover:Barbarian`, it looked like the guest was **loading game data and stuck on disk I/O**. Two checks were

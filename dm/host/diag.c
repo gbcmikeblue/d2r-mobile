@@ -16,6 +16,9 @@
 #include <sys/ucontext.h>
 #include "dm_uctx.h"
 #include <unistd.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>   // tgkill：按 tid 给指定线程发采样信号（pthread_kill 只认 pthread_t）| tgkill: signal a specific thread by tid (pthread_kill only takes a pthread_t)
+#endif
 #include <malloc/malloc.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
@@ -437,6 +440,9 @@ static void setlang_obs(const uint64_t *regs) {
     if (nm) atomic_store(&g_dm_lang, (int)idx);   // 我们自己的 UIKit 文字跟着换（dm_i18n.c） | our own UIKit text switches along with it (dm_i18n.c)
 }
 void probe_install(void) {
+    // 卡住时的一次性采样：注册进来给看门狗用（见 crash.c 的 crash_set_stall_sample）。
+    // One-shot sampler for stalls: registered here for the watchdog (see crash_set_stall_sample in crash.c).
+    { void crash_set_stall_sample(void (*)(void)); void crash_sample_stall(void); crash_set_stall_sample(crash_sample_stall); }
     if (gate_obs_present(OBS_SETLANG)) gate_obs_set(OBS_SETLANG, setlang_obs);
     if (gate_obs_present(OBS_EVENT_MSG)) gate_obs_set(OBS_EVENT_MSG, event_msg_obs);
     const char *ui = getenv("DM_UIMSG");
@@ -465,6 +471,45 @@ void probe_install(void) {
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }
 #endif
 }
+
+#if defined(__ANDROID__)
+// /proc 的一行读法（下面两个助手用）：成功 0、失败 -1，末尾换行去掉。
+// One-line /proc read used by the two helpers below: 0 on success, -1 on failure, trailing newline stripped.
+static int and_rd(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, cap - 1); close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0; char *nl = strchr(buf, '\n'); if (nl) *nl = 0;
+    return 0;
+}
+// 这个线程是否"在用户态空转"（/proc 的 syscall 报 running）。读不到返回 -1 —— **不拦**：宁可采错也不漏。
+// Whether a thread is "spinning in user mode" (/proc's syscall says running). -1 when unreadable -- **do not block**:
+// better to sample wrongly than to miss.
+static int and_in_user(pid_t tid) {
+    char p[64], b[128];
+    snprintf(p, sizeof p, "/proc/self/task/%d/syscall", (int)tid);
+    if (and_rd(p, b, sizeof b)) return -1;
+    return !strncmp(b, "running", 7);
+}
+// 全部"在用户态空转"的线程（状态 R 且不在系统调用里）：卡住时值得打断的正是这一批。
+// All threads "spinning in user mode" (state R and not inside a syscall): exactly the ones worth interrupting when stalled.
+static int and_spinning_tids(pid_t *out, int max) {
+    DIR *d = opendir("/proc/self/task"); if (!d) return 0;
+    struct dirent *de; int n = 0; char p[64], b[128];
+    while ((de = readdir(d)) != NULL && n < max) {
+        int tid = atoi(de->d_name); if (tid <= 0) continue;
+        snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid);
+        if (and_rd(p, b, sizeof b)) continue;
+        char *rp = strrchr(b, ')');
+        if (!rp || rp[1] != ' ' || rp[2] != 'R') continue;   // 状态 R：在跑 | state R: running
+        if (and_in_user((pid_t)tid) != 1) continue;          // 且不在系统调用里 | and not inside a syscall
+        out[n++] = (pid_t)tid;
+    }
+    closedir(d);
+    return n;
+}
+#endif
+static _Atomic unsigned g_sample_skip;   // 因"不在用户态"而跳过采样的次数 | how many samples were skipped for "not in user mode"
 
 // ---------- 采样 DM_SAMPLE=毫秒：定时打断调用 crash_sample_self() 的那个线程（客体主线程），打印 pc 与回溯 ----------
 // ---------- Sampling DM_SAMPLE=milliseconds: periodically interrupt the thread that called crash_sample_self() (the guest main thread) and print pc and backtrace ----------
@@ -506,6 +551,14 @@ static void *sampler(void *p) {
             for (int k = 0; k < n; k++) { pthread_kill(all[k], SIGUSR2); usleep(200); }
         } else {
             if (g_sample_name) { pthread_t t; if (!thr_find_by_name(g_sample_name, &t)) continue; g_sample_pt = t; }
+#if defined(__ANDROID__)
+            // 只在这个线程"确实在用户态"时才打断：实测把信号送进正在做 svc / 系统调用的线程，会把它打断在 svc 上
+            // （10 ms 那次启动 1.4 秒就 sig=11）。读不到 /proc 时不拦（-1）。
+            // Only interrupt while this thread really is in user mode: measured, delivering the signal to a thread busy
+            // inside an svc / syscall breaks it on the svc (the 10 ms run hit sig=11 1.4 s after start). When /proc
+            // cannot be read the check does not block (-1).
+            { pid_t td = pthread_gettid_np(g_sample_pt); if (td > 0 && and_in_user(td) == 0) { atomic_fetch_add(&g_sample_skip, 1); continue; } }
+#endif
             pthread_kill(g_sample_pt, SIGUSR2);
         }
         for (unsigned h = atomic_load(&g_shead); printed < h; printed++) {
@@ -523,6 +576,51 @@ void crash_sample_self(void) {
     struct sigaction sa = {.sa_sigaction = on_sample, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
     sigaction(SIGUSR2, &sa, 0);
     pthread_t t; pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(atoi(e) * 1000)); pthread_detach(t);
+}
+
+// 把环形缓冲里 [from, to) 的样本打出来（一次性采样用；常开采样那条路自己打印）。
+// Print the samples in [from, to) of the ring buffer (used by the one-shot sampler; the always-on path prints its own).
+static void sample_print_from(unsigned from, unsigned to, const char *tag) {
+    extern uint64_t g_t0_ns;
+    for (unsigned h = from; h < to; h++) {
+        unsigned i = h % SRING;
+        fprintf(stderr, "[dm] %s #%u [%.3fs] thr=%#x", tag, h + 1, (g_sring[i].t - g_t0_ns) / 1e9, g_sring[i].h);
+        off("pc", g_sring[i].pc); off("lr", g_sring[i].lr);
+        fprintf(stderr, "\n[dm] bt:"); for (int k = 0; k < g_sring[i].n; k++) off("", g_sring[i].bt[k]); fputc('\n', stderr);
+    }
+}
+static void sample_handler_install(void) {   // 只在真要采样时装一次 | installed once, only when sampling is really used
+    static int done; if (done) return; done = 1;
+    struct sigaction sa = {.sa_sigaction = on_sample, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
+    sigaction(SIGUSR2, &sa, 0);
+}
+// 卡住时的一次性采样（看门狗与 crash_dump_now 经 crash_set_stall_sample 调用）。
+// 安卓没有 ptrace，客体的 pc 只能在**发信号那一刻**从 ucontext 里取；而常开采样（DM_SAMPLE）有两处实测问题：
+// 间隔 10 ms 时打断点落在 svc 上（启动 1.4 秒 sig=11）、间隔 100 ms 时样本到 9 秒就不再产生。所以这里改成：
+// **只在真的卡住时、且这个线程确实在用户态空转（状态 R 且不在系统调用里）时**，各打一次信号，只打这一次。
+// One-shot sampling when stalled (called by the watchdog and crash_dump_now through crash_set_stall_sample).
+// Android has no ptrace, so a guest pc can only be read out of the ucontext at the moment a signal is delivered; and the
+// always-on sampler (DM_SAMPLE) showed two measured problems: at 10 ms the interrupt lands on an svc (sig=11 1.4 s after
+// start) and at 100 ms the samples stopped after 9 s. So this version sends one signal each -- once -- only when the
+// process really is stalled **and** a thread really is spinning in user mode (state R and not inside a syscall).
+void crash_sample_stall(void) {
+    sample_handler_install();
+#if defined(__ANDROID__)
+    pid_t t[8]; int n = and_spinning_tids(t, 8);
+    unsigned before = atomic_load(&g_shead);
+    for (int i = 0; i < n; i++) {
+        if (syscall(__NR_tgkill, getpid(), t[i], SIGUSR2)) fprintf(stderr, "[dm] 卡住采样：给 tid %d 发信号失败\n", (int)t[i]);
+        usleep(3000);
+    }
+    if (n) usleep(15000);
+    unsigned after = atomic_load(&g_shead);
+    fprintf(stderr, "[dm] 卡住采样：在用户态空转的线程 %d 个，新增样本 %u（此前的常开采样因不在用户态跳过 %u 次）\n",
+            n, after - before, atomic_load(&g_sample_skip));
+    if (!n) fprintf(stderr, "[dm] 卡住采样：没有「在跑且不在系统调用里」的线程 —— 那是卡在等（内核 / 锁 / 驱动），看下面的等待点\n");
+    sample_print_from(before, after, "STALLSAMPLE");
+#else
+    (void)0;   // 苹果侧 mach 那套本来就能取 PC（看门狗的现场导出里已有）| Apple already reads the PC through mach (its watchdog dump has it)
+#endif
 }
 
 // ---------- DM_INFLATE_BENCH=<样本文件>：用游戏映像里的 zlib（main 0xf3a930 inflateInit_、0xf3aa90 inflate）解同一批样本并计时 ----------

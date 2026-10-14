@@ -157,8 +157,8 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
 // 等队列空闲也要外部同步（见 vk_device.h）：这个调用随时可能从前端线程发出来。
 // Everything on the queue has completed: on Android this is simply waiting for the queue to go idle. That wait needs
 // the external synchronisation too (see vk_device.h), since it can come from the front-end thread at any moment.
-void mtl_drain(void) { if (vk_dev()) { vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
-void mtl_finish(void) { if (vk_dev()) { vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
+void mtl_drain(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（drain）"); vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
+void mtl_finish(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（finish）"); vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
 
 // 统计出参：waits 类的计数还没做（提交落地后才有），池子数是现成的事实。
 // Statistics out-parameters: the waits counters do not exist yet (they arrive with submission), the pool
@@ -789,17 +789,20 @@ static int inflight_take(void) {   // 取一个空闲槽：没有就等（单一
 void mtl_wait_state_dump(void) {
     int taken = 0;
     char slots[256]; int o = 0;
+    char qst[96];   // 队列锁现在在谁手里、它打算干什么（见 vk_device.h 的 vk_queue_note）| who holds the queue lock now and what for (see vk_queue_note in vk_device.h)
+    vk_queue_lock_state(qst, sizeof qst);
     for (int i = 0; i < MAX_INFLIGHT; i++) {
         if (g_inf[i].pending) taken++;
         o += snprintf(slots + o, sizeof slots - o, "%s%llu", i ? " " : "",
                       (unsigned long long)(g_inf[i].pending ? g_inf[i].value : 0));
     }
     LOG("[vk] 等待点：已提交到栅栏 %llu、在飞槽 %d/%d（各槽的栅栏值 %s）、正在录制的槽 %d、通道开着 %d、"
-        "提交 %llu 次、出图 %llu 次、绘制计数 %llu（有目标 %llu / 无目标 %llu）",
+        "提交 %llu 次、出图 %llu 次、绘制计数 %llu（有目标 %llu / 无目标 %llu）；队列锁 %s；窗口队列 %s",
         (unsigned long long)g_fence, taken, MAX_INFLIGHT, slots, g_cur_slot, g_rs.open ? 1 : 0,
         (unsigned long long)atomic_load(&g_sub_total), (unsigned long long)atomic_load(&g_present_n),
         (unsigned long long)atomic_load(&g_draw_skip),
-        (unsigned long long)atomic_load(&g_draw_ncN), (unsigned long long)atomic_load(&g_draw_nc0));
+        (unsigned long long)atomic_load(&g_draw_ncN), (unsigned long long)atomic_load(&g_draw_nc0),
+        qst, vk_queue_win() != vk_queue() ? "自己的（与客体分开）" : "与客体共用");
 }
 
 static int vk_sub_ready(void) {
@@ -904,6 +907,7 @@ uint64_t mtl_sub_commit(void) {
     // 客体线程的提交与前端线程的上屏/读回共用同一条队列，提交这一步必须串行化（见 vk_device.h）
     // The guest thread's submits and the front end's present and readbacks share one queue, so this submit has to be
     // serialised (see vk_device.h)
+    vk_queue_note("客体：提交命令缓冲");
     vk_queue_lock();
     r = vkQueueSubmit(vk_queue(), 1, &si, in->fence);
     vk_queue_unlock();
