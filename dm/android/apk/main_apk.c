@@ -17,6 +17,8 @@
 #include <android/log.h>
 #include <errno.h>
 #include <jni.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,12 @@
 #include <unistd.h>
 #include "vk_device.h"
 #include "vk_win.h"
+
+// 宿主那套的环境准备与 dm_main 的交接（dm/android/main_android.c）：**与 APK 必须完全一致**，所以那边只留一个实现，
+// 这里直接调它，而不是把环境准备抄一遍（抄一遍就会漂）。
+// The host's environment setup and hand-over to dm_main (dm/android/main_android.c): it **has to be identical for the
+// APK**, so that file keeps one implementation and this one calls it rather than copying the setup (a copy would drift).
+int dm_android_main(int argc, char **argv);
 
 #define TAG "dmwin"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -37,6 +45,7 @@
 #define IMG_H 900
 
 static struct android_app *g_app;
+static int g_guest_started;             // 游戏只起一次（TERM_WINDOW/INIT_WINDOW 会来回）| the game starts once (TERM_WINDOW/INIT_WINDOW come and go)
 static uint8_t *g_img;                  // 主机内存里的一帧（RGBA8）| one frame in host memory (RGBA8)
 static int g_perm_files;                // "所有文件访问"是否已授予 | whether all files access is granted
 static int32_t g_btn_x, g_btn_y, g_btn_w, g_btn_h;   // 申请按钮（**图像坐标**）| the request button, in image coordinates
@@ -45,6 +54,67 @@ static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+// ---------- 把宿主的 stderr 接到 logcat ----------
+// 宿主的 LOG() 走 stderr，而 **app 的 stdout/stderr 不进 logcat** —— 不接的话，游戏那一堆诊断在手机上一条都读不到
+// （不是推测：合一设备那次真机日志里只有 app 自己的行）。接法取最不侵入的一种：开一条管道、把 1/2 号 fd 换过去、
+// 再起一个线程按行读出来转给 `__android_log_print`。好处是连 libc 与第三方库的消息也一并进 logcat，宿主一行都不用改。
+// ---------- Routing the host's stderr into logcat ----------
+// The host's LOG() writes to stderr and **an app's stdout/stderr do not reach logcat** -- without this, the game's
+// diagnostics cannot be read on the phone at all (not a guess: in the merged-device run the device log held only this
+// app's own lines). The least invasive route is taken: make a pipe, move fds 1 and 2 onto it, and have a thread read it
+// line by line into `__android_log_print`. The dividend is that libc's and third-party libraries' messages come along
+// too, with not one line of the host changed.
+static void *log_pump(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    char buf[1024];
+    size_t n = 0;
+    for (;;) {
+        char tmp[512];
+        ssize_t r = read(fd, tmp, sizeof tmp);
+        if (r <= 0) break;
+        for (ssize_t i = 0; i < r; i++) {
+            char c = tmp[i];
+            if (c == '\n' || n >= sizeof buf - 1) {
+                buf[n] = 0;
+                if (n) __android_log_print(ANDROID_LOG_INFO, "dmhost", "%s", buf);
+                n = 0;
+            } else buf[n++] = c;
+        }
+    }
+    if (n) { buf[n] = 0; __android_log_print(ANDROID_LOG_INFO, "dmhost", "%s", buf); }
+    return NULL;
+}
+
+static void log_pipe_start(void) {
+    int fd[2];
+    if (pipe(fd) != 0) { LOGE("接日志失败：pipe %s", strerror(errno)); return; }
+    dup2(fd[1], 1);
+    dup2(fd[1], 2);
+    close(fd[1]);
+    setvbuf(stdout, NULL, _IOLBF, 0);   // 行缓冲 + 无缓冲：日志要"说到就到"，否则卡在缓冲里看不到
+    setvbuf(stderr, NULL, _IONBF, 0);
+    pthread_t th;
+    if (pthread_create(&th, NULL, log_pump, (void *)(intptr_t)fd[0]) == 0) pthread_detach(th);
+    else LOGE("接日志失败：起不了读日志的线程");
+}
+
+// ---------- 游戏：跑在工作线程上 ----------
+// dm_main 会**阻塞**（把客体一直跑到退出），而主线程要留着做事件与上屏 —— app_glue 的事件循环必须在创建它的那个线程
+// 上跑，所以两边不能互换位置。窗口先建好再起游戏：`vk_device_init` 只会跑一次，而窗口必须在它之前交过去（见
+// vk_device_set_window），所以顺序不能反。
+// ---------- The game: on a worker thread ----------
+// dm_main **blocks** (it runs the guest until it exits) while the main thread has to stay free for events and
+// presenting -- app_glue's event loop must run on the thread that created it, so the two cannot swap places. The window
+// is brought up before the game starts: `vk_device_init` only ever runs once and the window has to be handed over before
+// it (see vk_device_set_window), so the order cannot be reversed.
+static void *guest_thread(void *arg) {
+    (void)arg;
+    static char *a[] = { (char *)"dm", (char *)"", (char *)"main", (char *)"sdk" };   // argv[1] 空 = 用 <根>/patched | empty argv[1] means <root>/patched
+    int rc = dm_android_main(4, a);
+    LOGI("宿主返回 %d（游戏结束）", rc);
+    return NULL;
 }
 
 // ---------- 数据从哪读（探针）----------
@@ -243,6 +313,24 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
             vk_device_make_surface();
             if (!vk_win_boot()) LOGE("窗口那一套建不起来（见上面的日志）");
             else LOGI("窗口就绪：手机上应该能看到底色在变色、白条在滑动");
+            // 窗口好之后才起游戏（顺序见上面 guest_thread 的说明），而且只起一次
+            // The game starts only after the window is up (the order is explained above guest_thread) and only once
+            if (!g_guest_started) {
+                g_guest_started = 1;
+                // 环境按量出来的结论设：根**原地读**（9.1 GB 不用搬），存档与临时指到 app 可写目录（/data/local/tmp
+                // 读得到但写不进，SELinux 的 shell_data_file）
+                // The environment follows the measurements: the root is **read in place** (no 9.1 GB copy) while saves and
+                // temporary files point at a directory the app may write (/data/local/tmp is readable but not writable --
+                // SELinux's shell_data_file)
+                mkdir("/sdcard/Android/data/ai.d2rm.dm/files/save", 0777);
+                mkdir("/sdcard/Android/data/ai.d2rm.dm/files/temp", 0777);
+                setenv("DM_ROOT", "/data/local/tmp/dm", 1);
+                setenv("DM_SAVE", "/sdcard/Android/data/ai.d2rm.dm/files/save", 1);
+                setenv("DM_TEMP", "/sdcard/Android/data/ai.d2rm.dm/files/temp", 1);
+                pthread_t th;
+                if (pthread_create(&th, NULL, guest_thread, NULL) == 0) pthread_detach(th);
+                else LOGE("起不了游戏线程：%s", strerror(errno));
+            }
             break;
         case APP_CMD_TERM_WINDOW:
             vk_win_shutdown();
@@ -261,6 +349,7 @@ void android_main(struct android_app *app) {
     g_app = app;
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
+    log_pipe_start();   // 先接日志：它之后的宿主输出全部进 logcat | route the log first: every host line after this reaches logcat
     LOGI("启动（NativeActivity + app_glue；上屏走宿主那一个设备）");
     probe_paths();
     g_img = malloc((size_t)IMG_W * IMG_H * 4);

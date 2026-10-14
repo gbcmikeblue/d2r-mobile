@@ -18,6 +18,13 @@
 #define DM_SYM(n) n
 #define DM_ADRP(reg, n) adrp reg, n
 #define DM_ADDLO(reg, n) add reg, reg, :lo12:n
+// 同 nvn_thunks.S 的理由：这两张蹦床表也是模块内部的，hidden 之后 adrp/add 才能在共享库里就地解掉。
+// 报错原文：relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol 'nvn_real'; recompile with -fPIC。
+// For the same reason as in nvn_thunks.S: these two trampoline tables are module internal too, and hidden is what lets
+// the adrp/add pair resolve in place inside a shared library. The error text reads: relocation
+// R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol 'nvn_real'; recompile with -fPIC.
+.hidden nvn_real
+.hidden nvn_prof_ticks
 #endif
 
     .arch_extension lse

@@ -30,7 +30,12 @@ static void mkdir_if_needed(const char *p) {
 // 文件/目录在不在 / whether a path exists
 static int exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
 
-int main(int argc, char **argv) {
+// 环境准备 + 交出 dm_main：这一段**控制台宿主与 APK 必须完全一致**，所以只留一个实现、两个入口 ——
+// 控制台的 main() 在文件末尾薄薄地包一层，APK 那边直接调 dm_android_main（见 dm/android/apk/main_apk.c）。
+// Environment setup plus handing over to dm_main: this part **has to be identical for the console host and the APK**,
+// so there is one implementation and two entry points -- the console's main() is a thin wrapper at the end of this file
+// and the APK calls dm_android_main directly (see dm/android/apk/main_apk.c).
+int dm_android_main(int argc, char **argv) {
     // 工作区根：DM_ROOT 优先；否则取可执行文件所在目录（/proc/self/exe 在安卓上可用）
     // Workspace root: DM_ROOT wins; otherwise the directory holding the executable (/proc/self/exe works on Android)
     char root[4096] = "";
@@ -124,3 +129,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "dm_main 返回 %d\n", rc);
     return rc;
 }
+
+// 控制台那条路的入口（可执行文件自己的 main）：与 iOS 同形，行为一点没变
+// The console route's entry point (the executable's own main): the same shape as iOS and unchanged in behaviour
+int main(int argc, char **argv) { return dm_android_main(argc, argv); }

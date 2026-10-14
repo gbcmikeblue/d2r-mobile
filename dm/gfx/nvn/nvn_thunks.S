@@ -18,6 +18,15 @@
 #define DM_LABEL(n) n:
 #define DM_SLOT_PAGE(r) adrp r, nvn_slot
 #define DM_SLOT_OFF(r) add r, r, :lo12:nvn_slot
+// ELF 这边：槽表是**模块内部**的，声明成 hidden 之后链接器就能就地解掉 adrp/add 这对绝对寻址。
+// 不这么做的话，链进共享库（M3 的 APK 要把宿主链进 libdm.so）会报
+// "relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol 'nvn_slot'; recompile with -fPIC" ——
+// 而 -fPIC 对汇编文件不起作用，能解的是"这个符号不需要被外部抢占"这件事本身。
+// On the ELF side: the slot table is **module internal**, and declaring it hidden lets the linker resolve the adrp/add
+// pair in place. Without it, linking into a shared library (M3's APK links the host into libdm.so) fails with
+// "relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol 'nvn_slot'; recompile with -fPIC" -- and -fPIC
+// does nothing for an assembly file, whereas "this symbol cannot be preempted" is exactly what does.
+.hidden nvn_slot
 #define DM_DATA .data
 #define DM_CSTRING .section .rodata
 #endif

@@ -95,6 +95,15 @@ target_compile_options(dmhost_android PRIVATE
 # work through them after M1's acceptance.
 target_compile_options(dmhost_android PRIVATE -w)
 
+# 位置无关代码：M3 的窗口工程要把这个静态库**链进一个 .so**（APK 的 libdm.so），而默认编出来的是给可执行文件用的
+# 绝对寻址（nvn_slot / nvn_real 那一批表），链进共享库会直接报"relocation ... cannot be used against symbol ...
+# recompile with -fPIC"。打开它：对可执行文件只是一点点开销，比维护两套构建划算。
+# Position-independent code: M3's window project links this static library **into a .so** (the APK's libdm.so), while the
+# default output uses absolute addressing meant for executables (the nvn_slot / nvn_real tables and friends), which makes
+# the link fail with "relocation ... cannot be used against symbol ... recompile with -fPIC". Turning it on costs a little
+# in the executable and is cheaper than maintaining two builds.
+set_target_properties(dmhost_android PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # M2 第一步的探针：不进宿主，也不进 APK，只用来量设备的 Vulkan 能力（离屏清屏 + 回读 + 内存模型）。
 # 之所以先做离屏：宿主现在是 adb 推上去跑的可执行文件，没有窗口，而窗口/交换链要 APK 才有。
 # M2 step 1 probe: not part of the host or any APK, it only measures the device's Vulkan capabilities
