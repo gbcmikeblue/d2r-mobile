@@ -63,16 +63,35 @@ uint64_t nvn_unimpl_c(nvn_slot_t *slot, uint64_t x0, uint64_t x1, uint64_t x2) {
 }
 
 typedef struct { const char *name; void *fn; } nvn_impl;
+// 实现表所在段的段名：Mach-O 要「段,节」（"__DATA,swnvn"），ELF 只要一个节名（"swnvn"）。
+// 读法两平台也不同，统一走 dm.h 的 DM_SEC_BOUNDS（见下面 nvn_init_slots）。
+// 这两个平台差异原先只按 Mach-O 写死：ELF 上 getsectiondata 恒返回「找不到」，于是实现表一条都登记不上，
+// 523 个槽全落到报红桩——真机日志里的「已实现 13（语义 0）」就是它，游戏拿到 nvnDeviceGetProcAddress 的
+// 空指针后直接崩在 main+0x173cb78。宿主自己的两张登记表（swhle / swforce）早就用 DM_SEC_* 解决了同一个问题，
+// 这里照同一套办。
+// The section holding the implementation table: Mach-O wants "segment,section" ("__DATA,swnvn"), ELF just a
+// section name ("swnvn"). Reading it differs per platform too, so both go through dm.h's DM_SEC_BOUNDS (see
+// nvn_init_slots below).
+// These two differences used to be hard-coded for Mach-O only: on ELF getsectiondata always reports "not
+// found", so not a single implementation was registered and all 523 slots fell through to the failure stub --
+// that is the "13 implemented (0 semantic)" line in the real-device log, and the game crashed at
+// main+0x173cb78 right after getting a null nvnDeviceGetProcAddress. The host's own two registry tables
+// (swhle / swforce) solved this same problem with DM_SEC_* long ago; this follows the same scheme.
+#if defined(__APPLE__)
+#define NVN_SEC "__DATA,swnvn"
+#else
+#define NVN_SEC "swnvn"
+#endif
 #define NVN(name, ret, ...)                                                                       \
     static ret h_##name(__VA_ARGS__);                                                             \
     static const NVNT_##name chk_##name __attribute__((unused)) = h_##name;                       \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, DM_SEC_KEEP, section(NVN_SEC))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 // 无原型的新版接口：不做签名检查
 // Newer interfaces without prototypes: no signature check
 #define NVN_NOPROTO(name, ret, ...)                                                               \
     static ret h_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, DM_SEC_KEEP, section(NVN_SEC))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
@@ -83,9 +102,14 @@ static unsigned g_nsem;                          // 语义实现个数（nvn_ini
 static void nvn_init_slots(void) {
     static int done; if (done) return; done = 1;
     g_log = getenv("DM_NVN_LOG") != NULL;
-    unsigned long sz;
-    const nvn_impl *im = (const nvn_impl *)getsectiondata(&_mh_execute_header, "__DATA", "swnvn", &sz);
-    unsigned nim = im ? (unsigned)(sz / sizeof *im) : 0, hit = 0;
+    // 实现表怎么读，两个平台不同：苹果用 getsectiondata 按「段,节」找并给出字节数，ELF 用链接器生成的
+    // __start_swnvn / __stop_swnvn 一对符号（为空时不定义，所以要判 0）。差异收在 dm.h 的 DM_SEC_BOUNDS 里。
+    // How the table is read differs per platform: Apple looks it up by "segment,section" with getsectiondata and
+    // gets a byte length, while ELF uses the __start_swnvn / __stop_swnvn pair the linker generates (undefined
+    // when empty, hence the 0 check). The difference is hidden in dm.h's DM_SEC_BOUNDS.
+    const nvn_impl *im; unsigned long nim;
+    DM_SEC_BOUNDS(swnvn, "__DATA", nvn_impl, im, nim);
+    unsigned hit = 0;
     for (unsigned i = 0; i < NVN_NFUNC; i++) nvn_slot[i].fn = (void *)nvn_unimpl_entry;
     for (unsigned k = 0; k < nim; k++) {
         unsigned i = 0;

@@ -55,6 +55,7 @@ add_library(dmhost_android STATIC
   # removes its stub from gfx_stub_android.c.
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
   ${HOST_SRC}
   ${DM}/host/entry.S
   ${GFX_SRC}

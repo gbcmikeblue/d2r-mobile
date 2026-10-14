@@ -61,6 +61,17 @@ int main(int argc, char **argv) {
         else fprintf(stderr, "romfs: 【黄】没找到 %s，也没有 DM_ROMFS——资源读不到（先跑通到 UNIMPL 不受影响）\n", buf);
     }
 
+    // 存档：宿主不设 DM_SAVE 会报红中止（它必须指向本局可写的那份），这里给 <根>/save 作缺省——
+    // 与 DM_ROMFS 同一套做法，目录已经建出来了，空目录起步没问题。
+    // Saves: the host reports a failure and aborts when DM_SAVE is unset (it must point at this run's writable
+    // copy), so default it to <root>/save -- the same treatment as DM_ROMFS, and the directory already exists,
+    // so starting from an empty one is fine.
+    if (!getenv("DM_SAVE")) {
+        snprintf(buf, sizeof buf, "%s/save", root);
+        setenv("DM_SAVE", buf, 1);
+        fprintf(stderr, "save: %s\n", buf);
+    }
+
     // 工作目录设成工作区根：环境变量里的相对路径都落在这里
     // Set the working directory to the workspace root: relative paths in environment variables land here
     if (chdir(root)) fprintf(stderr, "【红】chdir %s 失败：%s\n", root, strerror(errno));

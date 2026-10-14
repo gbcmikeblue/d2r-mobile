@@ -1,8 +1,10 @@
-// M1 还没有图形后端：这里给出图形层留给宿主的那批符号的空实现，让宿主能链接起来。
-// 它就是 nvn_mtl.m 在安卓这边的替身——M2 的 Vulkan 回放层落地后，这个文件应当删掉。
-// M1 has no graphics backend yet: this supplies empty implementations for the symbols the graphics
-// layer offers the host, so that the host links. It is the Android stand-in for nvn_mtl.m and should
-// be deleted once the M2 Vulkan replay layer lands.
+// 图形层留给宿主的那批符号里，还没被 Vulkan 回放层接管的部分在这里给空实现，让宿主能链接起来。
+// M2 每落地一块（见 dm/android/vk/nvn_vk.c），就从这里删掉对应的一条——两个文件不该有重名的定义。
+// 全部接完，这个文件就可以删掉。
+// The symbols the graphics layer offers the host that the Vulkan replay layer has not taken over yet get
+// empty implementations here so that the host links. Each piece of M2 that lands (see
+// dm/android/vk/nvn_vk.c) removes its entry from this file -- the two files must never define the same
+// symbol. Once everything is taken over this file can be deleted.
 //
 // 取值约定：查询类一律「没有 / 没有窗口 / 没准备好」（0 或失败），等待类立刻返回，统计类的出参写 0，
 // 释放与登记类空操作。这样宿主里那些统计、诊断与生命周期调用点都拿到一个合理的空值。
@@ -54,13 +56,9 @@ int mtl_link_wait_tick(uint64_t timeout_ns) { (void)timeout_ns; return 0; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 0; }
 int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 1; }          // 没什么要等的 | nothing to wait for
 uint64_t mtl_last_fence(void) { return 0; }                                // 从未提交 | never submitted
-void mtl_drain(void) { }
-void mtl_finish(void) { }
 
 // ---- 提交（Metal 命令缓冲 / 内存池 / 内存池登记） | Submission (Metal command buffers / memory pools) ----
 
-void mtl_pool_add(const void *mem, uint64_t size) { (void)mem; (void)size; }
-void mtl_pool_del(const void *mem) { (void)mem; }
 void mtl_sub_begin(void) { }
 uint64_t mtl_sub_commit(void) { return 0; }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
@@ -94,7 +92,6 @@ void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes) { if (loa
 void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { if (lib_ns) *lib_ns = 0; if (pso_ns) *pso_ns = 0; }
 void mtl_create_stats(uint64_t *libs, uint64_t *psos) { if (libs) *libs = 0; if (psos) *psos = 0; }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { if (uploads) *uploads = 0; if (reuploads) *reuploads = 0; }
-void mtl_alloc_stats(uint64_t *waits, uint64_t *gpu_waits, int *pools) { if (waits) *waits = 0; if (gpu_waits) *gpu_waits = 0; if (pools) *pools = 0; }
 void mtl_mem_stat(unsigned long long frame, unsigned long long mb, int ok, unsigned long long a, unsigned long long b, unsigned long long c) {
     (void)frame; (void)mb; (void)ok; (void)a; (void)b; (void)c;
 }

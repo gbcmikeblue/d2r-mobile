@@ -110,7 +110,19 @@ static Result mount(const char *name, const char *dir, int ro) { return mount_ex
 // APFS is case-insensitive by default, Horizon paths are case-sensitive: every component is looked up exactly by guest name.
 // Ordinary host names are unchanged; only when a name collides on the host is a separate physical name chosen, with the guest name stored in an xattr.
 // clonefile preserves xattr, so save Commit/remount needs no separate mapping table; enumeration must not leak physical aliases.
+// macOS 允许任意 xattr 名，Linux 不允许：必须以 user./trusted./system./security. 之一开头，否则 getxattr /
+// setxattr 直接返回 EOPNOTSUPP。真机上就撞了这个：$:/data/.build.config 的路径解析失败 errno=95（EOPNOTSUPP），
+// 游戏读不到 RomFS 里的第一个文件就退出了。安卓这边加 user. 前缀——这个属性两种平台上都只归我们使用，语义不变。
+// macOS allows any xattr name, Linux does not: it must begin with one of user. / trusted. / system. / security.,
+// otherwise getxattr / setxattr return EOPNOTSUPP outright. That is exactly what the real device hit:
+// resolving $:/data/.build.config failed with errno=95 (EOPNOTSUPP) and the game quit on the first file it
+// wanted from the RomFS. Android gets a user. prefix -- the attribute belongs to us alone on either platform,
+// so the semantics do not change.
+#if defined(__ANDROID__)
+#define FS_GUEST_NAME "user.org.d2rmobile.guest-name"
+#else
 #define FS_GUEST_NAME "org.d2rmobile.guest-name"
+#endif
 static int guest_name(const char *parent, const char *physical, char *out, size_t n) {
     char p[1280]; snprintf(p, sizeof p, "%s/%s", parent, physical);
 #if defined(__ANDROID__)
@@ -124,7 +136,22 @@ static int guest_name(const char *parent, const char *physical, char *out, size_
     ssize_t k = getxattr(p, FS_GUEST_NAME, out, n - 1, 0, XATTR_NOFOLLOW);
 #endif
     if (k >= 0) { out[k] = 0; return 1; }
-    if (errno != ENOATTR) return 0;
+    // 「没有这个属性」和「这个文件系统根本不支持 xattr」都退回到物理名：大小写敏感的映射是可选增强，
+    // 不该因为一个可选特性让整条路径解析失败（宿主目录本身分大小写时，物理名就等于客体名）。
+    // ENOTSUP / EOPNOTSUPP 只在安卓上出现（Linux 的 xattr 名字与文件系统支持都可能有别），报一次黄。
+    // Both "no such attribute" and "this filesystem has no xattr support at all" fall back to the physical
+    // name: the case-sensitive mapping is an optional refinement and should not make path resolution fail
+    // over an optional feature (when the host directory is itself case-sensitive, the physical name equals
+    // the guest name). ENOTSUP / EOPNOTSUPP only shows up on Android (Linux xattr names and filesystem
+    // support can both differ), so warn once.
+    if (errno == ENOTSUP || errno == EOPNOTSUPP) {
+#if defined(__ANDROID__)
+        static int warned;
+        if (!warned++) LOG("【黄】这个文件系统不支持 xattr（errno=%d）：客体原名映射停用，路径按宿主原名解析", errno);
+#else
+        (void)0;
+#endif
+    } else if (errno != ENOATTR) return 0;
     strlcpy(out, physical, n); return 1;
 }
 static int path_component(char *parent, size_t n, const char *name, int create) {
