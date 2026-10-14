@@ -4,7 +4,7 @@ English: [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md)
 
 This page breaks "porting D2R Mobile to Android" down into an actionable, checkable task list, so it can be confirmed item by item and divided up. For the technical feasibility case see [ANDROID.md](ANDROID.md); for the plain-language version see [ANDROID_PLAIN.md](ANDROID_PLAIN.md).
 
-**Current stage: preparation (no Android-side code written yet).** The checkboxes below reflect the actual state of this machine, not intentions.
+**Current stage: M2 in progress (the Vulkan replay layer runs on a device).** The checkboxes below reflect the actual state of this machine, not intentions.
 
 ## 1. Starting-point snapshot
 
@@ -725,13 +725,93 @@ took 4.2 s
 | vertex attribute component class | **fallback added** | when a pipeline is built, the shadow format's component class (float/uint/sint) is compared with the input type the shader declares and a mismatch warns once -- "location == attribute number" above is an **assumption**, and if it is wrong the vertex data attaches to the wrong slots **without any error**, so this check makes it visible at the first draw |
 | dummy buffer for the constant fallback | **in place** | `vk_pipe_dummy_buffer()` lazily creates a 64 KB all-zero vertex buffer, bound at `VK_PIPE_DUMMY_BIND` by a draw (a fallback attribute advances one element per instance and the instance count is the game's, so 16 bytes would not do) |
 | four primitives without counterparts | **measured before deciding** | `vk_topo_of` accumulates a draw count per primitive number (`vk_pipe_prim_counts`) so the device answers whether they appear, and the expansion is decided then; the counters are read-only and change nothing |
-| only set 0 layouts | unchanged | every binding in the library is in set 0 (all 6923 pass); another set would be reported in red and the multi-set machinery waits until it is needed |
+| two sets (vertex on set 0, fragment on set 1) | landed | see step 10: when two stages claim one binding number Vulkan has no answer (one binding, one type), and splitting by **stage** is the smallest correct fix (the `DescriptorSet` decoration is rewritten at load time) |
 | stencil masks in the pipeline key | unchanged | Apple's `pso_key` carries `vm`/`wm` the same way, so the behaviour matches and is not a defect |
 
 The device-ready line gained two capabilities along with it (Adreno 830): `non-solid fill: yes; per-instance vertex
 step: yes (with 0)`.
 
-**Next**: the replay layer's shadow binding storage (`vattr/vstream/vbuf/ubo/ssbo/tex/samp`) and the state interpretation
-(the `color/chmask/ms/poly/ds` bit-field groups -> `vk_gfx_state`, with blend stored per target via `blend_st.target`),
-then really issuing `DRAW` / `DRAW_IDX` (descriptor writes plus vertex buffer binding), and then **reading one frame back
-offscreen** to look at it.
+**Next**: descriptor writing and really issuing draws (step 10 below) -> resolving textures by NVN slot (step 11) ->
+**reading one frame back offscreen** to look at it.
+
+### M2 step 10: descriptor writing, real draws and GPU timing (all three measured on a device)
+
+**Descriptor writing**: one descriptor pool per **in-flight submission slot**, reset whole when the slot is reaped (fence
+signalled) -- the replay layer already has in-flight slots with fences (`g_inf`), so no extra synchronisation is needed.
+Buffers always use **dynamic offsets** (the guest data sits in zero-copy pools and `mtl_addr` returns (buffer, offset));
+**the dynamic offset array has the same source as the layout** (one `vk_pipe_binds` table, never computed twice -- two
+computations drift apart sooner or later). A zero or unresolvable address **writes a blank**: an unwritten descriptor is
+undefined while NVN itself reads 0 on an empty slot, so a blank is a faithful fallback.
+
+**The first real draws on the device**: **1.22 million real draws, 83 graphics pipelines, zero failures, no GPU hang, clean
+exit**. This batch also let **one of my own diagnostics catch a real bug**: NVN's index type is `0 = 8-bit / 1 = 16-bit /
+2 = 32-bit` (`NVNindexType` in `nvn.h`) while I had guessed "2/4 bytes" -- the device uses 1, which **happened** to read
+correctly as 16-bit, but 32-bit would have been read as 16-bit. Fixed against `nvn.h`; 8-bit indices (not in core Vulkan,
+they need a KHR extension) are reported and that draw skipped, as on Apple.
+
+**GPU timing: from a stub reporting 0 to a real measurement.** On Android `mtl_gpu_ms` was **a stub** (`return 0`), so the
+"GPU 0.00 ms" in the log was never a measurement -- and **nobody would find that odd**, because 0.00 looks exactly like
+"the GPU is doing nothing". Now a timestamp is written at the start of every pass (once it really opened) and at the end
+(before it closes) with `vkCmdWriteTimestamp`; when the slot is reaped they are read back and "last end minus first
+start" becomes that submission's GPU span (on TBDR passes are pipelined and spans cannot be summed -- Apple's pass table
+carries the same note), accumulated into a per-frame ring (1024 entries) and looked up by frame number, returning -1
+while incomplete (the same semantics as Apple's `GPUStartTime/GPUEndTime`). The prerequisites are asked for properly:
+**this queue family's** `timestampValidBits` (not a device-level property) and `limits.timestampPeriod`. Device result:
+`timestamps 48 bits valid, 52.08 ns per tick`, then one line per 300 frames with **`GPU p50 6.02 / p95 6.07 / max 8.02
+ms`** (the frame budget is 33 ms = 30 fps). The -1 semantics show up on the device too: the first window reported 292
+frames, with seven more not yet complete and correctly excluded.
+
+**The texture format table completed against `nvn.h`**: from the four gaps the device log reported (`0xb/0xd/0x6/0x1`),
+filled in along the `NVNformat` enum to **154/157**, including **ASTC** (the Switch's main compressed texture format,
+natively supported by Adreno) and the BGR series; the 32-bit `UI2F/I2F` have **no counterpart** in Vulkan
+(`_USCALED/_SSCALED` exist only for 8/16-bit channels) and mapping them to UINT/SINT would hand the shader integers where
+it expects floats -- so they are **not guessed** but reported. The offline reverse check (`case` values against the enum)
+found no typos.
+
+**The texture registry**: the host calls `mtl_reg_tex` when the game registers a texture (a stub on Android before) and it
+now stores a copy **by value** (the game copies `NVNtexture` by value and a pointer would go stale), alongside the
+sampler registry `mtl_reg_samp` (also promoted from a stub).
+
+### M2 step 11: textures and samplers resolved by NVN slot (the device binds textures for the first time)
+
+**The missing link was "binding <-> NVN slot"**: a texture binding in the SPIR-V is not an NVN texture slot, and
+`<key>.res.json` carries no such correspondence (Apple's reflection has `reg`, this one does not). It took two steps:
+
+1. **Statistical pairing first** (group by dimension, then in order): from 314 shaders with one texture and one slot --
+   **forced pairings** -- `type 3 -> 2D` came out; after adding the count-elimination results `4 -> 3D` and `2 -> cube`,
+   all 44,135 bindings in the library were 98.4% self-consistent, and a **control** (corrupting one mapping on purpose
+   drops it to 65.1%) showed the consistency figure discriminates rather than being self-serving.
+2. **Then exact decoding** (from a parallel probe): `binding` is really the **translator's own dense counter** (the four
+   callbacks in `Program.cs` share one `_binding++`), while **the `handle` already carries the slots**, with the formula
+   implemented twice in the repo (`decode_tex` in `dmsh_build.py` is the same one the Apple-side artifacts use;
+   `maxwell_refs.py` plus `README.md` record the whole-library measurement: texture slot r at `c2[0x168+8r]`,
+   **sampler slot r at `c2[0x568+8r]`**, image slot r at `c2[0x120+8r]`). The handle word splits into `o0`/`o1` and
+   **when `ty != 0` both words must be tried** (the separate-sampler half is in o1; trying only o0 misses about 7%).
+   **Cross-checked against three sources**: a sample of 800 shaders / 5199 texture entries had every decoded texture slot
+   **land in `shader_facts.tsv`'s slot set** (that table comes from the PC reflection, an independent source), zero
+   failures and every sampler slot inside 0..10 -- matching the device's "non-zero sampler slots 0..10". On the device
+   the two independent routes confirmed each other as well: decode 414 ok / 9 failed against the statistical pairing's
+   409/14.
+
+**Samplers**: texture slots and sampler slots are **two numberings** (two handle tables), so a sampler must be taken by
+its **sampler slot**; the handle's high 20 bits are the sampler pool id and `0xFFF` is the "slot filled in" sentinel.
+Device result: **520k bound, 28k blanked, "sampler id not found" 0** -- whenever a sampler slot really holds something it
+resolves; those 28k blanks are about equal to the empty-slot count (declared by the shader, unused by that draw) and a
+blank is exactly the counterpart of an empty slot.
+
+**Two mistakes of my own, both corrected by measurement or probing** (recorded for the record): (1) an early version's
+"this stage bounds no textures at all" was a **bad sample** (concluded from the first three slots; it actually binds 36);
+(2) I once read the sampler table with a **texture** slot, took the `0xfff00000` it returned for an "empty-slot sentinel"
+and called it closed -- the truth was that it was simply **the wrong slot**.
+
+### M2 step 12: views land (sampling the way the game means it)
+
+An NVN texture view can **limit the mip range**, **limit the layer range**, **reinterpret the format** and **reinterpret
+the target** (a 3D texture seen as a 2D array, say). This layer used to have **no view parameter at all**: the view was
+stored at registration (`treg_e.has_v/v`) and **never read**. Now `vk_tex_view(const tex_t*, const view_t*)` caches up to
+four sub-views per texture by view content, with `subresourceRange` from `base_level/nlevels/min_layer/nlayers`, format
+from `set_format` and `viewType` from `set_target`; image creation adds `MUTABLE_FORMAT` (the precondition for
+reinterpreting formats) and `2D_ARRAY_COMPATIBLE` (3D only). The two render-target paths still pass the base view
+(`p_set_rt`'s views are not in the shadow state yet), as noted in the code. **The device was disconnected at commit
+time**, so the three view counters (base / hit / created) have to wait for it -- the previous log shows the game does
+register views (`TextureViewSetLevels=2369, SetLayers=2030`).
