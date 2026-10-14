@@ -3,3 +3,12 @@
 .iosdd_mac/
 .iosdd_*/
 .DS_Store
+
+# 本地 Python 虚拟环境（跑工具脚本用，不进仓库）| Local Python virtualenv (for tooling scripts; not committed)
+.venv/
+
+# 本地工具（hactool 源码与编译产物等，不进仓库）| Local tooling (hactool source and build output, etc.; not committed)
+.tools/
+
+# 本地工作区（游戏文件与中间产物，不进仓库）| Local workspace (game files and intermediates; not committed)
+.work/
