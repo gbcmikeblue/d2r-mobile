@@ -7,6 +7,7 @@
 #include "nvn_tex.h"
 #include "nvn_deswizzle.h"
 #include "dm.h"
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -641,16 +642,84 @@ int vk_tex_copy_t2t(const tex_t *src, const view_t *sv, const NVNcopyRegion *sr,
 
 uint64_t vk_tex_t2t_count(void) { return atomic_load(&g_t2t_n); }
 
+// 半精度 → 单精度（读回浮点画面时用；标准做法，逐位展开）
+// Half precision to single precision (used when reading back a float picture; the standard bit-by-bit expansion)
+static float h2f(uint16_t h) {
+    uint32_t s = (uint32_t)(h >> 15) & 1u, e = (uint32_t)(h >> 10) & 0x1fu, m = (uint32_t)h & 0x3ffu;
+    if (e == 0) {                       // 非规格化：没有隐含的 1 | subnormal: no implicit 1
+        if (!m) return s ? -0.0f : 0.0f;
+        float f = (float)m * (1.0f / 1024.0f) * (1.0f / 16777216.0f);
+        return s ? -f : f;
+    }
+    if (e == 31) return m ? 0.0f : (s ? -1.0f / 0.0f : 1.0f / 0.0f);   // 无穷 / NaN：NaN 当 0，免得污染统计 | inf / NaN (NaN as 0 so it does not pollute the statistics)
+    float f = (1.0f + (float)m * (1.0f / 1024.0f)) * powf(2.0f, (float)((int)e - 15));
+    return s ? -f : f;
+}
+
+// 无符号浮点（11/11/10 位那类）→ 单精度：5 位指数、偏置 15、没有符号位也没有隐含的 1。
+// 这就是 VK_FORMAT_B10G11R11_UFLOAT_PACK32 的编码（名字里 B 在前，占最高 10 位；R 在最低 11 位）。
+// Unsigned float (the 11/11/10-bit kind) to single precision: a 5-bit exponent with a bias of 15 and neither a sign
+// bit nor an implicit 1. This is how VK_FORMAT_B10G11R11_UFLOAT_PACK32 is encoded (the name puts B first, occupying
+// the top 10 bits, with R in the low 11).
+static float uf(uint32_t v, int nbits) {
+    int mb = nbits - 5;
+    uint32_t e = v >> mb, m = v & ((1u << mb) - 1u);
+    if (e == 0) return (float)m * (1.0f / 16777216.0f) * (1.0f / 16384.0f);   // 非规格化 | subnormal
+    if (e == 31) return m ? 0.0f : 3.4e38f;                                    // NaN 当 0、无穷给个上限（后面会钳住）| NaN as 0, infinity as a ceiling (clamped later)
+    return (1.0f + (float)m * (1.0f / (float)(1u << mb))) * powf(2.0f, (float)((int)e - 15));
+}
+
+// 中转缓冲缓存（读回用）：实测每张读回约 0.45 秒，大半花在分配/销毁上——而读回只发生在调试路径（出图截图、
+// 扫描），所以留着反复用是划算的，尺寸不够时换一块大的。
+// Cached staging buffer (for readbacks): a readback measures at about 0.45 s per texture, most of it in allocation and
+// destruction, and readbacks only happen on debugging paths (present screenshots, scans), so keeping one around and
+// reusing it pays; when it is too small it is replaced with a larger one.
+static VkBuffer g_stg_buf;
+static VkDeviceMemory g_stg_mem;
+static VkDeviceSize g_stg_sz;
+
+static int stg_get(VkDeviceSize need, VkBuffer *out_buf, VkDeviceMemory *out_mem) {
+    if (!g_stg_buf || g_stg_sz < need) {
+        if (g_stg_buf) {
+            vkDestroyBuffer(vk_dev(), g_stg_buf, NULL);
+            vkFreeMemory(vk_dev(), g_stg_mem, NULL);
+            g_stg_buf = VK_NULL_HANDLE; g_stg_mem = VK_NULL_HANDLE; g_stg_sz = 0;
+        }
+        VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = need,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        if (vkCreateBuffer(vk_dev(), &bci, NULL, &g_stg_buf) != VK_SUCCESS) { g_stg_buf = VK_NULL_HANDLE; return 0; }
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(vk_dev(), g_stg_buf, &mr);
+        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+            .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
+        if (vkAllocateMemory(vk_dev(), &mai, NULL, &g_stg_mem) != VK_SUCCESS || vkBindBufferMemory(vk_dev(), g_stg_buf, g_stg_mem, 0) != VK_SUCCESS) {
+            if (g_stg_mem) { vkFreeMemory(vk_dev(), g_stg_mem, NULL); g_stg_mem = VK_NULL_HANDLE; }
+            vkDestroyBuffer(vk_dev(), g_stg_buf, NULL);
+            g_stg_buf = VK_NULL_HANDLE;
+            return 0;
+        }
+        g_stg_sz = need;
+    }
+    *out_buf = g_stg_buf;
+    *out_mem = g_stg_mem;
+    return 1;
+}
+
 // ---------- 从驱动侧读回（见 vk_tex.h 的说明）----------
 // ---------- Read back from the driver side (see the note in vk_tex.h) ----------
-int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
+// 按序号读回：截图与诊断的工具面。不需要 tex_t —— 贴图层的入口里本来就有 img/fmt/w/h/levels/lay，而"游戏把画面
+// 画进了哪一张"这种问题只能按序号问（那些贴图的 tex_t 不在回放层手上）。
+// Read back by serial: the tool surface for screenshots and diagnostics. No tex_t is needed -- the texture layer's
+// entry already holds img/fmt/w/h/levels/lay -- and a question like "which texture did the game draw the picture into"
+// can only be asked by serial (the replay layer does not hold those textures' tex_t).
+int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
     // 读不回就得说清为什么：这一层早退的路很多，静默早退过一次（真机上表现为"截图 0x0 失败"配一条黄红都没有），
     // 所以每条早退都留一句话。
     // A failed readback has to say why: this layer has many early exits and one of them was silent (on the device that
     // looked like "screenshot 0x0 failed" with no failure line anywhere), so every exit leaves a line behind.
-    if (!t || !t->serial || !dst) {
-        LOG("【黄】读回：参数不成立（纹理 %p、序号 %llu、目标 %p）——序号为 0 说明这个对象还没在宿主这边登记",
-            (const void *)t, (unsigned long long)(t ? t->serial : 0), (const void *)dst);
+    if (!serial || !dst) {
+        LOG("【黄】读回：参数不成立（序号 %llu、目标 %p）——序号为 0 说明这个对象还没在宿主这边登记",
+            (unsigned long long)serial, (const void *)dst);
         return 0;
     }
     vk_device_init();
@@ -662,7 +731,7 @@ int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint
     VkImageLayout lay = VK_IMAGE_LAYOUT_UNDEFINED;
     int depth_like = 0;
     pthread_mutex_lock(&g_mu);
-    ent_t *e = find_slot(t->serial, 0);
+    ent_t *e = find_slot(serial, 0);
     if (e && e->img) {
         img = e->img; fmt = e->fmt; iw = e->w; ih = e->h; levels = e->levels;
         lay = e->lay; depth_like = e->depth_like || e->dsa;
@@ -672,29 +741,44 @@ int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint
         // 入口不存在：这张贴图还没被 GPU 用过，真值在池里（直读那条路），不该走这里
         // No entry: the GPU has never touched this texture and the pool holds the truth (the direct path), so this is
         // the wrong way to read it
-        LOG("【黄】从驱动侧读回一张还没被 GPU 用过的贴图（serial %llu）：它是直读池的那一类", (unsigned long long)t->serial);
+        LOG("【黄】从驱动侧读回一张还没被 GPU 用过的贴图（序号 %llu）：它是直读池的那一类", (unsigned long long)serial);
         return 0;
     }
     if (depth_like) {
         static int said;
-        if (!said++) LOG("【黄】读回的是深度/模板贴图（serial %llu）：出图截图只取颜色，跳过", (unsigned long long)t->serial);
+        if (!said++) LOG("【黄】读回的是深度/模板贴图（序号 %llu）：截图只取颜色，跳过", (unsigned long long)serial);
         return 0;
     }
-    // 只有 8 位四通道能直接当 RGBA8 用；两种字节序各认一遍（交换链常见的是 B8G8R8A8）
-    // Only 8-bit four-channel formats are usable as RGBA8 directly; both byte orders are recognised (B8G8R8A8 is the
-    // usual swapchain format)
-    int bgra = 0;
+    // 能读的格式：8 位四通道（两种字节序）与几种"十六位/三十二位浮点或归一化"四通道。
+    // 后者是**游戏真正的画面**所在——真机上 1600×900 的同尺寸贴图里有 8 张是浮点格式，而能直读的两张 8 位贴图
+    // 全是白的；只支持 8 位就等于看不见画面。浮点的读回来要**压到可看的范围**（钳到 [0,1] 再取伽马），
+    // 那是**为了看**的变换，不是数据本身，所以日志里会写明，并把原始峰值一起报出来。
+    // Usable formats: 8-bit four-channel (both byte orders) and a few 16/32-bit float or normalised four-channel
+    // ones. The latter are where **the game's real picture** lives: on the device eight of the eleven same-size
+    // 1600x900 textures are float formats while the two 8-bit ones that can be read directly are pure white, so
+    // supporting only 8-bit amounts to not seeing the picture at all. A float readback has to be **squeezed into a
+    // viewable range** (clamp to [0,1] then gamma), which is a transform **for looking at it**, not the data itself,
+    // so the log says as much and reports the raw peak alongside.
+    int bgra = 0, src = 0;   // src: 0 = 8 位归一化、1 = 16 位浮点、2 = 16 位归一化、3 = 32 位浮点 | src: 0 = 8-bit normalised, 1 = 16-bit float, 2 = 16-bit normalised, 3 = 32-bit float
     switch (fmt) {
         case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
-        case VK_FORMAT_R8G8B8A8_SNORM: bgra = 0; break;
+        case VK_FORMAT_R8G8B8A8_SNORM: bgra = 0; src = 0; break;
         case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
-        case VK_FORMAT_B8G8R8A8_SNORM: bgra = 1; break;
+        case VK_FORMAT_B8G8R8A8_SNORM: bgra = 1; src = 0; break;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: src = 1; break;
+        case VK_FORMAT_R16G16B16A16_UNORM: src = 2; break;
+        case VK_FORMAT_R32G32B32A32_SFLOAT: src = 3; break;
+        // 真机上 1600×900 的场景色就是这一个（编号 122）——查过 NDK 头文件再对的名字，不是猜的
+        // On the device the 1600x900 scene colour is this one (number 122), a name checked against the NDK header
+        // rather than guessed
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: src = 4; break;
         default: {
             static int said;
-            if (!said++) LOG("【黄】读回不支持格式 %d（只支持 8 位 RGBA/BGRA 四通道）：截图跳过", (int)fmt);
+            if (!said++) LOG("【黄】读回不支持格式 %d：截图跳过（要看得见就得先支持它）", (int)fmt);
             return 0;
         }
     }
+    uint32_t bpp = src == 0 || src == 4 ? 4u : src == 3 ? 16u : 8u;
     uint32_t lv = level < levels ? level : 0;
     uint32_t w = lv > 31 ? 1u : iw >> lv, h = lv > 31 ? 1u : ih >> lv;
     if (!w) w = 1;
@@ -704,18 +788,7 @@ int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint
     // Staging buffer: host-visible and coherent, mapped and read straight after the copy
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = (VkDeviceSize)w * h * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
-    if (vkCreateBuffer(vk_dev(), &bci, NULL, &buf) != VK_SUCCESS) { LOG("【红】读回：建中转缓冲失败"); return 0; }
-    VkMemoryRequirements mr;
-    vkGetBufferMemoryRequirements(vk_dev(), buf, &mr);
-    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
-        .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
-    if (vkAllocateMemory(vk_dev(), &mai, NULL, &mem) != VK_SUCCESS || vkBindBufferMemory(vk_dev(), buf, mem, 0) != VK_SUCCESS) {
-        LOG("【红】读回：中转缓冲的内存分配 / 绑定失败");
-        vkDestroyBuffer(vk_dev(), buf, NULL);
-        return 0;
-    }
+    if (!stg_get((VkDeviceSize)w * h * bpp, &buf, &mem)) { LOG("【红】读回：建中转缓冲失败（%llu 字节）", (unsigned long long)((VkDeviceSize)w * h * bpp)); return 0; }
 
     // 拷之前先把队列排空：要读的是 GPU 已经写完的画面（与苹果侧截图前那次 mtl_finish_gpu 同一个意思）
     // Drain the queue before copying: the point is to read a picture the GPU has finished (the same meaning as the
@@ -740,16 +813,43 @@ int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint
         void *p = NULL;
         if (vkMapMemory(vk_dev(), mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
             const uint8_t *s = (const uint8_t *)p;
+            float peak = 0.0f;
             for (uint32_t y = 0; y < h; y++) {
                 uint8_t *d = dst + (size_t)y * pitch;
-                const uint8_t *r = s + (size_t)y * w * 4;
-                if (bgra) for (uint32_t x = 0; x < w; x++) { d[x * 4 + 0] = r[x * 4 + 2]; d[x * 4 + 1] = r[x * 4 + 1]; d[x * 4 + 2] = r[x * 4 + 0]; d[x * 4 + 3] = r[x * 4 + 3]; }
-                else memcpy(d, r, (size_t)w * 4);
+                const uint8_t *r = s + (size_t)y * w * bpp;
+                if (src == 0) {
+                    if (bgra) for (uint32_t x = 0; x < w; x++) { d[x * 4 + 0] = r[x * 4 + 2]; d[x * 4 + 1] = r[x * 4 + 1]; d[x * 4 + 2] = r[x * 4 + 0]; d[x * 4 + 3] = r[x * 4 + 3]; }
+                    else memcpy(d, r, (size_t)w * 4);
+                } else for (uint32_t x = 0; x < w; x++) {
+                    // 浮点/归一化 → 可看的 8 位：钳到 [0,1]、取 1/2.2 伽马（为了看，不是为了改数据），峰值单独记
+                    // Float/normalised -> viewable 8-bit: clamp to [0,1] and apply a 1/2.2 gamma (for looking, not for
+                    // changing the data), with the peak recorded separately
+                    for (int c = 0; c < 3; c++) {
+                        float v;
+                        if (src == 1) v = h2f(*(const uint16_t *)(r + x * 8 + c * 2));
+                        else if (src == 2) v = *(const uint16_t *)(r + x * 8 + c * 2) / 65535.0f;
+                        else if (src == 4) {
+                            // 一个 32 位字里三个无符号浮点：R 在最低 11 位、G 中间 11 位、B 最高 10 位
+                            // Three unsigned floats in one 32-bit word: R in the low 11 bits, G the middle 11, B the
+                            // top 10
+                            uint32_t w32 = ((const uint32_t *)r)[x];
+                            v = c == 0 ? uf(w32 & 0x7ffu, 11) : c == 1 ? uf((w32 >> 11) & 0x7ffu, 11) : uf((w32 >> 22) & 0x3ffu, 10);
+                        }
+                        else v = ((const float *)r)[x * 4 + c];
+                        if (v > peak) peak = v;
+                        if (!(v > 0.0f)) v = 0.0f;                 // NaN / 负数都当 0 | NaN and negatives count as zero
+                        if (v > 1.0f) v = 1.0f;
+                        d[x * 4 + c] = (uint8_t)(powf(v, 1.0f / 2.2f) * 255.0f + 0.5f);
+                    }
+                    d[x * 4 + 3] = 255;
+                }
             }
+            if (src) LOG("[vk] 读回格式 %d（浮点/归一化，%u 字节每像素）：按「钳到 [0,1] + 1/2.2 伽马」转成可看的图，原始峰值 %.3f",
+                         (int)fmt, bpp, (double)peak);
             vkUnmapMemory(vk_dev(), mem);
             if (out_w) *out_w = w;
             if (out_h) *out_h = h;
-        } else { ok = 0; LOG("【红】读回：中转缓冲映射不出（尺寸 %ux%u、%llu 字节）", w, h, (unsigned long long)bci.size); }
+        } else { ok = 0; LOG("【红】读回：中转缓冲映射不出（尺寸 %ux%u、%llu 字节）", w, h, (unsigned long long)((VkDeviceSize)w * h * bpp)); }
     } else {
         static int said;
         if (!said++) LOG("【红】读回：命令缓冲那一套没走通（格式 %d 尺寸 %ux%u）", (int)fmt, w, h);
@@ -758,13 +858,55 @@ int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint
     // The image stays in TRANSFER_SRC after the copy: record that layout so the next transition knows where from
     if (ok) {
         pthread_mutex_lock(&g_mu);
-        ent_t *e2 = find_slot(t->serial, 0);
+        ent_t *e2 = find_slot(serial, 0);
         if (e2 && e2->img == img) e2->lay = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         pthread_mutex_unlock(&g_mu);
     }
-    vkDestroyBuffer(vk_dev(), buf, NULL);
-    vkFreeMemory(vk_dev(), mem, NULL);
-    return ok;
+    return ok;   // 中转缓冲留在缓存里（见 stg_get）：下一个读回接着用 | the staging buffer stays cached (see stg_get) for the next readback
+}
+
+// 带 tex_t 的旧入口：就是按序号那一支的薄封装（诊断分得更细一点，因为这里能报出对象与序号的关系）
+// The older tex_t entry point: a thin wrapper over the serial version (with a slightly richer diagnostic, since here
+// the relationship between the object and the serial can be reported)
+int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
+    if (!t || !t->serial) {
+        LOG("【黄】读回：这个贴图对象没有序号（对象 %p）：说明它还没在宿主这边登记过", (const void *)t);
+        return 0;
+    }
+    return vk_tex_grab_ser(t->serial, level, dst, pitch, out_w, out_h);
+}
+
+// 某尺寸下的全部已知贴图序号（诊断用：把"画面进了哪一张"从猜变成问）
+// Every known texture serial of a given size (diagnostics: turn "which one did the picture go into" from a guess into
+// a question)
+// 列出所有"已经有图像"的贴图（扫描用：不按尺寸筛，一次看全，省得漏掉真画面所在的那个尺寸）
+// List every texture that already has an image (for a scan: no size filter, so the size the picture actually lives at
+// cannot be missed)
+int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap) {
+    pthread_mutex_lock(&g_mu);
+    int n = 0;
+    for (int i = 0; i < g_cap && n < cap; i++) {
+        ent_t *e = &g_tab[i];
+        if (!e->serial || !e->img) continue;
+        ser[n] = e->serial;
+        ws[n] = e->w;
+        hs[n] = e->h;
+        n++;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
+
+int vk_tex_same_size_serials(uint32_t w, uint32_t h, uint64_t *out, int cap) {
+    pthread_mutex_lock(&g_mu);
+    int n = 0;
+    for (int i = 0; i < g_cap && n < cap; i++) {
+        ent_t *e = &g_tab[i];
+        if (!e->serial || !e->img || e->w != w || e->h != h) continue;
+        out[n++] = e->serial;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return n;
 }
 
 // 按 view 取（必要时建）视图。view 为空、或它一个"限定/重解释"位都没设，就是底视图。

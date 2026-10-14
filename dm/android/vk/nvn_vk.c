@@ -436,14 +436,62 @@ static pthread_mutex_t g_shotq_mu = PTHREAD_MUTEX_INITIALIZER;
 // tests that do not link the host
 __attribute__((weak)) void dm_shot_written(const char *path, int ok) { (void)path; (void)ok; }
 
-// 截图：等到 GPU 做完，把这张纹理从驱动侧读回，写成 PNG。
-// Take a screenshot: wait for the GPU to finish, read this texture back from the driver side and write it as a PNG.
-static int shot_take(const tex_t *t, const char *path) {
-    if (!t) { LOG("【红】截图 %s：出图纹理为空", path); return 0; }
-    uint32_t w = t->d.width, h = t->d.height;
-    if (!w || !h) { LOG("【红】截图 %s：出图纹理尺寸 %ux%u", path, w, h); return 0; }
+// 截图的核心，按**序号**：抓像素、算亮度统计、写 PNG、报一行。出图那一支与"同尺寸全部截取"共用它。
+// The core of a screenshot, by **serial**: grab pixels, compute luminance statistics, write the PNG, report one line.
+// The present path and "grab every same-size texture" both go through it.
+// `save_blank`：整片只有一种值时要不要照样落盘（出图那一支要——它得证明"这里确实是空白"；扫描不要——扫描靠
+// 统计行说话，落一张 5.7 MB 的纯色图没有意义）。
+// `save_blank`: whether to write the file even when the whole picture is a single value (the present path wants it --
+// it has to prove "this really is blank"; a scan does not -- the statistics line says it, and writing a 5.7 MB
+// single-colour file proves nothing).
+static int shot_grab_ser(uint64_t serial, uint32_t w, uint32_t h, const char *path, int save_blank) {
+    if (!w || !h) { LOG("【红】截图 %s：尺寸 %ux%u", path, w, h); return 0; }
     uint8_t *buf = malloc((size_t)w * h * 4);
     if (!buf) { LOG("【红】截图 %s：%ux%u 的像素缓冲分配不出", path, w, h); return 0; }
+    uint32_t gw = 0, gh = 0;
+    int ok = vk_tex_grab_ser(serial, 0, buf, (size_t)w * 4, &gw, &gh);
+    if (ok) {
+        // 亮度统计：白 / 黑 / 有内容从此是**日志里的数**，不必把图拉下来才知道（上一轮的"全白"正是这样看出来的）
+        // Luminance statistics: white / black / has content become **numbers in the log** instead of something you
+        // learn only after pulling the file down (last round's "all white" was read exactly that way)
+        uint64_t sum = 0;
+        uint8_t lo = 255, hi = 0;
+        size_t np = (size_t)gw * gh;
+        for (size_t i = 0; i < np; i++) {
+            uint8_t l = (uint8_t)(((unsigned)buf[i * 4] + buf[i * 4 + 1] + buf[i * 4 + 2]) / 3);
+            sum += l;
+            if (l < lo) lo = l;
+            if (l > hi) hi = l;
+        }
+        double mean = np ? (double)sum / (double)np : 0.0;
+        if (!path || (lo == hi && !save_blank)) {
+            // 整片一个值就是"没有画面"的**数**：扫描时只报不写
+            // A single value across the whole picture is "no picture" as a **number**: a scan reports it without writing
+            LOG("[vk] 扫描 序号 %llu %ux%u：亮度 均值 %.1f、最小 %u、最大 %u%s", (unsigned long long)serial, gw, gh, mean, lo, hi,
+                path ? "（整片一个值，不落盘）" : "（只统计）");
+        } else {
+            ok = vk_png_write(path, buf, gw, gh);
+            LOG("截图序号 %llu %ux%u → %s %s；亮度 均值 %.1f、最小 %u、最大 %u", (unsigned long long)serial, gw, gh, path,
+                ok ? "成功" : "失败", mean, lo, hi);
+        }
+    } else {
+        LOG("截图序号 %llu %ux%u → %s 失败", (unsigned long long)serial, w, h, path);
+        // 读不回来就把"这个尺寸还有哪些已知贴图"列出来（只列一次：逐张截取时后面每张都失败，会刷屏）
+        // If the readback fails, list which known textures share this size (once only: when grabbing every texture of
+        // a size, the later ones all fail and would flood the log)
+        static int dumped;
+        if (!dumped++) vk_tex_dump_size(w, h);
+    }
+    free(buf);
+    if (path) dm_shot_written(path, ok);
+    return ok;
+}
+
+// 出图那一支（tex_t 入口）：等到 GPU 做完，把这张纹理从驱动侧读回，写成 PNG。
+// The present path (the tex_t entry): wait for the GPU to finish, read this texture back from the driver side and write
+// it as a PNG.
+static int shot_take(const tex_t *t, const char *path) {
+    if (!t) { LOG("【红】截图 %s：出图纹理为空", path); return 0; }
     // 出图那张贴图**按需建**——与苹果侧一致（那边是 `id<MTLTexture> src = tex_mtl(t)`，建不出就报红"出图贴图建不出
     // MTLTexture"）。这一条我先前搞错了：要求"入口必须已存在"等于把"此前没人问过它"误当成"游戏没画过它"。
     // The present texture is built **on demand**, the same as Apple (there it is `id<MTLTexture> src = tex_mtl(t)`,
@@ -451,20 +499,57 @@ static int shot_take(const tex_t *t, const char *path) {
     // requiring a pre-existing entry mistakes "nobody asked for it yet" for "the game never drew into it".
     if (!vk_tex_view(t, NULL)) {
         LOG("【红】截图 %s：出图贴图（序号 %llu）建不出图像", path, (unsigned long long)t->serial);
-        free(buf);
         return 0;
     }
-    uint32_t gw = 0, gh = 0;
-    int ok = vk_tex_grab(t, 0, buf, (size_t)w * 4, &gw, &gh);
-    if (ok) ok = vk_png_write(path, buf, gw, gh);
-    // 读不回来就把"这个尺寸还有哪些已知贴图"列出来：画面到底进了哪一张，看这里最快
-    // If the readback fails, list which known textures share this size: this is the quickest way to see which one the
-    // picture went into
-    if (!ok) vk_tex_dump_size(w, h);
-    LOG("截图 %ux%u 格式 %#x → %s %s", gw, gh, t->d.format, path, ok ? "成功" : "失败");
-    free(buf);
-    dm_shot_written(path, ok);
-    return ok;
+    return shot_grab_ser(t->serial, t->d.width, t->d.height, path, 1);
+}
+
+// 扫描：把**所有**已知贴图各读一次、报一行统计，只有"不是整片一个值"的才落盘。与"同尺寸"那条相比，它不预设画面
+// 在哪个尺寸上——真机实测 1600×900 那 11 张全是空的（0 或 255），画面可能根本不在这个尺寸。
+// A scan: read **every** known texture once and report a statistics line for each, writing a file only for those that
+// are not a single value throughout. Unlike the same-size path it does not presuppose which size the picture lives at
+// -- on the device all eleven 1600x900 textures are empty (0 or 255), and the picture may not be at that size at all.
+static void shot_scan(uint64_t frame, const char *prefix) {
+    enum { SCAN_MAX = 192 };
+    static uint64_t ser[SCAN_MAX];
+    static uint32_t ws[SCAN_MAX], hs[SCAN_MAX];
+    int n = vk_tex_list(ser, ws, hs, SCAN_MAX);
+    // 只扫"够大"的：画面不可能是一张 16×24 的精灵图，而每读一张都要分配一次缓冲并等一次队列（实测约 0.45 秒），
+    // 192 张会把整轮跑满。这个门槛是**语义**上的，不是性能上的取巧。
+    // Only "big enough" ones: a picture cannot be a 16x24 sprite, and every read allocates a buffer and waits for the
+    // queue (measured at about 0.45 s), so 192 of them would eat the whole run. The threshold is a **semantic** one, not
+    // a performance trick.
+    int big = 0;
+    for (int i = 0; i < n; i++) if (ws[i] >= 256 && hs[i] >= 256) big++;
+    LOG("[vk] 扫描（出图第 %llu 次）：已知贴图 %d 张，其中 ≥256×256 的 %d 张，逐张读一次，只有有内容的落盘到 %s",
+        (unsigned long long)frame, n, big, prefix ? prefix : "（不落盘）");
+    for (int i = 0; i < n; i++) {
+        if (ws[i] < 256 || hs[i] < 256) continue;
+        char path[512];
+        // 文件名带帧号：多帧扫描时同一张贴图会被看好几次，不带帧号就互相覆盖了
+        // The name carries the frame number: a multi-frame scan looks at the same texture several times, and without it
+        // they would overwrite one another
+        if (prefix) snprintf(path, sizeof path, "%s%llu-%llu.png", prefix, (unsigned long long)frame, (unsigned long long)ser[i]);
+        shot_grab_ser(ser[i], ws[i], hs[i], prefix ? path : NULL, 0);
+    }
+}
+
+// 同尺寸的全部已知贴图逐张截出来（DM_NVN_SHOT_ALL）：这是找"游戏把画面画进了哪一张"的仪器——
+// 出图纹理可能根本不是画面所在（真机上它就是全白），那时唯一的办法是把同尺寸的每张都看一眼。
+// Grab every known texture of the same size (DM_NVN_SHOT_ALL): the instrument for finding "which texture did the game
+// draw the picture into" -- the present texture may not hold the picture at all (on the device it is all white), and
+// then the only way is to look at each same-size texture.
+static void shot_all_same_size(const tex_t *t, const char *prefix) {
+    if (!t) return;
+    uint32_t w = t->d.width, h = t->d.height;
+    uint64_t ser[24];
+    int n = vk_tex_same_size_serials(w, h, ser, 24);
+    LOG("[vk] 同尺寸（%ux%u）共 %d 张：逐张截到 %s<序号>.png", w, h, n, prefix);
+    for (int i = 0; i < n; i++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s%llu.png", prefix, (unsigned long long)ser[i]);
+        shot_grab_ser(ser[i], w, h, path, 1);
+    }
 }
 
 // 出图。安卓这边没有出图队列（M3 才有真的交换链），所以只做三件事：数帧、按请求截图、把票号报 0。
@@ -489,6 +574,34 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     for (int i = 0; i < nf; i++)
         if ((long)n == frames[i]) { char path[512]; snprintf(path, sizeof path, shot_path, (int)n); shot_take(t, path); }
+
+    // DM_NVN_SHOT_ALL=帧号:路径前缀 —— 该帧把"与出图纹理同尺寸"的每张已知贴图各截一张（找画面在哪一张）
+    // DM_NVN_SHOT_ALL=<frame>:<path prefix> -- at that frame, grab every known texture of the same size as the present
+    // texture (to find which one holds the picture)
+    static long all_at = -1; static const char *all_prefix;
+    if (all_at < 0) {
+        const char *e = getenv("DM_NVN_SHOT_ALL"), *c = e ? strchr(e, ':') : NULL;
+        all_at = (c && c > e) ? atol(e) : 0;
+        if (c) { all_prefix = c + 1; LOG("[vk] 同尺寸全部截取已排程：出图帧 %ld → %s", all_at, all_prefix); }
+    }
+    if (all_at > 0 && (long)n == all_at) shot_all_same_size(t, all_prefix);
+
+    // DM_NVN_SHOT_SCAN=帧号[:路径前缀] —— 该帧扫一遍所有已知贴图（报统计，只有有内容的落盘）。不预设尺寸。
+    // DM_NVN_SHOT_SCAN=<frame>[:<path prefix>] -- at that frame, scan every known texture (report statistics, write
+    // only the ones with content). No size presupposed.
+    static long sc[8]; static int nsc = -1; static const char *sc_prefix;
+    if (nsc < 0) {
+        nsc = 0;
+        const char *e = getenv("DM_NVN_SHOT_SCAN");
+        if (e) {
+            const char *c = strchr(e, ':');
+            const char *end = c ? c : e + strlen(e);
+            if (c) sc_prefix = c + 1;
+            for (const char *q = e; q < end && nsc < 8; q = strchr(q, ',') ? strchr(q, ',') + 1 : end) sc[nsc++] = atol(q);
+            if (nsc) LOG("[vk] 扫描已排程：出图帧 %s 共 %d 个 → %s", e, nsc, sc_prefix ? sc_prefix : "（不落盘）");
+        }
+    }
+    for (int i = 0; i < nsc; i++) if ((long)n == sc[i]) shot_scan(n, sc_prefix);
 
     pthread_mutex_lock(&g_shotq_mu);
     for (int i = 0; i < g_nshotq;) if (n >= g_shotq[i].frame) { shot_take(t, g_shotq[i].path); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;

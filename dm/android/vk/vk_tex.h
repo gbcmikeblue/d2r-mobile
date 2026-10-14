@@ -90,6 +90,20 @@ int vk_tex_is_gpu_written(const tex_t *t);
 // Returns 1 on success and writes the actual size back through out_w / out_h.
 int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h);
 
+// 同一件事，但按**序号**问：截"游戏自己那些渲染目标"时只有序号可问（它们的 tex_t 不在回放层手上）。
+// The same thing but asked by **serial**: grabbing "the game's own render targets" can only be asked by serial (the
+// replay layer does not hold their tex_t).
+int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h);
+
+// 某尺寸下的全部已知贴图序号（最多 cap 个，返回个数）
+// Every known texture serial of a given size (at most cap of them; returns the count)
+int vk_tex_same_size_serials(uint32_t w, uint32_t h, uint64_t *out, int cap);
+
+// 列出所有已有图像的贴图（序号 + 尺寸），最多 cap 个，返回个数。扫描用：一次看全，不按尺寸筛。
+// List every texture that already has an image (serial plus size), at most cap of them, returning the count. For a
+// scan: see everything at once without filtering by size.
+int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
+
 // 贴图 → 贴图拷贝（NVN 的 nvnCommandBufferCopyTextureToTexture）。记进**回放层的命令缓冲**，不另开一次提交
 // ——顺序就是语义：拷贝必须排在产生源内容的那些绘制之后。区域里宽/高/深 <= 0 表示"从偏移到边界"（NVN 的约定）。
 // 放在纹理层是因为只有这里同时知道两边的布局与"池是真值还是 GPU 写过"。
