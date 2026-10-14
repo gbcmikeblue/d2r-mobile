@@ -631,15 +631,19 @@ Proceed in the order on this page; after each milestone, tick it off here and re
 milestone A (the rendering chain's warnings) are now done**: the descriptor blanks (the UBO name number minus 3, the
 storage buffer derived from `cb_offset`, and **buffer textures** as a new resource kind -- see "M3-2k") and the vertex
 attribute test ("M3-2l": two independent faults, one of them caught by a probe). Device readings: `顶点属性` 0,
-`贴图写空白` 0, `拿不到缓冲地址` 0, `target 10 暂不支持` 0. **"Scan first" has now been done ("M3-2m")**: reading level 0
-texture by texture gives **all zero** (26 / 63 / 63 textures at >=256x256, not one with content); but with the viewer on
-**level 1** the same 1600x900 render target **does carry content** (`mean 0.3, max 160`). So "the GPU writes no colour
-content" has to be narrowed to "**level 0** carries none", and the blocker turns from "is there a picture" into "**which
-level holds it, and does the readback read the right one**". What follows is ordered by value:
+`贴图写空白` 0, `拿不到缓冲地址` 0, `target 10 暂不支持` 0. **"Scan first" has now been done twice over ("M3-2m")**:
+reading level 0 texture by texture gives **all zero**, and going **level by level** is still **all zero** (33 level reads
+at frame 50, **0 with content**). The "the viewer reads content at level 1" found in between was stale heap bytes read at
+a **wrong pitch**, and with the pitch fixed both sides agree (part six of "M3-2m") -- **step 14's conclusion stands**;
+what changed is that the instrument is now trustworthy. What follows is ordered by value:
 
-1. **Scan level by level** -- turn the scan from "level 0 only" into "**read every level, each with its own size**", and
-   let "has content or not" answer "which level holds the picture"; fix the driver-side crash on the way (copying level 1
-   with a level-0-sized buffer: `sig=11 pc=vulkan.adreno.so+0x2a7ac8`);
+1. **Chase the readback's concurrency crash** (part seven of "M3-2m") -- `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0` lands in
+   **our own code**, the scene being "the viewer and the scan/present reading at the **same time**" over **one resident
+   staging buffer** (`stg_get`), so the first suspects are its reuse and the edge of the queue lock. Until that is fixed
+   the "look at the picture" loop is itself unreliable.
+   The level-by-level scan is **already in** (part six): 33 level reads at frame 50, **0 with content**. The next round has
+   to scan a **later frame** -- this device normally stalls at 55-60 presents, so the scan points have to sit inside what
+   it can actually reach (50/54/57, say), or "scanned" and "never got there" cannot be told apart;
 2. **Milestone B: the guest stall** -- classify it by sampling `/proc` over several rounds (the one-shot stall sampler
    and the wait-point dump are both in place). This device normally stalls at 55-60 presents, so the judgement has to be
    read from "what is it doing across several samples", never against the occasional outlier run;
@@ -1241,6 +1245,40 @@ real subresource size -- size it from "that level's dimensions" when fixing it.
 **5. The instruments**: `DM_PASS_AREA=1` (measure only) / `=2` (render area from the attachment size, the control), with one
 line carrying "render area / attachment / viewport / scissor" side by side plus four running counts (below the attachment,
 collapsed to 1x1, no viewport when the pass opened, offset viewport).
+
+**6. Re-checked: the "level 1 has content" conclusion above is wrong (the pitch)** (added the same day, inside the same round)
+
+The first device run after the level-by-level scan landed overturned it. The fault was in the **viewer**: it sized its
+buffer and its pitch by the **base** image (`g_src_w * 4`) and then read level 1 with that pitch -- level 1's real row is
+only half as wide, so the rows came back shifted and the tail fell into **uninitialised heap memory**, which reads as
+"mean 0.3, max 160" of stale bytes. Level 0 read correctly (0.0) precisely because its row width matches the base.
+(This is the classic shape of "two numbers that look like a conclusion": **a broken instrument hands you a very
+plausible number**.)
+
+Two fixes: (1) the buffer and the pitch both follow **the level being read** (`>> level`); (2) `shot_grab_ser_lv`'s return
+value separates "read succeeded" from "has content" (0 = failed, 1 = read fine but a single value throughout, 2 = read
+fine with content), and the scan's summary counts with it.
+
+**Once fixed, the two readings agree**:
+
+| Method | serial 28, level 0 | serial 28, level 1 | serial 28, level 2 |
+|---|---|---|---|
+| Level-by-level scan (fixed) | mean 0.0 | **mean 0.0** | mean 0.0 |
+| Viewer (fixed) | -- | **mean 0.0, min 0, max 0** | -- |
+
+**So "the picture is at level 1" does not hold.** At the device's frame 50 the 26 textures at >=256x256 were read
+**level by level** 33 times with **0 having content** (serial 27's levels 1 and 2 read **255**, i.e. pure white -- still no
+content). Step 14's "the GPU writes no colour content" **stands as it was**; what changed is the **instrument**: it is now
+level-complete, and the pitch is right.
+
+**7. The crash, incidentally, is in **our own** code.** This round records `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0`
+(the previous round recorded `vulkan.adreno.so+0x2a7ac8`). The scene is "the viewer thread and the scan/present reading at
+the **same time**", and readback shares **one resident staging buffer** (`stg_get`), so the first suspects are the buffer's
+reuse and the edge of the queue lock. **That is the next item** -- it is no longer the driver's business.
+
+**8. The lesson worth recording on its own**: `DM_NVN_SHOT_SCAN` reading level 0 alone was a **gap in the instrument**,
+not a property of the world; and the viewer's "has content" was **another** gap. Together the two gaps were enough to make
+a conclusion that does not exist look supported by two pieces of evidence.
 
 ---
 

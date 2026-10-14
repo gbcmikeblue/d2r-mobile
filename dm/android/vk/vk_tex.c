@@ -906,7 +906,7 @@ int vk_tex_grab(const tex_t *t, unsigned level, uint8_t *dst, size_t pitch, uint
 // 列出所有"已经有图像"的贴图（扫描用：不按尺寸筛，一次看全，省得漏掉真画面所在的那个尺寸）
 // List every texture that already has an image (for a scan: no size filter, so the size the picture actually lives at
 // cannot be missed)
-int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap) {
+int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, uint32_t *lvs, int cap) {
     pthread_mutex_lock(&g_mu);
     int n = 0;
     for (int i = 0; i < g_cap && n < cap; i++) {
@@ -915,6 +915,7 @@ int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap) {
         ser[n] = e->serial;
         ws[n] = e->w;
         hs[n] = e->h;
+        lvs[n] = e->levels ? e->levels : 1;   // 级数：扫描逐级读要靠它（0 当 1，别把"还不知道"当成"没有") | the level count, which the level-by-level scan needs (0 counts as 1 rather than "unknown means none")
         n++;
     }
     pthread_mutex_unlock(&g_mu);

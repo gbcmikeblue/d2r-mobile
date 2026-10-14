@@ -108,10 +108,14 @@ int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch,
 // Every known texture serial of a given size (at most cap of them; returns the count)
 int vk_tex_same_size_serials(uint32_t w, uint32_t h, uint64_t *out, int cap);
 
-// 列出所有已有图像的贴图（序号 + 尺寸），最多 cap 个，返回个数。扫描用：一次看全，不按尺寸筛。
-// List every texture that already has an image (serial plus size), at most cap of them, returning the count. For a
-// scan: see everything at once without filtering by size.
-int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
+// 列出所有已有图像的贴图（序号 + 尺寸 + **级数**），最多 cap 个，返回个数。扫描用：一次看全，不按尺寸筛。
+// `lvs` 是每张贴图的 mip 级数——**扫描必须逐级读**：真机上第 0 级全零而第 1 级有内容（「M3-2m」），
+// 只读第 0 级等于把"画面在第几级"这个问题跳过去。
+// List every texture that already has an image (serial, size and **level count**), at most cap of them, returning the
+// count. For a scan: see everything at once without filtering by size.
+// `lvs` is each texture's mip count -- **a scan has to go level by level**: on the device level 0 reads all zero while
+// level 1 has content ("M3-2m"), so reading level 0 alone skips the question "which level holds the picture".
+int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, uint32_t *lvs, int cap);
 
 // 报一张贴图的身份：序号、尺寸、格式、是否窗口贴图、是否 GPU 写过。用来回答"这个序号到底是什么"——
 // 真机上渲染目标前 5 里混着 143/67/68 这种每窗口上千次的序号，它们很像三张轮转的交换链纹理，而那件事必须问清。

@@ -37,7 +37,9 @@
 // that header pulls in the host's internal headers (nvn_obj.h) and the compat layer, while the app side is clean
 // Android code (see the note in CMakeLists: the dm_android_compat force-include is deliberately **not** added here).
 int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h);
-int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
+// `lvs` = 每张贴图的 mip 级数：查看器要按**要读的那一级**准备缓冲与行距（见 viewer_frame 里那段）。
+// `lvs` = each texture's mip count: the viewer sizes its buffer and pitch by **the level it reads** (see viewer_frame).
+int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, uint32_t *lvs, int cap);
 // 心跳/报告用的那两件（同样就地声明）：出图次数、以及一行宿主侧计数
 // The two used by the heartbeat / report (also declared locally): the present count and one line of host-side counters
 uint64_t vk_present_count(void);
@@ -425,14 +427,23 @@ static int viewer_frame(double t) {
     // Ask the size first (the texture layer's entry has it) and size the buffer to it: replaced when the source changes
     uint32_t need_w = 0, need_h = 0;
     if (!g_src_buf) {
-        static uint64_t ser[64]; static uint32_t ws[64], hs[64];
-        int n = vk_tex_list(ser, ws, hs, 64);
+        static uint64_t ser[64]; static uint32_t ws[64], hs[64], lvs[64];
+        int n = vk_tex_list(ser, ws, hs, lvs, 64);
         for (int i = 0; i < n; i++) if (ser[i] == g_src_ser) { need_w = ws[i]; need_h = hs[i]; break; }
         if (!need_w) need_w = IMG_W, need_h = IMG_H;
+        // 缓冲与行距都按**要读的那一级**的尺寸。读第 1 级却按底图给行距，读回来的行距与实际不符 ——
+        // 亮度统计与上屏都把错位的行当成连续像素，看上去像画面被斜切（"读到了内容"那条读数因此也不可信）。
+        // Buffer and pitch both follow **the level being read**. Handing over a base-sized pitch while reading level 1
+        // makes the rows come back with a stride that does not match -- the luminance loop and the present both then
+        // treat shifted rows as contiguous pixels, which looks like a sheared picture (and makes "it read content" an
+        // untrustworthy reading too).
+        if (g_src_lv < 31) { need_w >>= g_src_lv; need_h >>= g_src_lv; }
+        if (!need_w) need_w = 1;
+        if (!need_h) need_h = 1;
         g_src_buf = malloc((size_t)need_w * need_h * 4);
-        if (!g_src_buf) { LOGE("查看器：%ux%u 的缓冲分配不出", need_w, need_h); g_src_ser = 0; return 0; }
+        if (!g_src_buf) { LOGE("查看器：%ux%u（第 %u 级）的缓冲分配不出", need_w, need_h, g_src_lv); g_src_ser = 0; return 0; }
         g_src_w = need_w; g_src_h = need_h;
-        LOGI("贴图查看器：源序号 %llu（%ux%u）", (unsigned long long)g_src_ser, g_src_w, g_src_h);
+        LOGI("贴图查看器：源序号 %llu 第 %u 级（%ux%u）", (unsigned long long)g_src_ser, g_src_lv, g_src_w, g_src_h);
     }
     uint32_t gw = 0, gh = 0;
     if (!vk_tex_grab_ser(g_src_ser, g_src_lv, g_src_buf, (size_t)g_src_w * 4, &gw, &gh)) {

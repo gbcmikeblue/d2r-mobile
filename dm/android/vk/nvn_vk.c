@@ -528,12 +528,25 @@ __attribute__((weak)) void dm_shot_written(const char *path, int ok) { (void)pat
 // `save_blank`: whether to write the file even when the whole picture is a single value (the present path wants it --
 // it has to prove "this really is blank"; a scan does not -- the statistics line says it, and writing a 5.7 MB
 // single-colour file proves nothing).
-static int shot_grab_ser(uint64_t serial, uint32_t w, uint32_t h, const char *path, int save_blank) {
+// `level`：读第几级 mip。`w`/`h` 是**底图**尺寸，缓冲与行距按该级算（`>> level`）。
+// 为什么要带级：真机上"扫一遍第 0 级全零、查看器读第 1 级却有内容"（「M3-2m」），而扫描原来把级**写死成 0**、
+// 缓冲还按底图开——于是"画面在第几级"这个问题从来没被问过。读回那一层本来就支持按级（`vk_tex_grab_ser` 里
+// `w = iw >> lv`），缺的只是调用侧把级传下来。
+// `level`: which mip to read. `w`/`h` are the **base** size and the buffer and pitch follow the level (`>> level`).
+// Why the level matters: on the device a level-0 scan reads all zero while the viewer reads content at level 1
+// ("M3-2m"), and the scan used to hardcode level 0 with a base-sized buffer -- so "which level holds the picture" was
+// never actually asked. The readback layer already supports a level (`w = iw >> lv` in `vk_tex_grab_ser`); what was
+// missing is the call site passing it down.
+static int shot_grab_ser_lv(uint64_t serial, unsigned level, uint32_t w, uint32_t h, const char *path, int save_blank) {
     if (!w || !h) { LOG("【红】截图 %s：尺寸 %ux%u", path, w, h); return 0; }
-    uint8_t *buf = malloc((size_t)w * h * 4);
-    if (!buf) { LOG("【红】截图 %s：%ux%u 的像素缓冲分配不出", path, w, h); return 0; }
+    uint32_t lw = level > 31 ? 1u : (w >> level), lh = level > 31 ? 1u : (h >> level);
+    if (!lw) lw = 1;
+    if (!lh) lh = 1;
+    uint8_t *buf = malloc((size_t)lw * lh * 4);
+    if (!buf) { LOG("【红】截图 %s：%ux%u（第 %u 级）的像素缓冲分配不出", path, lw, lh, level); return 0; }
     uint32_t gw = 0, gh = 0;
-    int ok = vk_tex_grab_ser(serial, 0, buf, (size_t)w * 4, &gw, &gh);
+    int content = 0;   // 这一级到底有没有内容（整片一个值 = 没有）；扫描的汇总与返回码都要它 | whether this level has content at all (a single value throughout means none); the scan's summary and the return code both need it
+    int ok = vk_tex_grab_ser(serial, level, buf, (size_t)lw * 4, &gw, &gh);
     if (ok) {
         // 亮度统计：白 / 黑 / 有内容从此是**日志里的数**，不必把图拉下来才知道（上一轮的"全白"正是这样看出来的）
         // Luminance statistics: white / black / has content become **numbers in the log** instead of something you
@@ -548,18 +561,19 @@ static int shot_grab_ser(uint64_t serial, uint32_t w, uint32_t h, const char *pa
             if (l > hi) hi = l;
         }
         double mean = np ? (double)sum / (double)np : 0.0;
+        content = lo != hi;
         if (!path || (lo == hi && !save_blank)) {
             // 整片一个值就是"没有画面"的**数**：扫描时只报不写
             // A single value across the whole picture is "no picture" as a **number**: a scan reports it without writing
-            LOG("[vk] 扫描 序号 %llu %ux%u：亮度 均值 %.1f、最小 %u、最大 %u%s", (unsigned long long)serial, gw, gh, mean, lo, hi,
+            LOG("[vk] 扫描 序号 %llu 第 %u 级 %ux%u：亮度 均值 %.1f、最小 %u、最大 %u%s", (unsigned long long)serial, level, gw, gh, mean, lo, hi,
                 path ? "（整片一个值，不落盘）" : "（只统计）");
         } else {
             ok = vk_png_write(path, buf, gw, gh);
-            LOG("截图序号 %llu %ux%u → %s %s；亮度 均值 %.1f、最小 %u、最大 %u", (unsigned long long)serial, gw, gh, path,
+            LOG("截图序号 %llu 第 %u 级 %ux%u → %s %s；亮度 均值 %.1f、最小 %u、最大 %u", (unsigned long long)serial, level, gw, gh, path,
                 ok ? "成功" : "失败", mean, lo, hi);
         }
     } else {
-        LOG("截图序号 %llu %ux%u → %s 失败", (unsigned long long)serial, w, h, path);
+        LOG("截图序号 %llu 第 %u 级 %ux%u → %s 失败", (unsigned long long)serial, level, lw, lh, path);
         // 读不回来就把"这个尺寸还有哪些已知贴图"列出来（只列一次：逐张截取时后面每张都失败，会刷屏）
         // If the readback fails, list which known textures share this size (once only: when grabbing every texture of
         // a size, the later ones all fail and would flood the log)
@@ -568,7 +582,10 @@ static int shot_grab_ser(uint64_t serial, uint32_t w, uint32_t h, const char *pa
     }
     free(buf);
     if (path) dm_shot_written(path, ok);
-    return ok;
+    // 返回值把"读成功"与"有没有内容"分开（扫描要靠它做汇总）：0 = 失败、1 = 读成功但整片一个值、2 = 读成功且有内容。
+    // The return separates "read succeeded" from "has content" (the scan needs it for its summary): 0 = failed,
+    // 1 = read fine but a single value throughout, 2 = read fine with content.
+    return ok ? (content ? 2 : 1) : 0;
 }
 
 // 出图那一支（tex_t 入口）：等到 GPU 做完，把这张纹理从驱动侧读回，写成 PNG。
@@ -585,7 +602,7 @@ static int shot_take(const tex_t *t, const char *path) {
         LOG("【红】截图 %s：出图贴图（序号 %llu）建不出图像", path, (unsigned long long)t->serial);
         return 0;
     }
-    return shot_grab_ser(t->serial, t->d.width, t->d.height, path, 1);
+    return shot_grab_ser_lv(t->serial, 0, t->d.width, t->d.height, path, 1) != 0;
 }
 
 // 扫描：把**所有**已知贴图各读一次、报一行统计，只有"不是整片一个值"的才落盘。与"同尺寸"那条相比，它不预设画面
@@ -594,10 +611,11 @@ static int shot_take(const tex_t *t, const char *path) {
 // are not a single value throughout. Unlike the same-size path it does not presuppose which size the picture lives at
 // -- on the device all eleven 1600x900 textures are empty (0 or 255), and the picture may not be at that size at all.
 static void shot_scan(uint64_t frame, const char *prefix) {
-    enum { SCAN_MAX = 192 };
+    enum { SCAN_MAX = 192, SCAN_MAXLV = 16 };
     static uint64_t ser[SCAN_MAX];
     static uint32_t ws[SCAN_MAX], hs[SCAN_MAX];
-    int n = vk_tex_list(ser, ws, hs, SCAN_MAX);
+    static uint32_t lvs[SCAN_MAX];
+    int n = vk_tex_list(ser, ws, hs, lvs, SCAN_MAX);
     // 只扫"够大"的：画面不可能是一张 16×24 的精灵图，而每读一张都要分配一次缓冲并等一次队列（实测约 0.45 秒），
     // 192 张会把整轮跑满。这个门槛是**语义**上的，不是性能上的取巧。
     // Only "big enough" ones: a picture cannot be a 16x24 sprite, and every read allocates a buffer and waits for the
@@ -605,17 +623,32 @@ static void shot_scan(uint64_t frame, const char *prefix) {
     // a performance trick.
     int big = 0;
     for (int i = 0; i < n; i++) if (ws[i] >= 256 && hs[i] >= 256) big++;
-    LOG("[vk] 扫描（出图第 %llu 次）：已知贴图 %d 张，其中 ≥256×256 的 %d 张，逐张读一次，只有有内容的落盘到 %s",
+    LOG("[vk] 扫描（出图第 %llu 次）：已知贴图 %d 张，其中 ≥256×256 的 %d 张，**逐张逐级**读一遍，只有有内容的落盘到 %s",
         (unsigned long long)frame, n, big, prefix ? prefix : "（不落盘）");
+    int nread = 0, ncontent = 0;
     for (int i = 0; i < n; i++) {
         if (ws[i] < 256 || hs[i] < 256) continue;
-        char path[512];
-        // 文件名带帧号：多帧扫描时同一张贴图会被看好几次，不带帧号就互相覆盖了
-        // The name carries the frame number: a multi-frame scan looks at the same texture several times, and without it
-        // they would overwrite one another
-        if (prefix) snprintf(path, sizeof path, "%s%llu-%llu.png", prefix, (unsigned long long)frame, (unsigned long long)ser[i]);
-        shot_grab_ser(ser[i], ws[i], hs[i], prefix ? path : NULL, 0);
+        int nl = lvs[i] ? (int)lvs[i] : 1;
+        if (nl > SCAN_MAXLV) nl = SCAN_MAXLV;
+        for (int lv = 0; lv < nl; lv++) {
+            // 每级用**该级自己的尺寸**（`>> lv`），并各自过"够大"这条线：一级 800×450 是画面，二级 400×225 也是，
+            // 再往下才没有意义——门槛跟着级走，不然"逐级"就白做了。
+            // Each level uses **its own size** (`>> lv`) and passes the "big enough" line on its own: 800x450 at level 1
+            // is a picture and so is 400x225 at level 2, and only below that does it stop meaning anything -- the
+            // threshold follows the level, or "level by level" would be pointless.
+            uint32_t lw = lv > 31 ? 1u : (ws[i] >> lv), lh = lv > 31 ? 1u : (hs[i] >> lv);
+            if (lw < 128 || lh < 128) break;
+            char path[512];
+            // 文件名带帧号与级号：多帧扫描时同一张贴图的同一级会被看好几次，不带就会互相覆盖
+            // The name carries the frame number and the level: a multi-frame scan looks at the same level of the same
+            // texture several times, and without them they overwrite one another
+            if (prefix) snprintf(path, sizeof path, "%s%llu-%llu-l%u.png", prefix, (unsigned long long)frame,
+                                 (unsigned long long)ser[i], (unsigned)lv);
+            nread++;
+            if (shot_grab_ser_lv(ser[i], (unsigned)lv, ws[i], hs[i], prefix ? path : NULL, 0) >= 2) ncontent++;
+        }
     }
+    LOG("[vk] 扫描（出图第 %llu 次）结束：读了 %d 次（逐张逐级），其中 %d 次拿到了内容", (unsigned long long)frame, nread, ncontent);
 }
 
 // 同尺寸的全部已知贴图逐张截出来（DM_NVN_SHOT_ALL）：这是找"游戏把画面画进了哪一张"的仪器——
@@ -632,7 +665,7 @@ static void shot_all_same_size(const tex_t *t, const char *prefix) {
     for (int i = 0; i < n; i++) {
         char path[512];
         snprintf(path, sizeof path, "%s%llu.png", prefix, (unsigned long long)ser[i]);
-        shot_grab_ser(ser[i], w, h, path, 1);
+        shot_grab_ser_lv(ser[i], 0, w, h, path, 1);
     }
 }
 
