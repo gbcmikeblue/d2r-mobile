@@ -48,6 +48,13 @@ add_library(dmhost_android STATIC
   ${COMPAT}/dm_android_compat.c
   ${CMAKE_CURRENT_SOURCE_DIR}/front_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/gfx_stub_android.c
+  # 图形后端（M2）：设备建设备与「把客体地址空间换成 Vulkan 零拷贝内存」两件基础设施。
+  # 回放层的其余部分陆续加进来，加一块就从 gfx_stub_android.c 里删掉对应的空实现。
+  # Graphics backend (M2): two pieces of infrastructure, the device bring-up and "turn the guest address
+  # space into Vulkan zero-copy memory". The rest of the replay layer arrives piece by piece, and each piece
+  # removes its stub from gfx_stub_android.c.
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region.c
   ${HOST_SRC}
   ${DM}/host/entry.S
   ${GFX_SRC}
@@ -55,7 +62,10 @@ add_library(dmhost_android STATIC
   ${LIBDEFLATE}
   ${DM}/ios/Sources/dm_touch_controls.c)
 
+target_link_libraries(dmhost_android PUBLIC vulkan)
+
 target_include_directories(dmhost_android PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
   ${DM}/host
   ${DM}/gfx/nvn
   ${DM}/gfx/nvn/include
@@ -98,6 +108,11 @@ target_include_directories(vk_hostmem_probe PRIVATE ${COMPAT})
 # M2's third capability probe: how much zero-copy memory can be obtained at once, and is it enough to
 # back the guest address space (heap 4 GB + alias 512 MB). This is the feasibility evidence for the design
 # route "what to do about zero-copy now that VK_EXT_external_memory_host is missing".
+add_executable(vk_fdmap_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_fdmap_probe.c)
+target_link_libraries(vk_fdmap_probe PRIVATE vulkan)
+target_link_options(vk_fdmap_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk_fdmap_probe PRIVATE ${COMPAT})
+
 add_executable(vk_region_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region_probe.c)
 target_link_libraries(vk_region_probe PRIVATE vulkan)
 target_link_options(vk_region_probe PRIVATE -Wl,-z,max-page-size=16384)

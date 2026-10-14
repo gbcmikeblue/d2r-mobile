@@ -4,6 +4,7 @@
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
 #include "hle.h"
+#include "dm_gpu_region.h"
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <errno.h>
@@ -11,6 +12,11 @@
 #include <unistd.h>
 #include <sched.h>
 #include <time.h>
+
+// 图形后端登记的内存换轨实现（见 dm_gpu_region.h）：安卓侧在启动时登记，苹果侧不登记。
+// The memory-overlay implementation the graphics backend registers (see dm_gpu_region.h): the Android side
+// registers one at startup, the Apple side does not.
+size_t (*dm_gpu_region_use)(void *at, size_t size, const char *what);
 
 // 预留一整块客体地址空间，按 Horizon 分区（地址值直接用宿主 mmap 得到的真地址）。只占地址、不占内存。
 // 大小 5 GB：游戏要的是开头 1 GB（别名区、栈）+ 一整块堆（应用内存池 3285 MiB，见下面 APP_POOL），合计约 4.2 GB；
@@ -40,6 +46,27 @@ static void mem_init(void) {
     g_alias = g_as + 0x10000000; g_alias_cap = 0x20000000;
     g_stack = g_as + 0x30000000; g_stack_cap = 0x10000000;
     g_heap  = g_as + 0x40000000; g_heap_cap  = RESERVE - 0x40000000;   // 4 GB，容得下游戏那一整块约 3.2 GB 的堆 | 4 GB, enough to hold the game's single heap block of about 3.2 GB
+    // 安卓：堆与别名区得换成图形后端（Vulkan）的零拷贝内存，否则这两块里的顶点/索引/纹理没法当 GPU 缓冲用
+    //（苹果有统一内存不需要，见 dm_gpu_region.h）。地址与偏移一个都不动，所以上面那套算法与 QueryMemory 不受影响；
+    // 但换不到的字节数要如实反映到报给客体的上限上，不能静默当成成功。
+    // Android: the heap and the alias region have to become the graphics backend's (Vulkan's) zero-copy
+    // memory, or vertex/index/texture data in them cannot serve as GPU buffers (Apple has unified memory and
+    // needs none of this, see dm_gpu_region.h). Not a single address or offset changes, so the arithmetic
+    // above and QueryMemory are unaffected; but whatever could not be converted must be reflected honestly in
+    // the limits reported to the guest rather than silently passed off as success.
+    if (dm_gpu_region_use) {
+        size_t h = dm_gpu_region_use(g_heap, g_heap_cap, "堆");
+        if (h < g_heap_cap) { LOG("【黄】堆只换到 %llu MB / %llu MB：报给客体的堆上限据此下调", (unsigned long long)(h >> 20), (unsigned long long)(g_heap_cap >> 20)); g_heap_cap = h; }
+        if (!h) LOG("【红】堆没能换成 GPU 可见内存：池子里的顶点/纹理将无法使用");
+        size_t a = dm_gpu_region_use(g_alias, g_alias_cap, "别名区");
+        if (a < g_alias_cap) { LOG("【黄】别名区只换到 %llu MB / %llu MB：上限据此下调", (unsigned long long)(a >> 20), (unsigned long long)(g_alias_cap >> 20)); g_alias_cap = a; }
+        if (!a) LOG("【红】别名区没能换成 GPU 可见内存");
+    } else {
+        // 苹果侧走这里（不需要换）；安卓侧走到这里说明图形后端没在启动时登记，那池子里的东西一件也用不了。
+        // Apple takes this path (nothing to convert); on Android reaching it means the graphics backend never
+        // registered at startup, in which case nothing in a pool can be used.
+        LOG("【黄】图形后端没登记内存换轨：堆与别名区按普通内存走");
+    }
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack);
 }
 

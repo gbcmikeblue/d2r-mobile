@@ -4,6 +4,9 @@
 // this fills in the front.h interface only; the guest runs directly on the calling thread and
 // presentation is left to the later Vulkan backend (M2).
 #include "front.h"
+#include "dm_gpu_region.h"
+#include "vk/vk_device.h"
+#include "vk/vk_region.h"
 #include <stdint.h>
 
 // 客体直接在调用线程上跑：安卓这边没有「主线程归系统 UI」的约束——宿主自己就是可执行文件，
@@ -11,7 +14,18 @@
 // The guest runs directly on the calling thread: Android has no "main thread belongs to the system
 // UI" constraint here, because the host is the executable itself and there is no UI event loop that
 // the main thread must be kept free for.
-void front_run(void (*guest)(void)) { guest(); }
+//
+// 跑客体之前先把图形后端备好：Vulkan 设备要在客体第一次陷内核（mem_init 铺地址空间）之前就绪，
+// 并把内存换轨登记上去，否则堆与别名区会按普通内存铺下去，池子里的顶点/纹理就上不了 GPU。
+// The graphics backend is prepared before the guest runs: the Vulkan device must be up before the guest's
+// first kernel trap (mem_init laying out the address space) and the memory overlay must be registered, or
+// the heap and alias region would be laid out as ordinary memory and vertex/texture data in a pool could
+// never reach the GPU.
+void front_run(void (*guest)(void)) {
+    vk_device_init();
+    dm_gpu_region_use = vk_region_use;
+    guest();
+}
 
 // 还没有图形后端：返回 NULL，宿主据此走「无窗口」路径（不出图、不弹原生输入框）。
 // No graphics backend yet: return NULL and the host takes its "no window" paths (no presentation,

@@ -436,6 +436,33 @@ That is about 4.5 GB of Vulkan allocations, committed lazily, so it does not rea
   loudly and count them**, so that the real device tells us whether it ever happens before we decide on a
   compensation route (a shadow copy, or changing the allocation).
 
+**(4) Two more things measured while implementing (both handled)**
+
+- The carrier buffer must not use `STORAGE_BUFFER`: exporting an fd requires a "dedicated" buffer for that
+  allocation (see above), and a 4 GB carrier buffer created with `STORAGE_BUFFER` fails outright -- it hits the
+  driver's `maxStorageBufferRange`. The carrier is never really read or written, so transfer-only usage
+  suffices; on top of that, **when it cannot be created, step down by 128 MB**, the same treatment as the
+  allocation limit.
+- The heap overlay runs into the limit at 3968 MB, so **the limit reported to the guest must be reduced
+  honestly** (`g_heap_cap` goes from 4 GB to 3968 MB). This step is necessary: otherwise the guest would use a
+  4 GB heap and the last 128 MB would land on ordinary, unconverted memory. With the reduction in place the game
+  still sets its heap to 3728 MB (< 3968, as required) and boot proceeds all the way to `nnMain`.
+
+**Current state**: `dm/android/vk/` holds `vk_device.c` (the Vulkan device, created once per process) and
+`vk_region.c` (the memory overlay plus address lookup), wired into the host through the hook in
+`dm/host/dm_gpu_region.h` (the host itself knows no Vulkan). Log from a real device:
+
+```
+[green] Vulkan device ready: Adreno (TM) 830 (Vulkan 1.3.284) queue family 0; zero-copy memory type 4; fd extension = yes
+[yellow] heap overlay: only 3968 MB converted (4096 MB requested) -- hit the per-allocation limit, so the limit reported to the guest was lowered accordingly
+[green] alias region overlay: 512 MB is now directly GPU-visible (0x6fa0a81000, type 4)
+SetHeapSize: first heap setup succeeded, 3728 MB      <- unchanged after the overlay
+... nnMain returned
+```
+
+The next step is the replay layer itself (`nvn_vk.c`): implementing `mtl_init` / `mtl_pool_add` / `mtl_pool_del` /
+`mtl_addr` against the interface in `nvn_mtl.h` first, removing each stub from `gfx_stub_android.c` as it lands.
+
 ### M2 — minimal Vulkan replay layer (the largest item)
 
 - [ ] Vulkan skeleton: device, queue, `ANativeWindow` swapchain

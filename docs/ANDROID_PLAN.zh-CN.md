@@ -413,6 +413,29 @@ maxMemoryAllocationSize = 1024 MB（广告值，实际能超），bufferImageGra
 - **单次分配上限 3968 MB**：客体堆当前是 3728 MB，余量约 240 MB。若将来提高 `app_pool()` 让堆超过这个数，就会退化成「两块不连续」——所以 `mem_init` 要**在超限时明确报红**，而不是静默失败。
 - **落不到 Vulkan 区的池子**：客体若把池子开在普通 mmap 段（stack / 预留段），当前无法把它变成缓冲。实现时 `pool_add` 要**明确报红并计数**，先让真机跑出来告诉我们它到底会不会发生，再决定要不要补偿路（拷贝影子或改分配）。
 
+**④ 落地时又量出的两件事（都已处理）**
+
+- 载体缓冲不能用 `STORAGE_BUFFER`：为了导出 fd 必须给这份分配建一块「专属」缓冲（见上），实测把 4 GB 的载体缓冲按
+  `STORAGE_BUFFER` 建会直接失败——撞驱动的 `maxStorageBufferRange`。载体不会被真的读写，改成只给传输位即可；
+  同时**建不出来时按 128 MB 档往下退**，与分配上限的处理一致。
+- 堆换到 3968 MB 就顶到上限，**报给客体的上限必须如实下调**（`g_heap_cap` 由 4 GB 改成 3968 MB）。这一步是必要的：
+  否则客体照 4 GB 报的堆去用，最后 128 MB 会落在没换轨的普通内存上。实测下调后游戏照旧把堆设到 3728 MB（< 3968 ✓），
+  引导一路走到 `nnMain`。
+
+**当前状态**：`dm/android/vk/` 下已有 `vk_device.c`（Vulkan 设备，进程内建一次）与 `vk_region.c`（内存换轨 + 地址反查），
+宿主侧通过 `dm/host/dm_gpu_region.h` 的钩子接入（宿主自己不认识 Vulkan）。真机日志：
+
+```
+【绿】Vulkan 设备就绪：Adreno (TM) 830（Vulkan 1.3.284）队列族 0；零拷贝内存类型 4；扩展 fd=有
+【黄】堆 内存换轨：只换成 3968 MB（要 4096 MB）——顶到单次分配上限，报给客体的上限已相应下调
+【绿】别名区 内存换轨：512 MB 已是 GPU 直接可见（0x6fa0a81000，类型 4）
+SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
+... nnMain returned
+```
+
+下一步是回放层本身（`nvn_vk.c`）：按 `nvn_mtl.h` 的接口先实现 `mtl_init` / `mtl_pool_add` / `mtl_pool_del` / `mtl_addr`，
+每实现一块就从 `gfx_stub_android.c` 里删掉对应的空实现。
+
 ### M2 —— 最小 Vulkan 回放层（最大工作量）
 
 - [ ] 搭 Vulkan 骨架：设备、队列、`ANativeWindow` 交换链
