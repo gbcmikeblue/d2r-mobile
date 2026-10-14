@@ -76,11 +76,47 @@ English: [ANDROID_PLAN.md](ANDROID_PLAN.md)
 
 ### 探路 A —— 用 NDK 试编宿主层（不写新功能，只量化复用率）
 
-- [ ] 建一个最小 CMake 工程，把 `dm/host/` 的平台无关源文件加入编译
-- [ ] 首次编译，收集完整报错清单
-- [ ] 把报错分类：Apple 专有 API / POSIX 差异 / 头文件缺失 / 其他
-- [ ] 产出「宿主层复用率评估」结论（写回本页或单独文档）
-- [ ] **验收**：拿到一份"要改哪些文件、改多少处"的清单
+- [x] 建一个最小 CMake 工程，把 `dm/host/` 的平台无关源文件加入编译
+- [x] 首次编译，收集完整报错清单
+- [x] 把报错分类：Apple 专有 API / POSIX 差异 / 头文件缺失 / 其他
+- [x] 产出「宿主层复用率评估」结论
+- [x] **验收**：拿到一份"要改哪些文件、改多少处"的清单
+
+**结论（实测：NDK r30.0.16248370 / clang 21.0.0，`arm64-v8a`，`android-31`）**
+
+参与编译 **87 个编译单元**（`dm/host/*.c` 70 个 + `dm/gfx` 8 个 + libdeflate 5 个 + 触摸判定 1 个 + 汇编 3 个）：
+
+| 结果 | 数量 |
+|---|---|
+| **直接编过，零改动** | **56** |
+| C 文件有平台差异 | 29 个文件，共 **31 处**（每个 1–4 处） |
+| 汇编文件需重写 | 2 个（`nvn_thunks.S` 1047 处、`nvn_entry.S` 6 处） |
+
+**31 处 C 平台差异 —— 分类与解法**
+
+| 类别 | 处数 | 具体形式 | 解法 |
+|---|---|---|---|
+| Apple 专有头文件不存在 | 17 | `TargetConditionals.h`(7)、`mach/mach.h`(3)、`mach/mach_time.h`(3)、`CommonCrypto/CommonDigest.h`(2)、`sys/sysctl.h`(1)、`sys/clonefile.h`(1) | 加 `__ANDROID__` 分支，接平台等价实现 |
+| macOS 专有 API / 结构 | 14 | `st_mtimespec`(6)、`clock_gettime_nsec_np`(3)、`CLOCK_UPTIME_RAW`(2)、`pthread_get_stack{addr,size}_np`(2)、`F_GETPATH`(1) | 见下表 |
+
+| 原用法 | 安卓等价 |
+|---|---|
+| `struct stat.st_mtimespec` | `st_mtim`（POSIX） |
+| `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` | `clock_gettime(CLOCK_MONOTONIC)` |
+| `mach/mach_time.h` | `clock_gettime` |
+| `pthread_get_stacksize_np` / `pthread_get_stackaddr_np` | `pthread_getattr_np` + `pthread_attr_getstack` |
+| `F_GETPATH` | `/proc/self/fd/<fd>` + `readlink` |
+| `sys/sysctl.h` | `/proc` |
+| `clonefile()` | `copy_file_range` |
+| `CommonCrypto/CommonDigest.h` | 自带实现或其他库 |
+
+**汇编**
+
+`nvn_thunks.S`、`nvn_entry.S` 用的是 **Mach-O 汇编语法**（`@PAGEOFF`），在 Android 的 **ELF** 上不成立，要改成 AArch64 ELF 的写法（`#:lo12:` 等）。这是机械改动；其中 `nvn_thunks.S` 是生成文件（`dm/gfx/tools/gen_protos.py`），改生成器即可。
+
+**一句话结论：宿主层的 C 代码复用率约 95%+。** 87 个编译单元里 56 个**零改动通过**，其余 29 个共 31 处、且都是"换一个 API"级别的局部改动。这与可行性分析里"宿主层大部分是平台无关 POSIX/C"的判断一致，而且**比预期更乐观**。真正的重头戏仍然是图形层（M2 的 Vulkan 回放层）。
+
+**顺带记录（Windows 环境坑）**：跑 `gen_vault_table.py` / `gen_hud_exp.py` / `gen_bright_levels.py` 必须设 `PYTHONIOENCODING=utf-8`。否则 Python 在 Windows 上按 GBK 编码输出，遇到脚本注释里的 `U+2212` 会 `UnicodeEncodeError` 中途退出，生成出**被截断的表头**（表现为一堆 `vt_row` 未定义）。
 
 ### 探路 B —— 着色器翻译链落地
 
@@ -161,7 +197,28 @@ English: [ANDROID_PLAN.md](ANDROID_PLAN.md)
 | **`nvn_mtl.m` 体量** | 约 5,800 行 Metal，是最大的一块 | 按 NVN 函数分批移植，配合 `dm/gfx/tests` 的思路做等价测试 |
 | **性能** | iOS 的 60 fps 来自深度调优，不能假定直接搬过来 | M4 单独设调优阶段 |
 
-## 六、下一步
+## 六、Windows 作业规范（编码与命令）
+
+本项目目前在一台 Windows 机器上推进安卓移植。这里记下已经踩过的坑与约定，后续一律照此执行。
+
+### 编码
+
+- **Python 脚本一律设 `PYTHONIOENCODING=utf-8`**。Windows 控制台代码页是 GBK；脚本注释里含 `U+2212` 这类字符时会 `UnicodeEncodeError` **中途退出**（表现为生成的表头被截断）。
+- **重定向到文件用 cmd 的 `>`**（保持原始字节），不要在 PowerShell 里用管道 + `Out-File`（会改编码与行尾）。
+- **读文件显式指定编码**：PowerShell 用 `-Encoding`，或直接 `[System.IO.File]::ReadAllLines()`。
+- **路径一律纯 ASCII**。本机用户目录名含中文（`C:\Users\ZhuanZ（无密码）`），已经因此踩过两个坑：
+  - `hactool` 会把 `HOME` / `USERPROFILE`（含中文）转 UTF-16 失败而崩溃 → 跑之前先设一个 ASCII 的 `HOME`；
+  - 生成的表头、缓存、日志不要落在用户目录下。
+  - 约定位置：SDK 在 `C:\Android\Sdk`，工具/工作区在 `d:\yiyi\d2r-mobile\.tools`、`.work`。
+
+### 命令
+
+- **长任务必须给出进度显示**，不要静默等待：下载用 `curl`（不加 `--silent`）、构建用 `ninja`（默认的 `[n/m]` 进度）、`adb push/pull` 自带进度等。
+- **多步命令写成 `.bat` / `.cmd` 再执行**，不要在 PowerShell 里拼 `cmd /c "..."`（引号嵌套极易出错）。
+- 需要"收集全部错误"时用 `ninja -k 0`，输出重定向到日志后再统一分析。
+- **`sdkmanager` 已被官方弃用**，且在无 TTY 环境下无法接受许可；改用 `android sdk install`（启动时展示 ToS 后自动接受）。
+
+## 七、下一步
 
 按本页顺序推进：先把 M0 剩下的部分（SDK/NDK + 真机）补齐，再做探路 A、探路 B，然后进 M1。
 每完成一个里程碑，在这里回勾并记录结论。

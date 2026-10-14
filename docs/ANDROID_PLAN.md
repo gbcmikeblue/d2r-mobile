@@ -76,11 +76,47 @@ Principle: **do not rewrite gameplay**; reuse the existing host and replace only
 
 ### Recon A — compile the host layer with the NDK (no new features; just quantify reuse)
 
-- [ ] Create a minimal CMake project that compiles the platform-independent sources of `dm/host/`
-- [ ] First compile; collect the full list of errors
-- [ ] Classify the errors: Apple-only API / POSIX differences / missing headers / other
-- [ ] Produce a "host-layer reuse assessment" conclusion (write it back here or into its own document)
-- [ ] **Acceptance**: a list of "which files change, and at how many points"
+- [x] Create a minimal CMake project that compiles the platform-independent sources of `dm/host/`
+- [x] First compile; collect the full list of errors
+- [x] Classify the errors: Apple-only API / POSIX differences / missing headers / other
+- [x] Produce a "host-layer reuse assessment" conclusion
+- [x] **Acceptance**: a list of "which files change, and at how many points"
+
+**Result (measured with NDK r30.0.16248370 / clang 21.0.0, `arm64-v8a`, `android-31`)**
+
+**87 translation units** were compiled (70 `dm/host/*.c` + 8 `dm/gfx` + 5 libdeflate + 1 touch-decision file + 3 assembly):
+
+| Outcome | Count |
+|---|---|
+| **Compiles as is, zero changes** | **56** |
+| C files with platform differences | 29 files, **31 sites** (1–4 each) |
+| Assembly files to rewrite | 2 (`nvn_thunks.S` 1047 sites, `nvn_entry.S` 6 sites) |
+
+**The 31 C sites — classes and fixes**
+
+| Class | Sites | Forms | Fix |
+|---|---|---|---|
+| Apple-only headers missing | 17 | `TargetConditionals.h`(7), `mach/mach.h`(3), `mach/mach_time.h`(3), `CommonCrypto/CommonDigest.h`(2), `sys/sysctl.h`(1), `sys/clonefile.h`(1) | add an `__ANDROID__` branch onto a platform equivalent |
+| macOS-only APIs / structs | 14 | `st_mtimespec`(6), `clock_gettime_nsec_np`(3), `CLOCK_UPTIME_RAW`(2), `pthread_get_stack{addr,size}_np`(2), `F_GETPATH`(1) | see below |
+
+| Original | Android equivalent |
+|---|---|
+| `struct stat.st_mtimespec` | `st_mtim` (POSIX) |
+| `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` | `clock_gettime(CLOCK_MONOTONIC)` |
+| `mach/mach_time.h` | `clock_gettime` |
+| `pthread_get_stacksize_np` / `pthread_get_stackaddr_np` | `pthread_getattr_np` + `pthread_attr_getstack` |
+| `F_GETPATH` | `/proc/self/fd/<fd>` + `readlink` |
+| `sys/sysctl.h` | `/proc` |
+| `clonefile()` | `copy_file_range` |
+| `CommonCrypto/CommonDigest.h` | an in-tree implementation or another library |
+
+**Assembly**
+
+`nvn_thunks.S` and `nvn_entry.S` use **Mach-O assembly syntax** (`@PAGEOFF`), which does not hold for Android's **ELF**; they need the AArch64 ELF form (`#:lo12:` and friends). Mechanical work; `nvn_thunks.S` is generated (`dm/gfx/tools/gen_protos.py`), so the generator is what changes.
+
+**In one line: the host layer's C code is roughly 95%+ reusable.** Of 87 translation units, 56 compile **unchanged**, and the other 29 come to 31 sites that are all "swap one API" level. This matches the feasibility analysis ("most of the host layer is platform-independent POSIX/C") and is **better than expected**. The real heavyweight remains the graphics layer (the M2 Vulkan replay layer).
+
+**Noted along the way (Windows environment trap)**: `gen_vault_table.py` / `gen_hud_exp.py` / `gen_bright_levels.py` need `PYTHONIOENCODING=utf-8`. Otherwise Python encodes stdout as GBK on Windows, hits the `U+2212` in the scripts' comments, raises `UnicodeEncodeError` and exits midway, producing **truncated headers** (which shows up as a pile of undefined `vt_row`).
 
 ### Recon B — land the shader translation chain
 
@@ -161,7 +197,28 @@ Android 12 / API 31 is the recommendation: Vulkan 1.1 and up is mandatory by the
 | **Size of `nvn_mtl.m`** | About 5,800 lines of Metal, the single largest piece | Port by NVN function group, with equivalence tests in the spirit of `dm/gfx/tests` |
 | **Performance** | The 60 fps on iOS comes from deep tuning; it cannot be assumed to carry over | A dedicated tuning stage in M4 |
 
-## 6. Next step
+## 6. Working on Windows (encoding and commands)
+
+The port is currently being driven from a Windows machine. These are the traps already hit, and the rules that follow from them.
+
+### Encoding
+
+- **Always set `PYTHONIOENCODING=utf-8` for Python scripts.** The Windows console code page is GBK, and a character such as `U+2212` in a script's comments raises `UnicodeEncodeError` and **aborts the script midway** (seen as truncated generated headers).
+- **Redirect to a file with cmd's `>`** (preserves raw bytes); do not use a PowerShell pipeline plus `Out-File` (it changes encoding and line endings).
+- **Read files with an explicit encoding**: PowerShell `-Encoding`, or `[System.IO.File]::ReadAllLines()`.
+- **Keep every path pure ASCII.** The user directory on this machine contains non-ASCII characters (`C:\Users\ZhuanZ（无密码）`), which has already caused two problems:
+  - `hactool` converts `HOME` / `USERPROFILE` to UTF-16 and crashes when that fails → set an ASCII `HOME` before running it;
+  - do not put generated headers, caches or logs under the user directory.
+  - Agreed locations: the SDK at `C:\Android\Sdk`, tooling and workspace at `d:\yiyi\d2r-mobile\.tools` and `.work`.
+
+### Commands
+
+- **Long tasks must show progress**, never sit silent: `curl` without `--silent` for downloads, `ninja`'s built-in `[n/m]` progress for builds, `adb push/pull` for transfers.
+- **Write multi-step commands as `.bat` / `.cmd` and run those**, rather than assembling `cmd /c "..."` inside PowerShell (quote nesting breaks easily).
+- To **collect all errors**, use `ninja -k 0` and redirect to a log, then analyse it.
+- **`sdkmanager` is deprecated** and cannot accept licences without a TTY; use `android sdk install` instead (it accepts the ToS automatically after showing it).
+
+## 7. Next step
 
 Proceed in the order on this page: finish the rest of M0 (SDK/NDK + device), then Recon A and Recon B, then M1.
 After each milestone, tick it off here and record the conclusion.
