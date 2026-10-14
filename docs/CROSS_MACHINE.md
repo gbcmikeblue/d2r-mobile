@@ -4,6 +4,8 @@
 
 This page covers one thing: when Android-side development and debugging move to another computer, which files besides the `git clone`d code have to come along, where they come from, and what "restored" looks like. The code itself is small (`.work/`, `.tools/` and `.venv/` are all in `.gitignore`, hence outside the repository); the thing that actually needs moving is the data.
 
+**If you are just carrying on rather than moving house, go straight to section 7**: it says where the work stands, what the next step is, and how to run one round and get a reading out.
+
 ## 1. The phone is the data carrier
 
 Everything that has to cross machines lives in the phone's **staging area** `/sdcard/d2rm/pc/`: write it in with `adb push`, pull it back with `adb pull` on the next machine. No external drive, and no need to re-extract the game.
@@ -151,3 +153,96 @@ Three old rules:
 - **The three generated headers are not in the table above**: `dm\host`'s `dm_vault_tab.h` / `dm_hud_exp.h` / `dm_bright_levels.inc` come from the game files and are gitignored, so without them `build_apk.cmd` stops at `'dm_hud_exp.h' file not found` in `dm\host\diag.c`. Regenerate them from section 2 once the data is back.
 - **PowerShell's `>` changes the encoding** (it writes UTF-16LE). Whenever the raw bytes matter -- generating C headers, dropping logs -- use **cmd's `>`**. Measured on the same script here: 93,550 bytes of UTF-16 from PowerShell against 47,124 bytes of UTF-8 from cmd.
 - **USB drops out entirely**: on this machine (Hyper-V plus USB passthrough) a directory-wide `adb pull` of large files dies after about 30 seconds and `adb devices` goes empty with it, and that has nothing to do with the screen locking. See "When the phone is flaky" in section 3.
+
+## 7. Where things stand and what comes next (hand-over: start here)
+
+> **This section goes stale.** Written 2026-10-14 against commit `ea71aab`; for the detail and the conclusions, the
+> authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its "7. Next step" and "8. Progress log".
+
+### Where it stops
+
+- **M1 is done**: the host loads the patched artifact on Android, takes over the service layer, finishes SDK
+  initialisation and reaches `nnMain`.
+- **The rendering chain's warnings are cleared**: the descriptor blanks (UBO name number minus 3, the storage buffer
+  derived from `cb_offset`, buffer textures) and the vertex-attribute test (two independent faults; see "M3-2k" and
+  "M3-2l").
+- **The blocker**: draws go out (about 400k per run, 78-84 graphics pipelines, zero failures) yet the **render targets
+  read back all zero**. `DM_NVN_SHOT_SCAN` is now **level-complete** (levels 0/1/2 each once), and on the frames it can
+  reach (50/54/57) **every one reads `brightness mean 0.0`** (part six of "M3-2m"). In other words the picture has not
+  been written anywhere readable, or the reading side still hides something.
+- **One normal thing**: this device **stalls at 55-60 presents** (stage `CharacterCreate:Hover:Barbarian`, occasionally
+  `MainMenuHD:CheckUpdateLinks`). That is a known scene, not a crash, and the judgement has to be read from "what it is
+  doing across several runs".
+- **One sporadic thing**: about once per run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a
+  hundred-plus `贴图上传失败` lines. **Unrelated to command-buffer sharing** (ruled out; "M3-2o").
+
+### Next steps (detail in "7. Next step" of ANDROID_PLAN)
+
+1. **Chase that device loss**: the next candidate is "**who loses it first**", the guest's own commands or this one
+   one-shot submit of ours. What to measure: what else was on the queue at that moment, whether the guest had already
+   lost the device on its side, and the `vkQueueSubmit` return value with its context.
+2. **Keep hunting the picture**: the level-by-level scan is in place but only on reachable frames; reaching a later frame
+   first needs "why does it stop here" answered (the normal thing above).
+3. **Items 1 and 2 of the "9. Optimisation list"** (persisting a `VkPipelineCache`, preferring `HOST_CACHED` for the
+   zero-copy memory type) -- unrelated to the blocker, doable whenever.
+
+### How to run one round (the smallest loop on a new machine)
+
+Paths and tooling on the PC side are in sections 2 and 3; this is only **run once and get a reading out**:
+
+```powershell
+$adb = 'C:\Android\Sdk\platform-tools\adb.exe'
+cd <repository>
+
+# 1) build the package (precondition: the three generated headers exist, see section 2)
+dm\android\apk\build_apk.cmd
+
+# 2) push the parameters, install, run, pull the log back
+& $adb push .work\dm.conf /sdcard/Android/data/ai.d2rm.dm/files/dm.conf
+& $adb install -r .work\apk-build\dm.apk
+& $adb shell am force-stop ai.d2rm.dm
+& $adb shell am start -n ai.d2rm.dm/android.app.NativeActivity
+Start-Sleep -Seconds 50
+& $adb pull /sdcard/Android/data/ai.d2rm.dm/files/logs/latest.log .work\logs\run.log
+```
+
+**Android cannot be given environment variables per launch** (`am start` passes no env), so the parameters live in a file
+adb can push: `/sdcard/Android/data/ai.d2rm.dm/files/dm.conf`, one `key=value` per line (`#` starts a comment). **Pushing
+it and restarting the app is enough -- no reinstall.** The current one:
+
+```
+DM_WIN_SRC=28          # the viewer's source serial (0 = off, back to the test pattern)
+DM_WIN_LEVEL=1         # which mip level to read (level 0 is all zero, and so is level 1; see above)
+DM_WATCH_STALL=0       # watchdog logs without killing (unset means it does not look at all)
+DM_NVN_SHOT_SCAN=50,54,57:/sdcard/Android/data/ai.d2rm.dm/files/scan/
+DM_PASS_AREA=1         # render-area trace (measure only; =2 swaps in the attachment size as a control)
+```
+
+The other switches are whatever `getenv` picks up in `dm/android/` (`DM_NVN_SHOT`, `DM_NVN_SHOT_ALL`, `DM_GFX_PROBE`,
+`DM_NO_DEPTH_TEST`, `DM_NO_TEXEL`, `DM_NVN_SPV_DIR`, `DM_NVN_FACTS`, `DM_ROOT/DM_ROMFS/DM_SAVE`).
+
+Where the output lands:
+
+| Where | What |
+|---|---|
+| `/sdcard/Android/data/ai.d2rm.dm/files/logs/latest.log` | this run's log (the previous one is `prev.log`) |
+| `/sdcard/Android/data/ai.d2rm.dm/files/scan/` | PNGs the level-by-level scan wrote (only ones with content) |
+| `/data/local/tmp/dm/` | the run-time data (`patched` / `spv` / `romfs`), **read-only**, see section 5 |
+
+**Device screenshots**: when a PNG has to land on disk, **do not use PowerShell's `>`** (you get UTF-16 and the file is
+dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
+
+### Traps hit this round (relevant to carrying on)
+
+- **Scan points have to sit on reachable frames**: this device stalls at 55-60 presents, so `DM_NVN_SHOT_SCAN=300,340`
+  will **never fire**, and the log cannot tell "scanned" from "never got there". Use 50/54/57 and the like.
+- **Changing a log line's text changes the measuring stick**: after renaming the line in `one_end` from
+  `上传命令等待失败` to `一次性提交等待失败`, a tally still counting the old string read "0 lines", and only just failed to
+  record "not fixed" as "fixed". **Change the script that reads it along with the text, or count both strings.**
+- **The readback has exactly one lock -- do not add it elsewhere**: the viewer (front-end thread) and present/scan (guest
+  thread) start readbacks **at the same time**, hence `g_one_mu` over that section ("M3-2n"). But **the upload path must
+  not take it** -- the caller `tex_of` holds `g_mu` when it uploads, so taking it is a **lock-order inversion** that shows
+  on the device as "**a stall at boot with zero presents**" (the watchdog reporting only `beat 0`), looking exactly like a
+  hung game. Uploads now have **their own command buffer** (`g_cb_up`, "M3-2o") and need no lock.
+- **Before adding a lock, list who holds what when they call in**: that deadlock came from skipping this, and the check
+  that settled it was "revert that one site and presents return to normal immediately".

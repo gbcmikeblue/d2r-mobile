@@ -4,6 +4,8 @@ English: [CROSS_MACHINE.md](CROSS_MACHINE.md)
 
 这一页只讲一件事：Android 侧的开发调试换一台电脑时，除了 `git clone` 到的代码，还要带哪些文件、从哪拿、恢复到什么样才算能用。代码本身很小（`.work/`、`.tools/`、`.venv/` 都在 `.gitignore` 里，全在仓库之外），真正要搬的是数据。
 
+**只是要接着往下跑（不搬家）的话，直接看第七节**：那里写了"现在停在哪、下一步查什么、怎么跑一轮并拿到读数"。
+
 ## 一、手机就是数据载体
 
 跨机器要带的东西一律放在手机的**中转区** `/sdcard/d2rm/pc/`：写入用 `adb push`，换机器时用 `adb pull` 取回。这样不必再找移动硬盘，也不必重新解包游戏。
@@ -159,3 +161,85 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
   本机实测同一个脚本：PowerShell 版 93,550 字节 UTF-16，cmd 版 47,124 字节 UTF-8。
 - **USB 会整段掉线**：本机（Hyper-V + USB 直通）整目录 `adb pull` 传大文件约 30 秒即断、`adb devices` 随之变空，
   且与熄屏无关。见第三节「手机不稳时」。
+
+## 七、当前进度与下一步（交接：接着跑的人从这里开始）
+
+> **这一节会过期。** 记于 2026-10-14，对应提交 `ea71aab`；进度细节与结论以
+> [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 的「七、下一步」与「八、进度记录」为准。
+
+### 现在停在哪
+
+- **M1 完成**：宿主在安卓上装载改写产物、接管服务层、跑完 SDK 初始化、进 `nnMain`。
+- **渲染链路的告警已清空**：描述符的空白（UBO 名字号 −3、SSBO 由 `cb_offset` 反推、缓冲区贴图）与顶点属性的那条判据
+  （两个独立的错，见「M3-2k」「M3-2l」）。
+- **卡点**：绘制在发（每轮约 40 万次、图形管线 78~84 条、零失败），但**渲染目标读出来是全零**。
+  `DM_NVN_SHOT_SCAN` 现在**逐级**读（第 0/1/2 级各一次），在够得着的帧（50/54/57）上**每张都是 `亮度 均值 0.0`**
+  （「M3-2m」第六节）。也就是说：**画面还没有被写到能读的地方**，或者"读"这一侧还有没照到的问题。
+- **一条常态**：这台机**常在出图 55~60 停住**（阶段 `CharacterCreate:Hover:Barbarian`，偶发 `MainMenuHD:CheckUpdateLinks`）。
+  这是已知现场，不是崩溃；判据要按"多轮里它在干什么"读。
+- **一条偶发**：约每轮 1 次 `【红】一次性提交等待失败 VkResult -4`（`VK_ERROR_DEVICE_LOST`），后面跟上百条
+  `贴图上传失败`。**与共用命令缓冲无关**（已排除，「M3-2o」）。
+
+### 下一步（细节在 ANDROID_PLAN「七、下一步」）
+
+1. **查那条设备丢失**：下一个候选是"**先丢的是谁**"——客体自己的命令，还是我们这一次一次性提交。
+   要量的东西：丢的那一刻队列上还有什么、设备是否已被客体那边先弄丢、`vkQueueSubmit` 的返回值与前后文。
+2. **继续找画面**：逐级扫已就位，但只在够得着的帧上；要拿更晚的帧，得先弄清"为什么停在这里"（上面那条常态）。
+3. **「九」优化清单**第 1/2 项（`VkPipelineCache` 落盘、零拷贝内存类型优先 `HOST_CACHED`）——与卡点无关，随时可做。
+
+### 怎么跑一轮（新机器上的最小闭环）
+
+PC 侧的路径与工具见第二、三节；这里只说**跑一次并拿到读数**：
+
+```powershell
+$adb = 'C:\Android\Sdk\platform-tools\adb.exe'
+cd <仓库>
+
+# 1) 出包（前提：那三个派生头文件已生成，见第二节）
+dm\android\apk\build_apk.cmd
+
+# 2) 推参数、装机、跑、把日志取回来
+& $adb push .work\dm.conf /sdcard/Android/data/ai.d2rm.dm/files/dm.conf
+& $adb install -r .work\apk-build\dm.apk
+& $adb shell am force-stop ai.d2rm.dm
+& $adb shell am start -n ai.d2rm.dm/android.app.NativeActivity
+Start-Sleep -Seconds 50
+& $adb pull /sdcard/Android/data/ai.d2rm.dm/files/logs/latest.log .work\logs\run.log
+```
+
+**Android 上没法按次给 app 设环境变量**（`am start` 不传 env），所以参数走一个 adb 能推的文件：
+`/sdcard/Android/data/ai.d2rm.dm/files/dm.conf`，每行 `key=value`（`#` 开头是注释），**推上去重启 app 即生效，不用重新装机**。
+当前那一份：
+
+```
+DM_WIN_SRC=28          # 贴图查看器的源序号（0 = 关，回测试图）
+DM_WIN_LEVEL=1         # 读第几级 mip（第 0 级全零、第 1 级也全零，见上）
+DM_WATCH_STALL=0       # 看门狗只记不杀（不设就完全不看）
+DM_NVN_SHOT_SCAN=50,54,57:/sdcard/Android/data/ai.d2rm.dm/files/scan/
+DM_PASS_AREA=1         # 渲染区取证（只读；=2 改成用附件尺寸做对照）
+```
+
+其余可用开关在 `dm/android/` 里搜 `getenv`（`DM_NVN_SHOT`、`DM_NVN_SHOT_ALL`、`DM_GFX_PROBE`、`DM_NO_DEPTH_TEST`、
+`DM_NO_TEXEL`、`DM_NVN_SPV_DIR`、`DM_NVN_FACTS`、`DM_ROOT/DM_ROMFS/DM_SAVE`）。
+
+产物落在：
+
+| 落在哪 | 是什么 |
+|---|---|
+| `/sdcard/Android/data/ai.d2rm.dm/files/logs/latest.log` | 本轮日志（上一轮是 `prev.log`） |
+| `/sdcard/Android/data/ai.d2rm.dm/files/scan/` | 逐级扫描里"有内容"才落盘的 PNG |
+| `/data/local/tmp/dm/` | 运行时数据（`patched` / `spv` / `romfs`），**只读**，见第五节 |
+
+**手机截屏**落 PNG 时**别在 PowerShell 里用 `>`**（写成 UTF-16 就废了）——写一个 `.cmd` 用 cmd 的重定向，规矩同第六节。
+
+### 这一轮新踩的坑（与"接着跑"有关的）
+
+- **扫描点要压在"够得着的帧"上**：这台机常在出图 55~60 停住，`DM_NVN_SHOT_SCAN=300,340` 会**一个都不触发**，
+  而日志上看不出是"扫过"还是"没扫到"。用 50/54/57 这类。
+- **改日志正文等于改统计口径**：把 `one_end` 里那句从 `上传命令等待失败` 改成 `一次性提交等待失败` 之后，
+  按旧串数的统计读出"0 条"，差一点把"没修好"记成"修好了"。**改日志正文时把读它的脚本一起改，或者新旧串都数一遍。**
+- **读回的锁只有一把，别乱加**：查看器（前端线程）与出图/扫描（客体线程）会**同时**发起读回，所以读回这一段有
+  `g_one_mu`（「M3-2n」）。但**上传那条路不能拿它** —— 调用方 `tex_of` 正持着 `g_mu` 调上传，一加就是**锁序反转**，
+  真机表现是"**启动就停住、出图 0 次**"（看门狗只报 `拍 0`），看着像游戏卡死。上传现在有**自己的命令缓冲**
+  （`g_cb_up`，「M3-2o」），不需要那把锁。
+- **加锁前先列"谁持着什么调进来"**：上面那条死锁就是这么来的，判据是"撤掉那一处，出图立刻恢复常态"。
