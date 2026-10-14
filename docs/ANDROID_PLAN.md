@@ -344,6 +344,27 @@ clear readback: all match (first pixel 64,128,191,255)
 minimal command set (`SetRenderTargets` / clear / `DrawArrays` / present). The window and swapchain must
 wait for the APK (`ANativeWindow`).
 
+### M2 step 2: the zero-copy memory pool passes both directions (2026-10-14)
+
+The memory pool is NVN's foundation: the guest writes on the CPU and the GPU must read the same bytes, and
+the reverse. The same probe builds two 64 KB buffers on the measured
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED` type (type 6) and checks both directions:
+
+```
+zero-copy memory pool (type 6, 64 KB each): CPU->GPU ok, GPU->CPU ok
+```
+
+- **CPU write -> GPU read**: the CPU writes `i*7+3` into the mapping, the GPU copies it into the other
+  buffer with `vkCmdCopyBuffer`, and the readback matches byte for byte.
+- **GPU write -> CPU read**: the GPU fills 0xAB with `vkCmdFillBuffer` and the CPU reads it straight back
+  from the mapping; everything matches.
+
+**Conclusion: NVN's memory pools can be mapped straight onto a type 6 `VkDeviceMemory` with no copying at
+all.** Risk number one of the feasibility analysis, the "unified memory" assumption, is now **verified on a
+real device**, and the rest of M2 can take the cheapest, zero-copy route. (The probe submits the two steps
+separately: the copy reads and the fill writes the same buffer, and separate submissions avoid a
+hand-written barrier.)
+
 ### M2 — minimal Vulkan replay layer (the largest item)
 
 - [ ] Vulkan skeleton: device, queue, `ANativeWindow` swapchain

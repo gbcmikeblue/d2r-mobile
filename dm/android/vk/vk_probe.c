@@ -177,6 +177,73 @@ int main(void) {
     printf("清屏回读：%s（首像素 %u,%u,%u,%u）\n", ok ? "全部符合" : "有偏差", px[0], px[1], px[2], px[3]);
     vkUnmapMemory(dev, bufmem);
 
+    // ---- 零拷贝内存池：两个方向各验一次 | zero-copy memory pool: verify both directions ----
+    // NVN 的内存池是「客体在 CPU 侧写、GPU 侧读同一份」（以及反过来），也就是内存池必须落在
+    // 既 DEVICE_LOCAL 又 HOST_VISIBLE|HOST_COHERENT 的类型上。这里就用这块类型造两条缓冲，
+    //   ① CPU 写 → GPU 读：CPU 往映射地址写花样，GPU 把它拷到另一条，回收后逐字节比对
+    //   ② GPU 写 → CPU 读：GPU 往同一条里填常量，CPU 直接读回来比对（中间只等队列空闲）
+    // NVN's memory pools are "the guest writes on the CPU and the GPU reads the same bytes" (and the
+    // reverse), which requires a type that is both DEVICE_LOCAL and HOST_VISIBLE|HOST_COHERENT. Two
+    // buffers are made on that type:
+    //    (1) CPU write -> GPU read: the CPU writes a pattern into the mapping, the GPU copies it into the
+    //        other buffer, and the result is compared byte by byte
+    //    (2) GPU write -> CPU read: the GPU fills the same buffer with a constant and the CPU reads it
+    //        straight back, with nothing but a queue idle in between
+    if (zero_copy_ok >= 0) {
+        const VkDeviceSize pool_sz = 64 * 1024;
+        VkBuffer pb[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkDeviceMemory pm[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        void *pmap[2] = { NULL, NULL };
+        for (int i = 0; i < 2; i++) {
+            VkBufferCreateInfo b = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = pool_sz,
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+            VKOK(vkCreateBuffer(dev, &b, NULL, &pb[i]));
+            VkMemoryRequirements rr; vkGetBufferMemoryRequirements(dev, pb[i], &rr);
+            VkMemoryAllocateInfo a = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                       .allocationSize = rr.size, .memoryTypeIndex = (uint32_t)zero_copy_ok };
+            VKOK(vkAllocateMemory(dev, &a, NULL, &pm[i]));
+            VKOK(vkBindBufferMemory(dev, pb[i], pm[i], 0));
+            VKOK(vkMapMemory(dev, pm[i], 0, pool_sz, 0, &pmap[i]));
+        }
+        // ① CPU 写 | CPU writes
+        uint8_t *a = pmap[0];
+        for (VkDeviceSize i = 0; i < pool_sz; i++) a[i] = (uint8_t)(i * 7 + 3);
+        // 两步分开提交：拷贝读 pb[0]、填充写 pb[0]，同一缓冲的读写冒险不必自己插屏障
+        // Two separate submissions: the copy reads pb[0] and the fill writes pb[0], so the read/write
+        // hazard on the same buffer does not need a hand-written barrier
+        VKOK(vkResetCommandPool(dev, pool, 0));
+        VKOK(vkBeginCommandBuffer(cb, &bi));
+        VkBufferCopy cp = { .size = pool_sz };
+        vkCmdCopyBuffer(cb, pb[0], pb[1], 1, &cp);
+        VKOK(vkEndCommandBuffer(cb));
+        VKOK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
+        VKOK(vkQueueWaitIdle(q));
+        int d1 = 1; VkDeviceSize bad1 = 0;
+        for (VkDeviceSize i = 0; i < pool_sz; i++) if (((uint8_t *)pmap[1])[i] != (uint8_t)(i * 7 + 3)) { d1 = 0; bad1 = i; break; }
+
+        // ② GPU 写 | the GPU writes
+        VKOK(vkResetCommandPool(dev, pool, 0));
+        VKOK(vkBeginCommandBuffer(cb, &bi));
+        vkCmdFillBuffer(cb, pb[0], 0, pool_sz, 0xABABABABu);
+        VKOK(vkEndCommandBuffer(cb));
+        VKOK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
+        VKOK(vkQueueWaitIdle(q));
+        int d2 = 1; VkDeviceSize bad2 = 0;
+        for (VkDeviceSize i = 0; i < pool_sz; i++) if (((uint8_t *)pmap[0])[i] != 0xAB) { d2 = 0; bad2 = i; break; }
+        printf("零拷贝内存池（类型 %d，每条 %llu KB）：CPU→GPU %s%s，GPU→CPU %s%s\n", zero_copy_ok,
+               (unsigned long long)(pool_sz >> 10),
+               d1 ? "通" : "不通", d1 ? "" : "（首处不符见下）", d2 ? "通" : "不通", d2 ? "" : "");
+        if (!d1) printf("  CPU→GPU 首处不符：偏移 %llu，读到 %u，期望 %u\n", (unsigned long long)bad1,
+                        ((uint8_t *)pmap[1])[bad1], (uint8_t)(bad1 * 7 + 3));
+        if (!d2) printf("  GPU→CPU 首处不符：偏移 %llu，读到 %u，期望 171\n", (unsigned long long)bad2, ((uint8_t *)pmap[0])[bad2]);
+        if (!d1 || !d2) ok = 0;
+        for (int i = 0; i < 2; i++) { vkUnmapMemory(dev, pm[i]); vkDestroyBuffer(dev, pb[i], NULL); vkFreeMemory(dev, pm[i], NULL); }
+    } else {
+        printf("零拷贝内存池：本设备没有 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT 类型，跳过\n");
+        ok = 0;
+    }
+
     // ---- 收尾 | teardown ----
     vkDestroyBuffer(dev, buf, NULL); vkFreeMemory(dev, bufmem, NULL);
     vkDestroyImage(dev, img, NULL); vkFreeMemory(dev, imgmem, NULL);

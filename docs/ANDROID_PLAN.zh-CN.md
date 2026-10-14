@@ -334,6 +334,23 @@ nninitInitializeSdkModule
 **下一步**：内存池映射（NVN MemoryPool → `VkDeviceMemory`，先按零拷贝那条路走）与最小命令集
 （`SetRenderTargets` / 清屏 / `DrawArrays` / present）。窗口与交换链要等 APK（`ANativeWindow`）。
 
+### M2 第 2 步：零拷贝内存池双向验证通过（2026-10-14）
+
+内存池是 NVN 的地基：客体在 CPU 侧写内存、GPU 侧要读到同一份（以及反过来）。同一个探针里按这条造了
+两条 64 KB 缓冲，落在上面量出的 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`（类型 6）上，
+两个方向各验一次：
+
+```
+零拷贝内存池（类型 6，每条 64 KB）：CPU→GPU 通，GPU→CPU 通
+```
+
+- **CPU 写 → GPU 读**：CPU 往映射地址写 `i*7+3`，GPU 用 `vkCmdCopyBuffer` 拷到另一条，回读逐字节比对全部相符；
+- **GPU 写 → CPU 读**：GPU 用 `vkCmdFillBuffer` 填 0xAB，CPU 直接从映射地址读回，全部相符。
+
+**结论：NVN 的内存池可以直接映射成类型 6 的 `VkDeviceMemory`，不需要任何拷贝。** 可行性分析里
+「统一内存假设」这条头号风险到此**在真机上验证通过**，M2 其余部分可以照「零拷贝」这条最省的路走。
+（探针里两步是分开提交的：拷贝读、填充写同一条缓冲，分开提交就不必自己插屏障。）
+
 ### M2 —— 最小 Vulkan 回放层（最大工作量）
 
 - [ ] 搭 Vulkan 骨架：设备、队列、`ANativeWindow` 交换链
