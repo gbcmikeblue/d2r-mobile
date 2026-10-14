@@ -542,18 +542,29 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
             continue;
         }
         vatt[na].location = loc; vatt[na].format = f;
-        vatt[na].offset = st->attr[loc].offset; vatt[na].binding = 16 + st_;
+        // 绑定号 = **顶点流号本身**（0..15）。这里原先写的是 `16 + st_`，而另一侧的绘制循环把缓冲绑在 `s2`（也就是流号
+        // 本身）—— 两边差 16，于是**管线真正要读的那些绑定从来没被绑过**：没有校验层的 Vulkan 会去读不确定内存，
+        // 几何整片塌掉，表现正是"34 万次绘制、一个像素不落、且零报错"。绑定号只有 32 个（0..31），16 条流占满高位，
+        // 所以"低位给流、高位留给常量回退"（`VK_PIPE_DUMMY_BIND = 31`）才是两边能同时对上的一套；顺带原来的
+        // `16 + 15` 与 31 撞车这件事也消失了。
+        // The binding number **is the vertex stream number** (0..15). This used to be `16 + st_` while the draw loop on the
+        // other side bound buffers at `s2` (the stream number itself) -- off by 16, so the bindings the pipeline actually
+        // reads were **never bound**: with no validation layers Vulkan reads undefined memory, the geometry collapses, and
+        // that is exactly "348k draws, not one pixel landing, zero errors". Only 32 bindings exist (0..31) and 16 streams
+        // would fill the high half, so streams on the low half with the constant fallback high (`VK_PIPE_DUMMY_BIND = 31`)
+        // is the only layout both sides can agree on -- which also removes the old `16 + 15` collision with 31.
+        vatt[na].offset = st->attr[loc].offset; vatt[na].binding = st_;
         na++;
         if (!stream_used[st_]) {
             stream_used[st_] = 1;
-            vbind[nb].binding = 16 + st_;
+            vbind[nb].binding = st_;
             vbind[nb].stride = const_stream ? 16 : st->stream[st_].stride;
             vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
             uint32_t div = st->stream[st_].divisor;
-            if (const_stream) { vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE; vdiv[ndiv].binding = 16 + st_; vdiv[ndiv].divisor = 0; ndiv++; }
+            if (const_stream) { vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE; vdiv[ndiv].binding = st_; vdiv[ndiv].divisor = 0; ndiv++; }
             else if (div) {
                 vbind[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
-                if (vk_have_attr_divisor()) { vdiv[ndiv].binding = 16 + st_; vdiv[ndiv].divisor = div; ndiv++; }
+                if (vk_have_attr_divisor()) { vdiv[ndiv].binding = st_; vdiv[ndiv].divisor = div; ndiv++; }
                 else {
                     static int said3;
                     if (div > 1 && !said3++) LOG("【黄】顶点流 %u 的 divisor=%u：设备不支持 VK_EXT_vertex_attribute_divisor，按 1 处理", st_, div);
