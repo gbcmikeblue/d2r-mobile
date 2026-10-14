@@ -255,6 +255,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     }
     default:
         if (!g_seen[num & 0xff]) { g_seen[num & 0xff] = 1; LOG("SVC %#x x0=%#llx x1=%#llx x2=%#llx (占位返回成功)", num, regs[0], regs[1], regs[2]); }
-        regs[0] = 0; return 0;
+        // 两个返回值寄存器都清零：只清 x0 的话 x1 会保持进门时的值（往往是上一次调用的残留），
+        // 而 sdk 的 svc 跳转表里有几条包装是从 x1 取结果的（str x0,[sp,#-16]! → svc → str w1,[x2]），
+        // 客体于是把一个野值当成结果用。
+        // Zero both return registers: clearing only x0 leaves x1 as it was on entry (usually a leftover
+        // from the previous call), and several wrappers in the SDK's svc trampoline table take their
+        // result from x1 (str x0,[sp,#-16]! → svc → str w1,[x2]), so the guest would use a wild value
+        // as a result.
+        regs[0] = 0; regs[1] = 0; return 0;
     }
 }

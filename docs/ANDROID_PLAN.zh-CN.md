@@ -182,6 +182,64 @@ English: [ANDROID_PLAN.md](ANDROID_PLAN.md)
 - 安卓侧 SIGSEGV 拿不到 ESR 的「读 / 写」位，暂按「读」处理（影响缺页钩子的判定）；
 - 构建暂时用 `-w` 关掉了警告，M1 验收后打开逐项处理。
 
+### M1 真机验证记录（2026-10-14，进行中）
+
+宿主已经在真机上跑通到「装载 → 重定位 → 进 SDK 初始化 → 打出客体 UNIMPL」，也就是 M1 的验收判据：
+
+```
+[dm] 线程槽量测：首个键 0x80000002 在 tpidr_el0+520，键间距 16 字节
+[dm] main: base 0x78fc7e5000 size 0x33dc000
+[dm] sdk:  base ... size 0xe80000
+[dm] main: reloc relative=60560 abs/glob=2109 jump=615
+[dm] force: 80 条全部命中
+[dm] >>> nnosInitialize
+[dm] UNIMPL nnosGetDefaultUserExceptionStackForApplication (...)      ← 验收点
+[dm] >>> nninitInitializeSdkModule
+[dm] SVC 0x1f ... （占位返回成功）
+```
+
+为此修掉两个**架构级**的平台差异——它们都不是读代码能看出来的，是跑到真机才暴露：
+
+**① 线程槽基址的平台约定**（`26158e2`）
+
+重写器把客体的 `mrs xN, tpidrro_el0` 原样保留，靠它加键页偏移去索引宿主的 pthread TSD。这在苹果上成立，在安卓上第一步就断：
+
+| | Apple | Android (bionic) |
+|---|---|---|
+| `tpidrro_el0` | = pthread TSD 基址 | **恒为 0，EL0 只读、用户态改不了** |
+| TSD 基址 | `tpidrro_el0` | `tpidr_el0` |
+| `pthread_key_t` | 槽号本身（小整数） | `0x80000000 \| 序号`（如 `0x80000001`） |
+| 值的字节偏移 | `键*8` | 键 1/2/3 → +88 / +104 / +120（每个键占两个指针位） |
+
+改法：重写器新增 `DM_TLSREG`（缺省 `apple`；`linux` 则把键槽访问的 `mrs` 目标换成 `tpidr_el0`，三个模块都走同一个 `MRS_TPIDRRO()`，只改这一处）；宿主 `loader.c` 的键页偏移改为按平台算——安卓不写死 bionic 的内部编码，而是启动时用哨兵键实测「首个键的偏移」与「键间距」再线性外推。`tsd_check` 用对应平台的基址寄存器校验，不符时报出该用哪个 `DM_TLSREG` 重出产物。
+
+**注意：安卓产物与 iOS 产物因此不再完全同一份**（只差键槽那一条 `mrs` 的目标寄存器）。
+
+**② 登记段在 ELF 上要另外读**（`7ed17c1`）
+
+`HLE` / `HLE_FORCE` 两张登记表原本用 `getsectiondata(&_mh_execute_header, "__DATA", "swhle"/"swforce", …)` 读——那是 Mach-O 的段查找。安卓上读到 NULL ⇒ 表为 0 条 ⇒ 上百条服务层接管（`nndiagStartup`、`oe::Initialize`、`fs::InitializeForApplication`、`pctl::Initialize` …）**一条都没生效**，SDK 拿自己的真实现去连不存在的 Horizon 服务进程 → Panic。改法：段名按平台给（`__DATA,swhle` ↔ `swhle`），读法用 ELF 的 `__start_<节名>` / `__stop_<节名>`，并且**链接时必须 `-Wl,--no-gc-sections`**（NDK 默认开着 GC，这两个段只靠 `__start_/__stop_` 被引用，会被整个丢掉；实测不加时段表里根本看不到它们）。实测 `swforce` 0x780 字节 = 80 条，日志变成 `force: 80 条全部命中`。
+
+顺带：关掉 GC 后，之前被悄悄丢掉的 31 个图形侧符号（`mtl_*`、`dm_nvn_ruler_truth`、`thread_selfcounts`）全部浮出为未定义，已在 `dm/android/gfx_stub_android.c` 补齐空实现。
+
+**当前卡点：`nninitInitializeSdkModule` 里一次 SDK Panic**
+
+```
+[dm] Break#1 reason=0 Result=0 svc 位于 sdk+0x39fbd4 缓冲 …+0x4 "...."
+[dm] bt: sdk+0x145038 sdk+0x145198 sdk+0x3874a0 sdk+0x386120 sdk+0x2d46dc sdk+0x2d4470 sdk+0x2d33b4 sdk+0x2d335c sdk+0x2b03ec …
+```
+
+已经查清与排除的：
+
+- **不是产物问题**：与仓库里原有的 `keypage` 产物逐字比对，改动**恰好**是那 25105 / 12085 / 10486 处 `mrs` 寄存器，其余一个字都没动；
+- **不是时间层**：`now_ns()` = `mach_absolute_time()×numer/denom`，兼容层给的是纳秒 + `mach_timebase_info` 1/1，自洽；
+- **不是接管表**：已 80 条全命中；
+- **不是野值**：把占位返回的 `x0/x1` 都清零后，Panic 位置**完全不变**；
+- **Panic 现场已定位**：`sdk+0x146870` 是 SDK 的 `Panic/Result` 小函数（`mov x1,x0; mov w0,wzr; mov w2,#4; bl svc#0x26`），所以 `reason=0` 是写死的、`Result` 就是传进来的那个值（日志读到 0）；它只被间接调用（函数指针表），所以要在 sdk 里按地址反查调用者。
+- **SDK 的 svc 跳转表已解出**（`sdk+0x39fb04` 起，按序号排列）：sdk 共用到 `0x13–0x1d、0x1f、0x21–0x23、0x25–0x2a、0x2c、0x2d、0x2f、0x32–0x36、0x4b`，其中宿主目前只实现了 `0x01–0x06 / 0x1e / 0x26 / 0x27 / 0x29 / 0x2c / 0x2d`。表里那几条包装是 `str x0,[sp,#-16]! → svc → str w1,[x2]`，即**从 x1 取结果写进出参指针**。
+- **日志里只有两处未实现的 svc 被调到**：`0x1f` 与 `0x21`（占位提示每个号只打一次）。`0x21` 与 `0x22` 是 sdk 里的**直接调用**，在同一个函数里相邻两条（`bl 0x39fb9c` / `bl 0x39fb94`），那个函数（`sdk+0x385040`）先读 TLR、与一个句柄比较，再二选一调用——`0x1f` 则只被间接调用。
+
+**下一步（反汇编路线）**：sdk 的 `Panic` 小函数只被函数指针间接调用，所以要在 sdk 里按地址反查调用者（`adrp/ldr` 取表项后 `blr`），顺藤摸到真正失败的那处检查；同时把 `0x1f`（按序号推断为 `GetSystemTickFrequency` 一类）与 `0x21` 在 `hle_svc.c` 里按语义实现，而不是继续占位。
+
 ### M2 —— 最小 Vulkan 回放层（最大工作量）
 
 - [ ] 搭 Vulkan 骨架：设备、队列、`ANativeWindow` 交换链

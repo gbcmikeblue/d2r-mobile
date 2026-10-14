@@ -170,6 +170,64 @@ The output lives in `.work/spv/` (gitignored; not committed).
 - Android's SIGSEGV carries no ESR, so the read/write bit is assumed to be a read (this affects the page-fault hook's decision);
 - The build currently passes `-w` to silence warnings; turn them on after M1's acceptance.
 
+### M1 device verification log (2026-10-14, in progress)
+
+The host now runs on the device all the way to "load → relocate → enter SDK init → print the game's UNIMPL", which is M1's acceptance criterion:
+
+```
+[dm] thread slot measurement: first key 0x80000002 at tpidr_el0+520, key stride 16 bytes
+[dm] main: base 0x78fc7e5000 size 0x33dc000
+[dm] sdk:  base ... size 0xe80000
+[dm] main: reloc relative=60560 abs/glob=2109 jump=615
+[dm] force: 80 entries all hit
+[dm] >>> nnosInitialize
+[dm] UNIMPL nnosGetDefaultUserExceptionStackForApplication (...)      <- the acceptance point
+[dm] >>> nninitInitializeSdkModule
+[dm] SVC 0x1f ... (placeholder returned success)
+```
+
+Two **architectural** platform differences had to be fixed for this. Neither is visible by reading the code; both only surfaced on the device.
+
+**① The platform convention for the thread slot base** (`26158e2`)
+
+The rewriter keeps the guest's `mrs xN, tpidrro_el0` as is and indexes the host's pthread TSD through it plus a key-page offset. That holds on Apple; on Android it breaks at the first step:
+
+| | Apple | Android (bionic) |
+|---|---|---|
+| `tpidrro_el0` | = the pthread TSD base | **always 0, read-only at EL0, userspace cannot set it** |
+| TSD base | `tpidrro_el0` | `tpidr_el0` |
+| `pthread_key_t` | the slot number itself (small) | `0x80000000 \| index` (e.g. `0x80000001`) |
+| byte offset of the value | `key*8` | keys 1/2/3 -> +88 / +104 / +120 (each key takes two pointer-sized slots) |
+
+The fix: the rewriter gained `DM_TLSREG` (default `apple`; `linux` switches the slot access's `mrs` target to `tpidr_el0` -- all three modules go through one `MRS_TPIDRRO()`, so that is the only change); the host's `loader.c` computes the key-page offsets per platform, and on Android it does not hard-code bionic's encoding but measures "offset of the first key" and "key stride" at startup with sentinel keys and extrapolates. `tsd_check` validates with the platform's base register and, on mismatch, says which `DM_TLSREG` the build output should have been made with.
+
+**Note: the Android and iOS build outputs are therefore no longer byte-identical** (they differ only in the target register of that one `mrs`).
+
+**② The registry sections need a different read on ELF** (`7ed17c1`)
+
+The `HLE` / `HLE_FORCE` tables used to be read with `getsectiondata(&_mh_execute_header, "__DATA", "swhle"/"swforce", ...)` -- a Mach-O section lookup. On Android it returns NULL, so both tables had 0 entries and not one of the hundred-odd service-layer take-overs (`nndiagStartup`, `oe::Initialize`, `fs::InitializeForApplication`, `pctl::Initialize`, ...) applied; the SDK ran its own implementations, tried to reach Horizon service processes that do not exist, and panicked. The fix: section names per platform (`__DATA,swhle` vs `swhle`), reading via ELF's `__start_<name>` / `__stop_<name>`, and **`-Wl,--no-gc-sections` at link time** (the NDK enables GC by default and these two sections are reached only through `__start_/__stop_`, so they were dropped entirely; measured, without the flag neither appears in the section table at all). Measured after the fix: `swforce` is 0x780 bytes = 80 entries, and the log reads `force: 80 entries all hit`.
+
+Also: with GC off, 31 graphics-side symbols that had been quietly discarded (`mtl_*`, `dm_nvn_ruler_truth`, `thread_selfcounts`) surfaced as undefined and got empty implementations in `dm/android/gfx_stub_android.c`.
+
+**Current blocker: a Panic inside `nninitInitializeSdkModule`**
+
+```
+[dm] Break#1 reason=0 Result=0 at sdk+0x39fbd4, buffer ...+0x4 "...."
+[dm] bt: sdk+0x145038 sdk+0x145198 sdk+0x3874a0 sdk+0x386120 sdk+0x2d46dc sdk+0x2d4470 sdk+0x2d33b4 sdk+0x2d335c sdk+0x2b03ec ...
+```
+
+Established and ruled out so far:
+
+- **Not the build output**: compared word by word against the existing `keypage` output, the only differences are exactly the 25105 / 12085 / 10486 `mrs` register changes; nothing else moved.
+- **Not the time layer**: `now_ns()` = `mach_absolute_time() * numer / denom`, and the compat layer returns nanoseconds with `mach_timebase_info` = 1/1, so it is self-consistent.
+- **Not the take-over table**: all 80 entries now hit.
+- **Not a wild value**: zeroing both `x0` and `x1` in the placeholder return leaves the panic **exactly where it was**.
+- **The panic site is identified**: `sdk+0x146870` is the SDK's `Panic/Result` helper (`mov x1,x0; mov w0,wzr; mov w2,#4; bl svc#0x26`), so `reason=0` is hard-coded and `Result` is simply the value passed in (the log reads 0). It is only called indirectly through a function-pointer table, so the caller has to be found by address in the sdk.
+- **The SDK's svc trampoline table is decoded** (from `sdk+0x39fb04`, ordered by ordinal): the sdk uses `0x13-0x1d, 0x1f, 0x21-0x23, 0x25-0x2a, 0x2c, 0x2d, 0x2f, 0x32-0x36, 0x4b`, while the host currently implements only `0x01-0x06 / 0x1e / 0x26 / 0x27 / 0x29 / 0x2c / 0x2d`. Several wrappers in that table are `str x0,[sp,#-16]! -> svc -> str w1,[x2]`, i.e. they take their result from **x1** and store it through an out-pointer.
+- **Only two unimplemented svcs were reached** (the placeholder line is printed once per ordinal): `0x1f` and `0x21`. `0x21` and `0x22` are **direct** calls in the sdk, adjacent in the same function (`bl 0x39fb9c` / `bl 0x39fb94`); that function (`sdk+0x385040`) reads the TLR, compares it against a handle, and then calls one of the two. `0x1f` is only called indirectly.
+
+**Next step (disassembly route)**: the SDK's `Panic` helper is only reached through function pointers, so the caller must be found by address in the sdk (`adrp/ldr` to fetch the table entry, then `blr`) and followed back to the failing check; at the same time `0x1f` (by ordinal likely `GetSystemTickFrequency` and friends) and `0x21` should be implemented in `hle_svc.c` according to their semantics instead of staying placeholders.
+
 ### M2 — minimal Vulkan replay layer (the largest item)
 
 - [ ] Vulkan skeleton: device, queue, `ANativeWindow` swapchain
