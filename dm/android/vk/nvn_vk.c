@@ -2,20 +2,31 @@
 // The Vulkan replay layer for the NVN null device (C interface): the Android stand-in for `nvn_mtl.m`.
 //
 // 与 Metal 那边的对应关系（接口与语义见 nvn_mtl.h）：
-//   · 内存池 = 客体地址空间里的一段（已经是 Vulkan 的零拷贝内存，见 vk_region.c），按页对齐的偏移绑一块 VkBuffer；
+//   · 内存池 = 客体地址空间里的一段（已经是 Vulkan 零拷贝内存，见 vk_region.c），按页对齐的偏移绑一块 VkBuffer；
 //   · 地址反查 = 同一份分配上的偏移换算，纯算术，不需要拷贝；
-//   · 提交 = VkCommandBuffer（下一步落地，现在还是 gfx_stub_android.c 里的空实现）。
+//   · 提交 = 一条 VkCommandBuffer + 一个栅栏值；命令流（nvn_obj.h 的 op 表）由一个与 Metal 侧同形的小解释器
+//     走一遍，"GPU 完成后才生效"的副作用（事件写值、计数器）登记在提交上、等栅栏到了再做。
 // Correspondence with the Metal side (interface and semantics in nvn_mtl.h):
 //   - a memory pool is a range of the guest address space (already Vulkan zero-copy memory, see
 //     vk_region.c) with a VkBuffer bound at a page-aligned offset;
 //   - address lookup is offset arithmetic inside the same allocation, with no copying;
-//   - submission is a VkCommandBuffer (lands in the next step; today it is still the empty implementation
-//     in gfx_stub_android.c).
+//   - a submission is one VkCommandBuffer plus a fence value, and the command stream (the op table in
+//     nvn_obj.h) is walked by a small interpreter shaped like the Metal one, with the "only after the GPU
+//     completes" effects (event writes, counters) recorded on the submission and run once its fence signals.
+//
+// 范围：M2 只做语义等价，不搬 Metal 那边的优化（分配器环、延迟合并通道、参数缓冲、常驻集）。命令流里的
+// 渲染类 op 目前只统计不执行——统计出来才知道该按什么次序实现（日志里每 300 次提交打一次）。
+// Scope: M2 aims only at semantic equivalence and does not carry over Metal's optimisations (allocator rings,
+// deferred merged passes, argument buffers, residency sets). Render-side ops in the command stream are only
+// counted for now, not executed -- the counts are what tell us which to implement first (logged every 300
+// submissions).
 #include "nvn_mtl.h"
+#include "nvn_obj.h"
 #include "vk_device.h"
 #include "vk_region.h"
 #include "dm.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -162,3 +173,258 @@ void vk_pool_stats(int *no_region, int *transfer_only, uint64_t *adds) {
     if (transfer_only) *transfer_only = g_pool_small;
     if (adds) *adds = g_pool_adds;
 }
+
+// ========== 提交与命令流 ==========
+// ========== Submission and the command stream ==========
+
+// 命令流里的 op 名（顺序与 nvn_obj.h 的枚举一致，一一对应）| Op names in the command stream (same order as the enum in nvn_obj.h, one to one)
+static const char *const g_opname[OP_COUNT_] = {
+    "END", "JUMP", "BEGIN", "CALL",
+    "SIGNAL_EVENT", "REPORT_COUNTER", "COPY_B2B", "UPDATE_UB",
+    "SET_RT", "CLEAR_COLOR", "CLEAR_DS", "VIEWPORTS", "SCISSOR", "DEPTH_RANGE",
+    "BIND_PROGRAM", "BIND_STATE", "BIND_VATTR", "BIND_VSTREAM", "BIND_VBUF",
+    "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP",
+    "STENCIL", "POLY_OFFSET", "DRAW", "DRAW_IDX", "DISPATCH", "BARRIER",
+    "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR", "COPY_T2B",
+    "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX",
+};
+static _Atomic uint64_t g_opcount[OP_COUNT_];
+static _Atomic uint64_t g_sub_total, g_op_unhandled;
+
+// 「GPU 完成后才生效」的副作用：事件写值 / 计数器 / 落不到 GPU 拷贝上的小搬移
+// Effects that take place only after the GPU completes: event writes, counters, and small moves that no GPU
+// copy region can express
+enum { POST_EVENT, POST_COUNTER, POST_MEMCPY };
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; void *src, *dst; size_t n; } post_op;
+
+#define MAX_INFLIGHT 8
+#define MAX_POST 512
+#define STAGE_SIZE (4u << 20)
+typedef struct {
+    VkFence fence;
+    VkCommandBuffer cb;
+    VkBuffer stage; void *stage_map; uint64_t stage_off;
+    uint64_t value;
+    int pending, cur;
+    post_op post[MAX_POST]; int npost;
+} inflight_t;
+static inflight_t g_inf[MAX_INFLIGHT];
+static uint64_t g_fence;
+static int g_cur_slot = -1;   // 正在录制的槽（-1 = 没在录）| the slot being recorded (-1 = not recording)
+
+static void inflight_reap(void) {
+    for (int i = 0; i < MAX_INFLIGHT; i++) {
+        if (!g_inf[i].pending) continue;
+        if (vkGetFenceStatus(vk_dev(), g_inf[i].fence) != VK_SUCCESS) continue;
+        // GPU 已完成：先把"GPU 完成后才生效"的副作用做掉，再放掉这个槽
+        // The GPU has completed: run the "only after completion" effects first, then release the slot
+        for (int k = 0; k < g_inf[i].npost; k++) {
+            const post_op *o = &g_inf[i].post[k];
+            if (o->kind == POST_EVENT) { if (o->mode == 0) *o->val = o->v; else *o->val += o->v; }
+            else if (o->kind == POST_COUNTER) { if (o->addr) *(volatile uint32_t *)(uintptr_t)o->addr = (uint32_t)o->type; }
+            else if (o->kind == POST_MEMCPY) memcpy(o->dst, o->src, o->n);
+        }
+        g_inf[i].npost = 0;
+        g_inf[i].pending = 0;
+    }
+}
+
+static int inflight_take(void) {   // 取一个空闲槽：没有就等（单一队列按序完成，等最老的那个即可）| Take a free slot, waiting if none is free
+    for (;;) {
+        inflight_reap();
+        for (int i = 0; i < MAX_INFLIGHT; i++) if (!g_inf[i].pending) return i;
+        for (int i = 0; i < MAX_INFLIGHT; i++)
+            if (vkWaitForFences(vk_dev(), 1, &g_inf[i].fence, VK_TRUE, 1000000000ull) == VK_SUCCESS) { inflight_reap(); break; }
+    }
+}
+
+static int vk_sub_ready(void) {
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return 0;
+    if (!g_inf[0].fence) {
+        VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk_queue_family() };
+        VkCommandPool pool = VK_NULL_HANDLE;
+        if (vkCreateCommandPool(vk_dev(), &pci, NULL, &pool) != VK_SUCCESS) { LOG("【红】建命令池失败"); return 0; }
+        VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = MAX_INFLIGHT };
+        VkCommandBuffer cbs[MAX_INFLIGHT];
+        if (vkAllocateCommandBuffers(vk_dev(), &ai, cbs) != VK_SUCCESS) { LOG("【红】分配命令缓冲失败"); return 0; }
+        for (int i = 0; i < MAX_INFLIGHT; i++) {
+            VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+            if (vkCreateFence(vk_dev(), &fi, NULL, &g_inf[i].fence) != VK_SUCCESS) { LOG("【红】建栅栏失败"); return 0; }
+            g_inf[i].cb = cbs[i];
+            VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = STAGE_SIZE,
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+            if (vkCreateBuffer(vk_dev(), &bci, NULL, &g_inf[i].stage) != VK_SUCCESS) { LOG("【红】建暂存缓冲失败"); return 0; }
+            VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk_dev(), g_inf[i].stage, &mr);
+            VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            if (vkAllocateMemory(vk_dev(), &mai, NULL, &mem) != VK_SUCCESS) { LOG("【红】暂存缓冲内存分配失败"); return 0; }
+            vkBindBufferMemory(vk_dev(), g_inf[i].stage, mem, 0);
+            vkMapMemory(vk_dev(), mem, 0, STAGE_SIZE, 0, &g_inf[i].stage_map);
+        }
+        LOG("【绿】回放层就绪：%d 个提交槽（每条一条 VkCommandBuffer + 栅栏 %d MB 暂存）", MAX_INFLIGHT, STAGE_SIZE >> 20);
+    }
+    return 1;
+}
+
+void mtl_sub_begin(void) {
+    if (!vk_sub_ready()) return;
+    int i = inflight_take();
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (vkBeginCommandBuffer(g_inf[i].cb, &bi) != VK_SUCCESS) { LOG("【红】开始命令缓冲失败"); return; }
+    g_inf[i].cur = 1; g_inf[i].npost = 0; g_inf[i].stage_off = 0;
+    g_cur_slot = i;
+}
+
+static void post_add(const post_op *o) {
+    if (g_cur_slot < 0) return;
+    inflight_t *in = &g_inf[g_cur_slot];
+    if (in->npost >= MAX_POST) { static int said; if (!said++) LOG("【红】一次提交的副作用表已满（%d）", MAX_POST); return; }
+    in->post[in->npost++] = *o;
+}
+
+void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
+    if (!n || g_cur_slot < 0) return;
+    void *sb = NULL, *db = NULL; uint64_t so = 0, dof = 0;
+    if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof)) {
+        static int said; if (!said++) LOG("【红】提交里的缓冲拷贝落不到池子里：%#llx → %#llx +%#llx", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
+        return;
+    }
+    // GPU 拷贝要求偏移 4 字节对齐；池子里的地址多是 16 字节对齐的，不对齐的少数退成"栅栏到了再搬"
+    // A GPU copy region needs 4-byte aligned offsets; pool addresses are mostly 16-byte aligned, and the few
+    // unaligned ones fall back to "move once the fence signals"
+    if ((so & 3) || (dof & 3)) {
+        post_op o = { .kind = POST_MEMCPY, .src = (void *)(uintptr_t)src, .dst = (void *)(uintptr_t)dst, .n = (size_t)n };
+        post_add(&o);
+        static int said; if (!said++) LOG("【黄】有缓冲拷贝偏移不是 4 字节对齐（%#llx→%#llx），退成完成后搬", (unsigned long long)so, (unsigned long long)dof);
+        return;
+    }
+    VkBufferCopy r = { .srcOffset = so, .dstOffset = dof, .size = n };
+    vkCmdCopyBuffer(g_inf[g_cur_slot].cb, (VkBuffer)sb, (VkBuffer)db, 1, &r);
+}
+
+void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) {
+    post_op o = { .kind = POST_EVENT, .val = val, .mode = mode, .v = v };
+    post_add(&o);
+}
+void mtl_sub_counter(uint64_t addr, uint32_t type) {
+    post_op o = { .kind = POST_COUNTER, .addr = addr, .type = type };
+    post_add(&o);
+}
+
+uint64_t mtl_sub_commit(void) {
+    if (!vk_sub_ready() || g_cur_slot < 0) { g_cur_slot = -1; return g_fence; }
+    inflight_t *in = &g_inf[g_cur_slot];
+    int i = g_cur_slot; g_cur_slot = -1;
+    if (vkEndCommandBuffer(in->cb) != VK_SUCCESS) { LOG("【红】结束命令缓冲失败"); return g_fence; }
+    VkResult r = vkResetFences(vk_dev(), 1, &in->fence);
+    if (r != VK_SUCCESS) { LOG("【红】重置栅栏失败 VkResult %d", (int)r); return g_fence; }
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &in->cb };
+    r = vkQueueSubmit(vk_queue(), 1, &si, in->fence);
+    if (r != VK_SUCCESS) { LOG("【红】提交失败 VkResult %d", (int)r); return g_fence; }
+    in->pending = 1;
+    in->value = ++g_fence;
+    g_sub_total++;
+    // 每 300 次提交报一次 op 分布：这就是"接下来该实现哪些 op"的实测依据。
+    // 只报次数最多的 5 个：宿主的 LOG 有长度上限，一行塞 12 个 op 会被截断（实测截在 119 字符，
+    // 而渲染 op 恰恰在截掉的那半截里；前 5 名已足够定实现次序）。
+    // Report the op distribution every 300 submissions: this is the measured basis for which ops to implement
+    // next. Only the top five are reported: the host LOG has a length limit and twelve ops on one line get cut
+    // off (measured at 119 characters, with the render ops in the half that is cut; the top five are enough to
+    // decide the implementation order).
+    if (g_sub_total % 300 == 0) {
+        uint64_t c[OP_COUNT_], total = 0;
+        for (int k = 0; k < OP_COUNT_; k++) { c[k] = atomic_load(&g_opcount[k]); total += c[k]; }
+        char line[400]; size_t o = 0;
+        for (int top = 0; top < 5; top++) {
+            int best = -1;
+            for (int k = 0; k < OP_COUNT_; k++) if (c[k] && (best < 0 || c[k] > c[best])) best = k;
+            if (best < 0) break;
+            o += (size_t)snprintf(line + o, sizeof line - o, " %s=%.1f%%", g_opname[best],
+                                  total ? 100.0 * (double)c[best] / (double)total : 0.0);
+            c[best] = 0;
+        }
+        // 前缀压到最短、未执行另起一行：宿主的 LOG 有长度上限，前缀长了前 5 也会被截掉（实测过）
+        // Shortest possible prefix and the unhandled count on its own line: the host LOG has a length limit,
+        // and a long prefix truncates even five entries (measured).
+        LOG("[vk] 提交 %llu，op 前 5：%s", (unsigned long long)g_sub_total, line);
+        LOG("[vk] 本窗口 %llu 条，未执行累计 %llu", (unsigned long long)total, (unsigned long long)atomic_load(&g_op_unhandled));
+        for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
+    }
+    return g_fence;
+}
+
+uint64_t mtl_last_fence(void) { return g_fence; }
+
+int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
+    if (!vk_dev() || !fence || fence > g_fence) return 0;
+    if (fence <= g_fence - MAX_INFLIGHT) { inflight_reap(); return 1; }   // 早已滑出在飞窗口 | long past the in-flight window
+    for (int i = 0; i < MAX_INFLIGHT; i++)
+        if (g_inf[i].pending && g_inf[i].value == fence) {
+            VkResult r = vkWaitForFences(vk_dev(), 1, &g_inf[i].fence, VK_TRUE, timeout_ns ? timeout_ns : 1000000000ull);
+            inflight_reap();
+            return r == VK_SUCCESS;
+        }
+    inflight_reap();
+    return 1;
+}
+
+// 命令流解释器：与 Metal 侧同形（OP_JUMP / OP_CALL 构成的小程序）。CPU 可见副作用按语义执行，
+// 渲染类 op 目前只计数——每次提交报一次分布，按实测的频次决定实现次序。
+// The command stream interpreter, shaped like the Metal one (a small program of OP_JUMP / OP_CALL). CPU-visible
+// side effects are executed per their semantics, while render-side ops are only counted for now -- the
+// distribution is reported per submission and the measured frequency decides the implementation order.
+void mtl_exec(const uint8_t *p) {
+    if (!p) return;
+    for (;;) {
+        op_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.op < OP_COUNT_) atomic_fetch_add(&g_opcount[h.op], 1);
+        const uint8_t *a = p + 8;
+        switch (h.op) {
+        case OP_END: return;
+        case OP_BEGIN: break;
+        case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); mtl_exec((const uint8_t *)(uintptr_t)t); break; }
+        case OP_SIGNAL_EVENT: {
+            volatile uint32_t *val; uint32_t m, v;
+            memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4);
+            mtl_sub_event(val, m, v);
+            break; }
+        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
+        case OP_RESET_COUNTER: break;   // 只影响计数器的取值，回放侧无对象可复位 | only affects the counter value; the replay side has nothing to reset
+        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); break; }
+        case OP_UPDATE_UB: {
+            // 载荷 = {目标地址(8), 字节数(8), 数据(n)}。录制时数据已拷进命令内存，这里再拷进本槽的暂存缓冲，
+            // 用 GPU 拷贝送到目标——保持"提交时序"（GPU 读这块缓冲的时候，写已经在它前面）。
+            // Payload = {target address (8), byte count (8), data (n)}. The data was copied into command memory at
+            // record time; here it goes into this slot's staging buffer and a GPU copy carries it to the target,
+            // which keeps submission ordering (the write precedes whatever reads that buffer on the GPU).
+            uint64_t dst, n; memcpy(&dst, a, 8); memcpy(&n, a + 8, 8);
+            if (!n || g_cur_slot < 0) break;
+            inflight_t *in = &g_inf[g_cur_slot];
+            uint64_t padded = (n + 3) & ~3ull;
+            if (in->stage_off + padded > STAGE_SIZE) { static int said; if (!said++) LOG("【红】暂存缓冲满，常量更新被丢（本次提交 %llu 字节）", (unsigned long long)in->stage_off); break; }
+            uint8_t *sp = (uint8_t *)in->stage_map + in->stage_off;
+            memcpy(sp, a + 16, n);
+            void *db = NULL; uint64_t dof = 0;
+            if (!mtl_addr(dst, n, &db, &dof) || (dof & 3)) {
+                static int said2; if (!said2++) LOG("【红】常量更新落不到池子里或偏移未对齐：%#llx +%llx（偏移 %#llx）", (unsigned long long)dst, (unsigned long long)n, (unsigned long long)dof);
+                break;
+            }
+            VkBufferCopy r = { .srcOffset = in->stage_off, .dstOffset = dof, .size = n };
+            vkCmdCopyBuffer(in->cb, in->stage, (VkBuffer)db, 1, &r);
+            in->stage_off += padded;
+            break; }
+        default: atomic_fetch_add(&g_op_unhandled, 1); break;   // 渲染类：先只统计 | render-side: counted only for now
+        }
+        p += h.size;
+    }
+}
+
+void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }        // Metal 用来预测预编译；Vulkan 侧不需要 | Metal uses it to predict precompilation; Vulkan does not need it
+void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }

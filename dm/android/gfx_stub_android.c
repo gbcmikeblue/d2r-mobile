@@ -53,17 +53,11 @@ void dm_gfx_shot_at(long k, const char *path) { (void)k; (void)path; }
 
 int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(uint64_t timeout_ns) { (void)timeout_ns; return 0; }
-int mtl_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 0; }
 int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 1; }          // 没什么要等的 | nothing to wait for
-uint64_t mtl_last_fence(void) { return 0; }                                // 从未提交 | never submitted
 
 // ---- 提交（Metal 命令缓冲 / 内存池 / 内存池登记） | Submission (Metal command buffers / memory pools) ----
 
-void mtl_sub_begin(void) { }
-uint64_t mtl_sub_commit(void) { return 0; }
-void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
-void mtl_exec(const uint8_t *handle) { (void)handle; }
-void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
+
 
 // ---- 资源登记与释放 | Resource registration and release ----
 
