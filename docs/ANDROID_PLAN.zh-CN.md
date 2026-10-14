@@ -553,6 +553,12 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
   - 输入侧：仓库里的表是 UTF-8，而脚本里 `open(path)` 未指定编码 → `UnicodeDecodeError`（读 `shader_facts.tsv` 时踩到）。
   `PYTHONUTF8=1` 让所有 `open()` 与 stdio 默认走 UTF-8，一次解决两侧问题。
 - **重定向到文件用 cmd 的 `>`**（保持原始字节），不要在 PowerShell 里用管道 + `Out-File`（会改编码与行尾）。
+- **提交消息不要经由 PowerShell 5.1 读 `.ps1` 去"转写"**。把中文消息写在脚本里再让脚本写进消息文件，这条老办法踩到过一次：
+  PowerShell 5.1 读 `.ps1` **按系统码页（GBK）而不是 UTF-8**，于是脚本里的中文在内存里已经是乱码，再经
+  `[System.IO.File]::WriteAllText(..., UTF8)` 落盘 → **提交消息被二次编码**（`git log` 里显示成 `M3-2k锛氱紦...`，
+  而仓库里更早的提交是好的）。改法：**消息文件由编辑器/工具直接写成 UTF-8**，`git commit -F <文件>` 只读字节，
+  中间不经过 PowerShell 的字符串。已经写坏的那条可以还原（UTF-8 字节被当 GBK 读 = 二次编码，逐字节反向即可），
+  或直接从脚本文件里把原文抽出来重写——但**别用 PowerShell 抽**，用 Python（`PYTHONUTF8=1`）。
 - **读文件显式指定编码**：PowerShell 用 `-Encoding`，或直接 `[System.IO.File]::ReadAllLines()`。
 - **路径一律纯 ASCII**。本机用户目录名含中文（`C:\Users\ZhuanZ（无密码）`），已经因此踩过两个坑：
   - `hactool` 会把 `HOME` / `USERPROFILE`（含中文）转 UTF-16 失败而崩溃 → 跑之前先设一个 ASCII 的 `HOME`；

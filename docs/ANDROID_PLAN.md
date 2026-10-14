@@ -595,6 +595,14 @@ The port is currently being driven from a Windows machine. These are the traps a
   - on input, the tables in the repository are UTF-8 while a script's `open(path)` carries no encoding → `UnicodeDecodeError` (hit when reading `shader_facts.tsv`).
   `PYTHONUTF8=1` makes every `open()` and stdio default to UTF-8, fixing both sides at once.
 - **Redirect to a file with cmd's `>`** (preserves raw bytes); do not use a PowerShell pipeline plus `Out-File` (it changes encoding and line endings).
+- **Do not route a commit message through a `.ps1` that PowerShell 5.1 reads.** Keeping the Chinese message inside a script and
+  having the script write the message file is the older habit, and it bit once: PowerShell 5.1 reads a `.ps1` using the **system
+  code page (GBK) rather than UTF-8**, so the Chinese is already mojibake in memory, and `[System.IO.File]::WriteAllText(..., UTF8)`
+  then lands it on disk **double-encoded** (`git log` shows `M3-2k锛氱紦...`, while the repository's earlier commits are fine).
+  The fix: **let the editor or tool write the message file as UTF-8**, and use `git commit -F <file>` so git reads bytes and
+  PowerShell never touches the string. A message already damaged this way can be recovered (UTF-8 bytes read as GBK is a
+  double encoding, so walking it back byte by byte works), or its text can be extracted from the script file and rewritten --
+  but **do not extract it with PowerShell**; use Python (`PYTHONUTF8=1`).
 - **Read files with an explicit encoding**: PowerShell `-Encoding`, or `[System.IO.File]::ReadAllLines()`.
 - **Keep every path pure ASCII.** The user directory on this machine contains non-ASCII characters (`C:\Users\ZhuanZ（无密码）`), which has already caused two problems:
   - `hactool` converts `HOME` / `USERPROFILE` to UTF-16 and crashes when that fails → set an ASCII `HOME` before running it;
