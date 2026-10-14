@@ -631,15 +631,15 @@ Proceed in the order on this page; after each milestone, tick it off here and re
 milestone A (the rendering chain's warnings) are now done**: the descriptor blanks (the UBO name number minus 3, the
 storage buffer derived from `cb_offset`, and **buffer textures** as a new resource kind -- see "M3-2k") and the vertex
 attribute test ("M3-2l": two independent faults, one of them caught by a probe). Device readings: `顶点属性` 0,
-`贴图写空白` 0, `拿不到缓冲地址` 0, `target 10 暂不支持` 0. **M2's acceptance (a picture appears) now hinges on the
-rendering chain alone** -- the warnings are cleared, but nobody has yet measured whether the GPU writes colour content
-once they are. What follows is ordered by value:
+`贴图写空白` 0, `拿不到缓冲地址` 0, `target 10 暂不支持` 0. **"Scan first" has now been done ("M3-2m")**: reading level 0
+texture by texture gives **all zero** (26 / 63 / 63 textures at >=256x256, not one with content); but with the viewer on
+**level 1** the same 1600x900 render target **does carry content** (`mean 0.3, max 160`). So "the GPU writes no colour
+content" has to be narrowed to "**level 0** carries none", and the blocker turns from "is there a picture" into "**which
+level holds it, and does the readback read the right one**". What follows is ordered by value:
 
-1. **Scan first** (cheapest and most informative) -- `DM_NVN_SHOT_SCAN` answers "has content or not" directly: with the
-   warnings cleared, do the targets carry content now? Content means the blocker moves to "does the picture reach the
-   present texture"; still all zero means the rendering chain holds a **third** problem nothing has caught yet (which
-   sends the work back to the readback and the pass/state lines to be measured, rather than guessing on down the warning
-   list);
+1. **Scan level by level** -- turn the scan from "level 0 only" into "**read every level, each with its own size**", and
+   let "has content or not" answer "which level holds the picture"; fix the driver-side crash on the way (copying level 1
+   with a level-0-sized buffer: `sig=11 pc=vulkan.adreno.so+0x2a7ac8`);
 2. **Milestone B: the guest stall** -- classify it by sampling `/proc` over several rounds (the one-shot stall sampler
    and the wait-point dump are both in place). This device normally stalls at 55-60 presents, so the judgement has to be
    read from "what is it doing across several samples", never against the occasional outlier run;
@@ -1182,6 +1182,66 @@ round's A/B groups both have it, and the 21:47 run does not -- **sporadic, and u
 shows that "device lost" surfaces on this texture-upload path (a one-off submit plus a queue-idle wait), which deserves a
 look of its own (who loses it first: the guest's own commands, or that one submit of ours).
 
+### M3-2m: the render-area trace -- item 3 is closed, and it asks "which level is the picture at" on the way (2026-10-14, device)
+
+Item 3 bet on "deriving the render area from the viewport drops fragments". Following the "measure first" rule, a
+side-by-side reading was added where a pass opens (`DM_PASS_AREA=1` measures only; `=2` swaps in the attachment size as a
+control) and one round was run on the device. **That suspect is dead**, but three other things surfaced in the same round.
+
+**1. The render area is not the blocker** (the distribution over 16384 pass opens)
+
+| Reading | Value |
+|---|---|
+| Main-scene passes | render area / attachment / viewport **all three 1600x900** (opens 3, 267, 339, 409, 423, 553, 633, ...) |
+| Computed render area below the attachment | **267 / 16384 = 1.6%** (11 / 28 / 62 / 131 / 267 at opens 1024 / 2048 / 4096 / 8192 / 16384) |
+| Collapsed to 1x1 | **0** |
+| "No viewport set" when a pass opened | **0** (the viewport always arrives before the pass) |
+| Offset viewport (x/y != 0) | **0** |
+
+That 1.6% is not an anomaly: those are passes whose viewport covers a sub-rectangle anyway (400x225 into 1600x900, say),
+which under Metal's semantics also draws only that rectangle. **Item 3 is closed: not the blocker** (so the `=2` control
+does not need running).
+
+**2. The trace turned up two new readings**
+
+1. **"Attachment 0x0" shows up often** -- those are **depth-only** passes (`ncolor=0` in the shadow). There is no colour
+   attachment to clamp against (the existing clamp only applies when there is one), so only the viewport or the 1x1
+   fallback is left. A branch nobody had noticed before.
+2. **Pairs like "viewport 1600x900 / attachment 800x450" appear** (opens 367, 8192, ...). The render area is clamped to
+   800x450 correctly, but **the viewport handed to Vulkan is still 1600x900** -- for an attachment limited to a mip, the
+   viewport is not scaled with it. Apple's side does not handle it either; recorded on its own for later.
+
+**3. The "scan first" of item 7 of "next steps" was run: still all zero, but that sentence itself has to be narrowed**
+
+`DM_NVN_SHOT_SCAN=50,300,340` scanned 26 / 63 / 63 textures at >=256x256 across three rounds: **every one reads `brightness
+mean 0.0, min 0, max 0`** (a single value throughout, so the `scan/` directory is still empty). On the face of it, step
+14's conclusion "the GPU writes no colour content" stands unchanged.
+
+**But the viewer reads the opposite.** Point it at **level 1** (`DM_WIN_SRC=28`, `DM_WIN_LEVEL=1`) and the same serial 28
+immediately reads:
+
+```
+查看器：序号 28 第 1 级 800x450 第 61 次，亮度 均值 0.3、最小 0、最大 160（读成功 61、跳过 149）
+查看器：序号 28 第 1 级 800x450 第 121 次，亮度 均值 0.2、最小 0、最大 106（读成功 121、跳过 149）
+```
+
+**The same 1600x900 render target reads zero at level 0 and content at level 1.** That lines up exactly with the batch of
+"attachment 800x450" passes in the trace (the `pass_begin` warning "render area width 1600 exceeds attachment 800
+(mip-limited view)" is the same fact).
+
+**So step 14's conclusion has to be narrowed to "level 0 carries no content"**: the scan reads level 0 only, and the
+picture is at some level. The test has to become a **level-by-level scan** (each level with its own size) rather than
+level 0 alone.
+
+**4. One crash on the way**: reading level 1 about 200 times ends in `CRASH sig=11 pc=vulkan.adreno.so+0x2a7ac8` (inside
+the driver). The same class as the documented "opening the viewer crashes in `vk_tex_view`"; the suspicion is that the
+readback **allocates its buffer for the base image's size and then copies level 1**, so the copy range does not match the
+real subresource size -- size it from "that level's dimensions" when fixing it.
+
+**5. The instruments**: `DM_PASS_AREA=1` (measure only) / `=2` (render area from the attachment size, the control), with one
+line carrying "render area / attachment / viewport / scissor" side by side plus four running counts (below the attachment,
+collapsed to 1x1, no viewport when the pass opened, offset viewport).
+
 ---
 
 ## 9. Optimisation list (**for confirmation**, recorded 2026-10-14)
@@ -1196,7 +1256,7 @@ The order is by value for money (gain over risk), not by effort.
 |---|---|---|---|---|
 | 1 | Create a `VkPipelineCache` and persist it | No pipeline cache at all today, so every launch compiles from scratch | Low | first |
 | 2 | Ask for `HOST_CACHED` for the zero-copy type | The 3.7 GB guest heap sits on **host-uncached** memory | Low-medium | alongside 1 |
-| 3 | Stop deriving `renderArea` from the viewport | An offset viewport shrinks the render area, so fragments are silently discarded | Zero to measure | **parallel with the re-scan** |
+| 3 | `renderArea` (**measured, and ruled out**) | 16384 pass opens on the device: the main scene agrees on all three, so the blocker is not here | -- | closed ("M3-2m") |
 | 4 | The per-draw repeated work | Pipeline lookup + two descriptor sets + a full rewrite + rebinding | Medium | after the blocker is measured |
 | 5 | Texture uploads on a resident upload ring | "One-off submit plus a queue-idle wait", and it has already shown `DEVICE_LOST` | Medium | with item 3 of "next steps" |
 | 6 | The hand-rolled pipeline tables are small and destroy on evict | `GPSO_TAB 192` / `CPSO_TAB 256` | Low | after 1 |
@@ -1249,11 +1309,15 @@ validation layers to say so. That is one of the exact shapes of "drew, and not o
 comparable projects (Skyline / Ryujinx) take the **attachment extent** and let the viewport and the scissor do the
 clamping.
 
-**Suggestion**: **measure first** (add readings, change no behaviour): when a pass opens, log the `renderArea` next to the
-attachment size and the viewport/scissor, and look for `w < att_w`, `h < att_h` or a plainly tiny value.
-
-**When**: **in parallel** with item 1 of "next steps" (`DM_NVN_SHOT_SCAN`) -- both answer "does the target hold anything
-now that the warnings are clear".
+**Measured and closed: not the blocker** ("M3-2m"). Across 16384 pass opens the main scene agrees on all three
+(1600x900); "computed smaller than the attachment" is only **1.6%** (and that 1.6% is passes whose viewport covers a
+sub-rectangle anyway, which is equivalent under Metal's semantics); collapsing to 1x1 happens **0** times; "no viewport
+when the pass opened" **0** times; an offset viewport **0** times. The switch stays for regression (`DM_PASS_AREA=1`
+measures only, `=2` swaps in the attachment size as a control).
+**The trace turned up two more readings** (see "M3-2m" part two): (1) "attachment 0x0" means a **depth-only** pass and
+the existing clamp does not apply to those; (2) pairs like "**viewport 1600x900 / attachment 800x450**" appear -- the
+render area is clamped correctly but **the viewport handed to Vulkan is not scaled along with it**, an inconsistency
+neither side handles yet (Apple's side does not either), recorded for later.
 
 ### 4. The per-draw repeated work
 

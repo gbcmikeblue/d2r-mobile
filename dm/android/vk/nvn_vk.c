@@ -1729,6 +1729,34 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
     return nd;
 }
 
+// ========== 渲染区取证：算出多少、附件多大、谁说了算（优化清单第 3 项）==========
+// 苹果侧开通道时**没有"渲染区"这个参数**（`MTL4RenderPassDescriptor` 不接收矩形），它的参考尺寸由
+// `pass_dims`（nvn_mtl.m:1386-1395）从**附件尺寸**（按 mip 级）取最小值得到，**完全不读视口**。
+// 安卓侧这里却是"视口的 x+width / y+height 与裁剪取小"（见 pass_begin），两者语义不同：视口一旦有偏移
+// （NVN 不保证它是 0），算出的渲染区就比附件小，而**渲染区外的片元会被直接丢弃** —— 真机没有校验层，
+// 不会报错。"画了却一个像素不落"正是这个形状，所以先读数、后改动。
+// DM_PASS_AREA=1 只读数（不改行为）；=2 渲染区改用附件尺寸（与苹果侧同源，对照实验）。
+// The render-area trace (optimisation item 3). Apple's side has no render-area parameter at all
+// (`MTL4RenderPassDescriptor` takes no rectangle): its reference size comes from `pass_dims` (nvn_mtl.m:1386-1395),
+// which takes the **attachment** sizes (per mip level) and **never reads the viewport**. The Android side here
+// derives it from the viewport's x+width / y+height min'd with the scissor instead, and the two do not agree: once
+// the viewport carries an offset (NVN does not promise zero) the computed area is smaller than the attachment, and
+// **fragments outside the render area are discarded outright** -- with no validation layers to say so. That is
+// exactly the shape of "drew, and not one pixel landed", so the numbers come first and the change second.
+// DM_PASS_AREA=1 measures only (no behaviour change); =2 uses the attachment size instead (same origin as Apple,
+// an A/B experiment).
+static int pass_area_mode(void) {
+    static int once = -1;
+    if (once < 0) {
+        const char *v = getenv("DM_PASS_AREA");
+        once = (v && *v) ? atoi(v) : 0;
+        if (once) LOG("【查】DM_PASS_AREA=%d：%s", once,
+                      once >= 2 ? "渲染区改用附件尺寸（与苹果侧同源，对照实验）" : "只打印渲染区 / 附件 / 视口 / 裁剪，不改行为");
+    }
+    return once;
+}
+static _Atomic uint64_t g_pa_n, g_pa_small, g_pa_tiny, g_pa_novp, g_pa_off;
+
 static void pass_begin(void) {
     if (g_rs.open || g_cur_slot < 0) return;
     if (!vk_have_dyn_render()) return;
@@ -1816,6 +1844,38 @@ static void pass_begin(void) {
     // no validation layers to show it).
     if (att_w && w > att_w) { static int said; if (!said++) LOG("【黄】渲染区宽 %u 超出附件 %u（限了 mip 的视图）：已按附件钳住", w, att_w); w = att_w; }
     if (att_h && h > att_h) { static int said; if (!said++) LOG("【黄】渲染区高 %u 超出附件 %u（限了 mip 的视图）：已按附件钳住", h, att_h); h = att_h; }
+    // ---- 渲染区取证 + 对照（说明见 pass_area_mode）----
+    // 四个累计数各回答一件事：比附件小（渲染区外的片元被丢）、退成 1x1 级（几乎什么都不画）、
+    // 开通道时**根本没设视口**（那份状态还没到，渲染区只能由裁剪或 1x1 兜底）、视口带偏移（"x+width" 算法失真）。
+    // Four counters, each answering one thing: smaller than the attachment (fragments outside are discarded),
+    // collapsed to 1x1 (almost nothing is drawn), **no viewport set at all** when the pass opened (that state has
+    // not arrived yet, so only the scissor or the 1x1 fallback is left), and an offset viewport (which is what
+    // distorts the "x+width" arithmetic).
+    int pa = pass_area_mode();
+    if (pa) {
+        const int has_vp = g_rs.nvp ? 1 : 0;
+        const float vpx = has_vp ? g_rs.vp[0].x : 0.f, vpy = has_vp ? g_rs.vp[0].y : 0.f;
+        const float vpw = has_vp ? g_rs.vp[0].width : 0.f, vph = has_vp ? g_rs.vp[0].height : 0.f;
+        const int small = (att_w && w < att_w) || (att_h && h < att_h);
+        const int tiny = (w <= 1 || h <= 1);
+        const int off = has_vp && (vpx != 0.f || vpy != 0.f);
+        uint64_t n = atomic_fetch_add(&g_pa_n, 1) + 1;
+        if (small) atomic_fetch_add(&g_pa_small, 1);
+        if (tiny) atomic_fetch_add(&g_pa_tiny, 1);
+        if (!has_vp) atomic_fetch_add(&g_pa_novp, 1);
+        if (off) atomic_fetch_add(&g_pa_off, 1);
+        if (n <= 8 || (n & 1023) == 0)
+            LOG("【查】渲染区 %ux%u / 附件 %ux%u / 视口 %.0fx%.0f@(%.0f,%.0f)%s / 裁剪 %ux%u@(%d,%d)%s%s（第 %llu 次；比附件小累计 %llu、退成 1x1 累计 %llu、开通道时没视口 %llu、视口带偏移 %llu）",
+                w, h, att_w, att_h, vpw, vph, vpx, vpy, has_vp ? "" : "（未设）",
+                g_rs.nsc ? g_rs.sc[0].extent.width : 0u, g_rs.nsc ? g_rs.sc[0].extent.height : 0u,
+                g_rs.nsc ? (int)g_rs.sc[0].offset.x : 0, g_rs.nsc ? (int)g_rs.sc[0].offset.y : 0,
+                small ? " ← 比附件小" : "", tiny ? " ← 退成 1x1 级" : "",
+                (unsigned long long)n,
+                (unsigned long long)atomic_load(&g_pa_small), (unsigned long long)atomic_load(&g_pa_tiny),
+                (unsigned long long)atomic_load(&g_pa_novp), (unsigned long long)atomic_load(&g_pa_off));
+        // =2：渲染区改用附件尺寸（与苹果侧 pass_dims 同源）
+        if (pa >= 2 && att_w && att_h) { w = att_w; h = att_h; }
+    }
     ri.renderArea.extent = (VkExtent2D){ w, h };
     if (g_rs.nvp) vkCmdSetViewport(cb, 0, (uint32_t)g_rs.nvp, g_rs.vp);
     if (g_rs.nsc) vkCmdSetScissor(cb, 0, (uint32_t)g_rs.nsc, g_rs.sc);
