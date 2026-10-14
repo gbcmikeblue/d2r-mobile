@@ -111,6 +111,16 @@ int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
 // thousands of times per window, which look like three rotating swapchain textures, and that has to be settled.
 void vk_tex_dump_ser(uint64_t serial);
 
+// 对照实验：给一张贴图清一个**已知的颜色**（走一次性的命令缓冲，与出图截图/扫描同一条"写入 → 读回 → 上屏"链路）。
+// 它分开的是两件完全不同的事：屏幕/截图出现了这个颜色，说明**抓取与上屏那条链路是通的**，问题在游戏自己的绘制上；
+// 屏幕还是黑的，说明**我们的写入/布局/读回本身有问题** —— 那么此前"目标全零"那条结论也要重新审视。
+// A control experiment: clear one texture to a **known colour** (through a one-shot command buffer, the same
+// "write -> read back -> present" chain the screenshots and scans use). It separates two very different things: if the
+// screen or a screenshot shows that colour then **the grab-and-present chain works** and the trouble is in the game's own
+// drawing; if the screen stays black then **our write, layout or readback is at fault**, and the earlier "the targets
+// are all zero" conclusion has to be revisited too.
+int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a);
+
 // 贴图 → 贴图拷贝（NVN 的 nvnCommandBufferCopyTextureToTexture）。记进**回放层的命令缓冲**，不另开一次提交
 // ——顺序就是语义：拷贝必须排在产生源内容的那些绘制之后。区域里宽/高/深 <= 0 表示"从偏移到边界"（NVN 的约定）。
 // 放在纹理层是因为只有这里同时知道两边的布局与"池是真值还是 GPU 写过"。

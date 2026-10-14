@@ -446,6 +446,23 @@ static uint32_t bytes_hash(const void *p, size_t n) {
     return h;
 }
 
+// DM_NO_DEPTH_TEST：把深度测试**一律关掉**（诊断用）。
+// 为什么值得一试：真机上 34 万次绘制都下发了、目标却读出来全零 —— 而"每个片元都被深度测试挡掉"是最经典的成因之一
+// （比较函数、深度范围、附件布局任一处不对都会这样）。关掉它，画面若立刻出来，那就是深度这一路。
+// DM_NO_DEPTH_TEST forces depth testing **off** everywhere (a diagnostic). Why it is worth trying: on the device 348k
+// draws go out yet the targets read all zero, and "every fragment rejected by the depth test" is one of the classic
+// causes (a wrong compare op, depth range or attachment layout all do it). Turn it off and, if the picture appears at
+// once, depth is the path to look at.
+static int nodepth_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_NO_DEPTH_TEST");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_NO_DEPTH_TEST：深度测试一律关掉（诊断）");
+    }
+    return v;
+}
+
 VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_gfx_state *st) {
     if (!vs || !st || vs->mod == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     vk_device_init();
@@ -575,9 +592,9 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         .rasterizationSamples = st->samples ? st->samples : VK_SAMPLE_COUNT_1_BIT,
         .alphaToCoverageEnable = st->a2c ? VK_TRUE : VK_FALSE };
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable = st->depth_test ? VK_TRUE : VK_FALSE,
+        .depthTestEnable = (nodepth_on() ? VK_FALSE : (st->depth_test ? VK_TRUE : VK_FALSE)),
         .depthWriteEnable = st->depth_write ? VK_TRUE : VK_FALSE,
-        .depthCompareOp = st->depth_test ? st->depth_op : VK_COMPARE_OP_ALWAYS,
+        .depthCompareOp = (nodepth_on() || !st->depth_test) ? VK_COMPARE_OP_ALWAYS : st->depth_op,
         .stencilTestEnable = st->stencil_en ? VK_TRUE : VK_FALSE };
     if (st->stencil_en) {
         ds.front = (VkStencilOpState){ .failOp = st->stencil_fail[0], .passOp = st->stencil_zpass[0],

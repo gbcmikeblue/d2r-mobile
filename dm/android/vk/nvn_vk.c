@@ -273,6 +273,20 @@ typedef struct {
 static rstate_t g_rs = { .st_vmask = { 0xff, 0xff }, .st_wmask = { 0xff, 0xff } };
 static _Atomic uint64_t g_pass_n, g_clear_n, g_draw_skip, g_shadow_n;
 
+// 绘制按"有没有渲染目标"分开计数 + 最近 32 个 op 的流水 + 最近一次 SET_RT。
+// 为什么：真机上近半数绘制写着"目标 0 个"（于是被跳过），而游戏那些目标因此一直是零 —— 究竟是"游戏真的没设目标"还是
+// "我们把它丢了"，光看计数分不出来，只能把**这次绘制前面的那条 op 序列**拿出来看。
+// Draws counted by "has render targets or not", plus a ring of the last 32 ops and the last SET_RT. Why: on the device
+// nearly half the draws say "0 targets" and are skipped, which is why the game's targets stay zero -- whether the game
+// really set no targets or we dropped them cannot be told from counts alone, only from **the op sequence in front of
+// that draw**.
+static _Atomic uint64_t g_draw_nc0, g_draw_ncN;
+static uint8_t g_opring[32];
+static _Atomic unsigned g_opring_i;
+static uint64_t g_last_rt[8];
+static int g_last_rt_n;   // 最近一次 SET_RT 报了几个目标（-1 = 从没报过）| how many targets the last SET_RT carried (-1 = never)
+static int g_last_rt_seen;
+
 // 渲染目标使用计数：哪张纹理被当渲染目标用过、用了多少次。回答的是"游戏到底往哪张纹理画"——而这件事只能靠数
 // （真机上出图纹理全白、游戏自己的目标全零，光看名字猜不出来）。表很小：超过就并到"其他"。
 // Render-target usage counts: which textures serve as render targets, and how often. It answers "which texture does the
@@ -575,6 +589,22 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s; (void)crop;
     uint64_t n = atomic_fetch_add(&g_present_n, 1) + 1;
 
+    // DM_GFX_PROBE=<序号>：每次出图后把这张贴图清成一个已知颜色（蓝）—— 这是"已知好的写入 → 读回 → 上屏"的对照实验。
+    // 放在出图之后、截图之前，所以同一帧里截的图/查看器抓的就是它：屏幕变蓝 = 抓取与上屏那条链路是通的，问题在游戏
+    // 自己的绘制上；还是黑的 = 我们的写入/布局/读回本身有问题（那么"目标全零"那条结论也要重审）。
+    // DM_GFX_PROBE=<serial>: after each present, clear that texture to a known colour (blue) -- the control experiment
+    // for "a known-good write -> read back -> present". It runs after the present but before any screenshot, so a
+    // screenshot or viewer grab in the same frame captures it: a blue screen means the grab-and-present chain works and
+    // the trouble is in the game's own drawing, while a black screen means our write, layout or readback is at fault
+    // (and "the targets are all zero" has to be revisited).
+    static long probe_ser = -2;
+    if (probe_ser == -2) {
+        const char *e = getenv("DM_GFX_PROBE");
+        probe_ser = (e && *e) ? atol(e) : -1;
+        if (probe_ser > 0) LOG("[vk] 对照实验已开启：出图后把序号 %ld 清成蓝色（DM_GFX_PROBE 去掉即关）", probe_ser);
+    }
+    if (probe_ser > 0) vk_tex_probe_clear((uint64_t)probe_ser, 0.0f, 0.6f, 1.0f, 1.0f);
+
     // DM_NVN_SHOT=帧号[,帧号…]:路径（路径里的 %d 换成帧号）——与苹果侧同名同义，脚本与经验可以直接搬过来
     // DM_NVN_SHOT=<frame>[,<frame>...]:<path> (%d in the path becomes the frame number) -- the same name and meaning
     // as on Apple, so scripts and know-how carry over
@@ -630,6 +660,29 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         LOG("[vk] 出图第 %llu 次：纹理序号 %llu %ux%u 格式 %#x（没有交换链，只做统计与截图）", (unsigned long long)n,
             (unsigned long long)(t ? t->serial : 0), t ? t->d.width : 0, t ? t->d.height : 0, t ? t->d.format : 0);
     return 0;   // 没有出图队列：票号恒 0，后端那条 mtl_present_wait 等待即空转 | no present queue: the ticket is always 0, so the back end's mtl_present_wait returns immediately
+}
+
+// ---------- 给 app 的心跳与报告用的一行计数 ----------
+// app 那边**就地声明**这两个（不去包含宿主的头，理由见 main_apk.c 里那段说明）。这一行是"进程被杀之前最后留下的现场"：
+// 每秒一条，所以哪怕后来被 SIGKILL，文件里也能看出"最后一次出图是多少、之后有没有再动"。
+// ---------- One line of counters for the app's heartbeat and report ----------
+// The app declares these two locally (rather than including the host's headers, for the reason given in main_apk.c). This
+// line is "the scene left behind before the process is killed": one per second, so even a later SIGKILL shows in the file
+// how many presents happened and whether anything moved after that.
+uint64_t vk_present_count(void) { return atomic_load(&g_present_n); }
+
+int vk_diag_line(char *buf, size_t cap) {
+    if (!buf || cap < 64) return 0;
+    uint64_t nlay = 0, nl2 = 0, ncpso = 0, gpso = 0, nfail = 0;
+    vk_pipe_stats(&nlay, &nl2, &ncpso, &gpso, &nfail);
+    uint64_t tot = 0;
+    for (int t = 0; t < g_rt_n; t++) tot += g_rt_use[t].n;
+    return snprintf(buf, cap,
+                    "出图 %llu；绘制 有目标 %llu / 无目标 %llu；T2T %llu；渲染目标 %d 张（前几名累计 %llu）；图形管线 %llu（失败 %llu）；未执行 op %llu",
+                    (unsigned long long)atomic_load(&g_present_n),
+                    (unsigned long long)atomic_load(&g_draw_ncN), (unsigned long long)atomic_load(&g_draw_nc0),
+                    (unsigned long long)vk_tex_t2t_count(), g_rt_n, (unsigned long long)tot,
+                    (unsigned long long)gpso, (unsigned long long)nfail, (unsigned long long)atomic_load(&g_op_unhandled));
 }
 
 // 按请求截图（DM_NVN_SHOT_UI / DM_TICK_HOLD=E:SHOT 用）：在当前出图帧之后第 k 帧截图。与苹果侧同签名。
@@ -833,6 +886,11 @@ uint64_t mtl_sub_commit(void) {
             LOG("[vk] 渲染目标前 5（共 %d 张、%llu 次，另 %llu 次超表）：%s", g_rt_n, (unsigned long long)tot,
                 (unsigned long long)atomic_load(&g_rt_other), o2 ? rl : "（无）");
             LOG("[vk] T2T 累计 %llu 次", (unsigned long long)vk_tex_t2t_count());
+            // 绘制按有无渲染目标分开：无目标的那些**被跳过**，所以"有目标"才是真正下发的绘制
+            // Draws split by whether they have render targets: the ones without are **skipped**, so "with targets" is
+            // what really goes out
+            LOG("[vk] 绘制：有目标 %llu、无目标 %llu（无目标者被跳过）",
+                (unsigned long long)atomic_load(&g_draw_ncN), (unsigned long long)atomic_load(&g_draw_nc0));
             // 前 5 名的身份逐条问出来：序号、尺寸、格式、是不是窗口贴图 —— "这个序号到底是什么"不看名字猜不出来
             // Ask each of the top five for its identity: serial, size, format, whether it is a window texture --
             // "what is this serial" cannot be guessed from the name
@@ -1586,6 +1644,7 @@ void mtl_exec(const uint8_t *p) {
         op_hdr h;
         memcpy(&h, p, sizeof h);
         if (h.op < OP_COUNT_) atomic_fetch_add(&g_opcount[h.op], 1);
+        g_opring[atomic_fetch_add(&g_opring_i, 1) & 31] = (uint8_t)h.op;   // 流水：出问题时把"前面发生了什么"打出来 | the ring: print "what came before" when a draw looks wrong
         const uint8_t *a = p + 8;
         switch (h.op) {
         case OP_END: pass_end(); return;
@@ -1638,6 +1697,12 @@ void mtl_exec(const uint8_t *p) {
             g_rs.depth = r->depth;
             g_rs.dview = r->dview;
             g_rs.has_dview = r->has_dview;
+            // 记下最近一次 SET_RT 的目标序号：绘制报"目标 0 个"时，要能一眼看出"到底有没有报过 SET_RT"
+            // Record the last SET_RT's target serials: when a draw reports "0 targets" it must be possible to see at a glance
+            // whether a SET_RT was ever reported
+            g_last_rt_n = (int)g_rs.ncolor;
+            g_last_rt_seen = 1;
+            for (int i = 0; i < 8; i++) g_last_rt[i] = g_rs.color[i] ? g_rs.color[i]->serial : 0;
             g_rs.cc_have = 0; g_rs.cc_mask = 0; g_rs.cd_have = 0; g_rs.cs_have = 0;
             break; }
         case OP_CLEAR_COLOR: {
@@ -1818,6 +1883,31 @@ void mtl_exec(const uint8_t *p) {
                 break;
             }
             gfx_state_fill(&stv, d->prim);
+            // 没有渲染目标的绘制：把"前面发生了什么"打出来（只打前三次，够看清形态；打多了会把日志淹掉）
+            // A draw with no render targets: print "what came before" (only the first three, enough to see the shape;
+            // more would drown the log)
+            if (!stv.color_count) {
+                uint64_t nc0 = atomic_fetch_add(&g_draw_nc0, 1);
+                if (nc0 < 3) {
+                    char seq[288]; int so = 0;
+                    unsigned wi = atomic_load(&g_opring_i);
+                    unsigned span = wi < 16 ? wi : 16;
+                    for (unsigned i2 = 0; i2 < span; i2++) {
+                        uint8_t op = g_opring[(wi - span + i2) & 31];
+                        so += snprintf(seq + so, sizeof seq - so, " %s", op < OP_COUNT_ ? g_opname[op] : "?");
+                    }
+                    LOG("【查】第 %llu 次绘制没有渲染目标：影子 ncolor=%d、开通道=%d、程序=%s、顶点流掩码 %#x（%d 条）；此前 %u 个 op：%s",
+                        (unsigned long long)(k + 1), g_rs.ncolor, g_rs.open ? 1 : 0, g_rs.prog ? "有" : "无",
+                        (unsigned)g_rs.stream_have, __builtin_popcount((unsigned)g_rs.stream_have), span, so ? seq : "（无）");
+                    if (!g_last_rt_seen) LOG("【查】至今**没有过** SET_RT 类 op");
+                    else {
+                        char rl[200]; int ro = 0;
+                        for (int i2 = 0; i2 < g_last_rt_n && i2 < 8; i2++)
+                            ro += snprintf(rl + ro, sizeof rl - ro, " 序号 %llu", (unsigned long long)g_last_rt[i2]);
+                        LOG("【查】最近一次 SET_RT：%d 个目标%s", g_last_rt_n, g_last_rt_n ? rl : "（零个）");
+                    }
+                }
+            } else atomic_fetch_add(&g_draw_ncN, 1);
             VkPipeline pl = shs[0] ? vk_pipe_graphics(shs[0], shs[1], &stv) : VK_NULL_HANDLE;
             int wrote = 0;
             if (pl && g_rs.open && g_cur_slot >= 0) {

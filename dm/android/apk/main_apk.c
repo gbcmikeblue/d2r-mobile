@@ -16,8 +16,10 @@
 #include <android_native_app_glue.h>
 #include <android/log.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <jni.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +38,10 @@
 // Android code (see the note in CMakeLists: the dm_android_compat force-include is deliberately **not** added here).
 int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h);
 int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
+// 心跳/报告用的那两件（同样就地声明）：出图次数、以及一行宿主侧计数
+// The two used by the heartbeat / report (also declared locally): the present count and one line of host-side counters
+uint64_t vk_present_count(void);
+int vk_diag_line(char *buf, size_t cap);
 
 // 宿主那套的环境准备与 dm_main 的交接（dm/android/main_android.c）：**与 APK 必须完全一致**，所以那边只留一个实现，
 // 这里直接调它，而不是把环境准备抄一遍（抄一遍就会漂）。
@@ -44,8 +50,71 @@ int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
 int dm_android_main(int argc, char **argv);
 
 #define TAG "dmwin"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// ---------- 日志：同时进 logcat 与一个文件 ----------
+// 为什么必须有文件：进程被系统**直接杀掉**（SIGKILL / ANR / 内存不足）时任何处理器都来不及跑，logcat 也可能被刷掉或
+// 截断，只有"每行立刻落盘"能在被杀之前把现场留下 —— 这正是"闪退 / 卡死都看不到原因"要补的那件事。
+// 位置：app 自己的外部目录，adb 可直接拉回 Windows 看；每次启动一个新文件，上一轮留成 prev.log。
+// 不自己装 SIGSEGV 那类处理器：宿主的 crash.c 已经装了（并且会打回溯），覆盖掉反而丢现场。
+// The log goes to both logcat and a file. Why a file is mandatory: when the system kills the process outright
+// (SIGKILL / ANR / out of memory) no handler ever runs and logcat can be flooded or truncated, so only "every line lands
+// on disk immediately" leaves the scene behind before the kill -- which is exactly the gap behind "a crash or a stall
+// with no reason visible". Location: the app's own external directory, which adb can pull straight back to Windows; a
+// fresh file per start with the previous run kept as prev.log. No SIGSEGV-class handler is installed here on purpose:
+// the host's crash.c already has one (and prints a backtrace), and replacing it would lose that scene rather than add to
+// it.
+static int g_log_fd = -1;
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// 单行落地（也用于宿主经由日志泵送来的那些行）
+// One line to disk (also used for the host's lines arriving through the log pump)
+static void log_sink(const char *s, size_t n) {
+    pthread_mutex_lock(&g_log_mu);
+    if (g_log_fd >= 0 && n) {
+        ssize_t w = write(g_log_fd, s, n);
+        (void)w;
+        if (s[n - 1] != '\n') { ssize_t w2 = write(g_log_fd, "\n", 1); (void)w2; }
+    }
+    pthread_mutex_unlock(&g_log_mu);
+}
+
+static void log_line(int err, const char *fmt, ...) {
+    char line[1200];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv;
+    localtime_r(&ts.tv_sec, &tmv);
+    int n = snprintf(line, sizeof line, "%02d:%02d:%02d.%03d [%s] ", tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                     (int)(ts.tv_nsec / 1000000), err ? "错" : "信");
+    va_list ap;
+    va_start(ap, fmt);
+    n += vsnprintf(line + n, sizeof line - (size_t)n, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n >= sizeof line) n = (int)sizeof line - 1;
+    __android_log_print(err ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, TAG, "%s", line);
+    log_sink(line, (size_t)n);
+}
+
+#define LOGI(...) log_line(0, __VA_ARGS__)
+#define LOGE(...) log_line(1, __VA_ARGS__)
+
+// 开日志文件：上一轮的 latest.log 留成 prev.log，然后新建（只保留两轮，免得堆满）
+// Open the log file: the previous run's latest.log becomes prev.log, then a fresh one is created (two runs kept, no pile-up)
+static void log_files_open(void) {
+    static const char *dir = "/sdcard/Android/data/ai.d2rm.dm/files/logs";
+    mkdir("/sdcard/Android/data/ai.d2rm.dm/files", 0777);
+    if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "建不了日志目录 %s（errno %d：%s）", dir, errno, strerror(errno));
+        return;
+    }
+    char cur[256], prev[256];
+    snprintf(cur, sizeof cur, "%s/latest.log", dir);
+    snprintf(prev, sizeof prev, "%s/prev.log", dir);
+    rename(cur, prev);
+    g_log_fd = open(cur, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0666);
+    if (g_log_fd < 0) __android_log_print(ANDROID_LOG_ERROR, TAG, "开不了日志文件 %s（errno %d：%s）", cur, errno, strerror(errno));
+}
 
 // 测试图的尺寸：按游戏真实画面目标来（真机是 1600×900），这样上屏那套缩放与将来一致
 // The test pattern's size follows the game's real render targets (1600x900 on the device), so the present-side scaling
@@ -87,16 +156,17 @@ static void *log_pump(void *arg) {
             char c = tmp[i];
             if (c == '\n' || n >= sizeof buf - 1) {
                 buf[n] = 0;
-                if (n) __android_log_print(ANDROID_LOG_INFO, "dmhost", "%s", buf);
+                if (n) { __android_log_print(ANDROID_LOG_INFO, "dmhost", "%s", buf); log_sink(buf, n); }
                 n = 0;
             } else buf[n++] = c;
         }
     }
-    if (n) { buf[n] = 0; __android_log_print(ANDROID_LOG_INFO, "dmhost", "%s", buf); }
+    if (n) { buf[n] = 0; __android_log_print(ANDROID_LOG_INFO, "dmhost", "%s", buf); log_sink(buf, n); }
     return NULL;
 }
 
 static void log_pipe_start(void) {
+    log_files_open();   // 先把文件开好：**连 libc 与第三方库在启动早期的输出也要落盘** | open the file first so even libc's and third-party libraries' early startup output lands on disk
     int fd[2];
     if (pipe(fd) != 0) { LOGE("接日志失败：pipe %s", strerror(errno)); return; }
     dup2(fd[1], 1);
@@ -307,7 +377,39 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
 // picture can only come from there; the default is the most-used one (28), changeable with DM_WIN_SRC=<serial>. Today it
 // is most likely **black** -- which means the rendering is not landing; once the render chain is fixed the phone screen
 // shows the picture directly, with no more pulling PNGs onto a PC.
+// ---------- 心跳方块（画在右下角，不需要字体）----------
+// 为什么要有它：查看器显示的那张游戏目标本来就是黑的 ✗ —— "一直黑屏"和"卡死"光看屏幕分不出来 ✗。两个小方块把它分开：
+//   上面的：**心跳** —— 每次出图换一次亮/暗（在跑就能看见它在闪 ✓）
+//   下面的：**状态** —— 绿 = 一秒内有新出图 ✓；黄 = 卡住 1～8 秒 ✓；红 = 超过 8 秒、或查看器读不回来 ✓
+// ---------- The heartbeat squares (bottom right, no font needed) ----------
+// Why they exist: the game target the viewer shows is black to begin with, so "a permanent black screen" and "hung" cannot
+// be told apart by looking. Two small squares separate them: the upper one is the **heartbeat** (it flips bright/dark on
+// every present, so it visibly blinks while running) and the lower one is the **state** -- green when a present happened
+// within the last second, yellow when stuck for 1-8 s, red when stuck longer or the viewer cannot read.
+static uint64_t g_hb_present;   // 上次心跳时的出图次数 | present count at the last heartbeat
+static int g_hb_stall_s;        // 连续多少秒没有新出图 | consecutive seconds without a new present
+static int g_hb_blink = 1;      // 每次出图翻转 | flipped on every present
+
+static void hud_overlay(uint8_t *b, uint32_t w, uint32_t h) {
+    if (!b || w < 64 || h < 96) return;
+    uint32_t s = w / 22;
+    if (s < 10) s = 10;
+    uint32_t x0 = w - s - s / 2, y0 = h - s - s * 3;   // 右下角，两块竖排 | bottom right, two stacked squares
+    uint8_t st[3];
+    if (g_hb_stall_s == 0) { st[0] = 40; st[1] = 220; st[2] = 60; }
+    else if (g_hb_stall_s < 8) { st[0] = 240; st[1] = 200; st[2] = 40; }
+    else { st[0] = 255; st[1] = 40; st[2] = 40; }
+    uint8_t hb = g_hb_blink ? 250 : 30;
+    for (uint32_t y = 0; y < s; y++) for (uint32_t x = 0; x < s; x++) {
+        uint8_t *p1 = b + ((size_t)(y0 + y) * w + x0 + x) * 4;
+        p1[0] = p1[1] = p1[2] = hb; p1[3] = 255;
+        uint8_t *p2 = b + ((size_t)(y0 + s * 2 + y) * w + x0 + x) * 4;
+        p2[0] = st[0]; p2[1] = st[1]; p2[2] = st[2]; p2[3] = 255;
+    }
+}
+
 static uint64_t g_src_ser;
+static unsigned g_src_lv;   // 读第几级 mip：真机的渲染区告警"1600×900 对 800×450"说明游戏是**通过 view 往某一级**画 | which mip level to read: the device's render-area warning "1600x900 vs 800x450" says the game draws **into a level** through a view
 static uint8_t *g_src_buf;
 static uint32_t g_src_w, g_src_h;
 static uint64_t g_view_n, g_view_ok, g_view_skip;
@@ -333,7 +435,7 @@ static int viewer_frame(double t) {
         LOGI("贴图查看器：源序号 %llu（%ux%u）", (unsigned long long)g_src_ser, g_src_w, g_src_h);
     }
     uint32_t gw = 0, gh = 0;
-    if (!vk_tex_grab_ser(g_src_ser, 0, g_src_buf, (size_t)g_src_w * 4, &gw, &gh)) {
+    if (!vk_tex_grab_ser(g_src_ser, g_src_lv, g_src_buf, (size_t)g_src_w * 4, &gw, &gh)) {
         g_view_skip++;
         if (!g_view_said_fail++) LOGE("查看器：序号 %llu 读不回来（先回落到测试图）", (unsigned long long)g_src_ser);
         return 0;
@@ -351,10 +453,12 @@ static int viewer_frame(double t) {
             if (l < lo) lo = l;
             if (l > hi) hi = l;
         }
-        LOGI("查看器：序号 %llu %ux%u 第 %llu 次，亮度 均值 %.1f、最小 %u、最大 %u（读成功 %llu、跳过 %llu）",
-             (unsigned long long)g_src_ser, gw, gh, (unsigned long long)g_view_ok, np ? (double)sum / (double)np : 0.0,
-             lo, hi, (unsigned long long)g_view_ok, (unsigned long long)g_view_skip);
+        LOGI("查看器：序号 %llu 第 %u 级 %ux%u 第 %llu 次，亮度 均值 %.1f、最小 %u、最大 %u（读成功 %llu、跳过 %llu）",
+             (unsigned long long)g_src_ser, g_src_lv, gw, gh, (unsigned long long)g_view_ok,
+             np ? (double)sum / (double)np : 0.0, lo, hi, (unsigned long long)g_view_ok, (unsigned long long)g_view_skip);
     }
+    g_hb_blink ^= 1;
+    hud_overlay(g_src_buf, gw, gh);
     return vk_win_present_rgba(g_src_buf, gw, gh);
 }
 
@@ -440,12 +544,52 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
     }
 }
 
+// 配置文件：`/sdcard/Android/data/<包>/files/dm.conf`，每行 `key=value`（`#` 开头当注释）。
+// 为什么要有它：Android 上没法给 app 按次启动设环境变量（`am start` 不传 env），而"你观察、我改一个参数"这条回路
+// 不该每次都要重新装机 —— 把参数放进一个 adb 就能推上去的文件里，推完重启 app 就生效。
+// The configuration file: `/sdcard/Android/data/<pkg>/files/dm.conf`, one `key=value` per line (`#` starts a comment).
+// Why it exists: on Android an app cannot be given environment variables per launch (`am start` does not pass env), and
+// the "you watch, I change one parameter" loop should not need a reinstall every time -- so the parameters live in a file
+// that adb can push, and restarting the app picks them up.
+static void conf_load(void) {
+    const char *p = "/sdcard/Android/data/ai.d2rm.dm/files/dm.conf";
+    FILE *f = fopen(p, "rb");
+    if (!f) { LOGI("没有配置文件 %s（用默认值）", p); return; }
+    char line[256];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || *s == '\n' || *s == '\r' || !*s) continue;
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *v = eq + 1;
+        for (char *q = v; *q; q++) if (*q == '\n' || *q == '\r') { *q = 0; break; }
+        setenv(s, v, 1);
+        LOGI("配置：%s=%s", s, v);
+        n++;
+    }
+    fclose(f);
+    LOGI("配置文件 %s：%d 项已生效", p, n);
+}
+
 void android_main(struct android_app *app) {
     g_app = app;
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
     log_pipe_start();   // 先接日志：它之后的宿主输出全部进 logcat | route the log first: every host line after this reaches logcat
     LOGI("启动（NativeActivity + app_glue；上屏走宿主那一个设备）");
+    conf_load();
+    // 启动头：时间、进程号、构建时间、以及真正生效的开关（"结论不该靠记忆"，这一行让每次日志自带参数）
+    // The startup header: time, pid, build time and the switches actually in effect (a conclusion should not rest on
+    // memory, so every log carries its own parameters)
+    LOGI("=== 本次启动 pid %d，构建 %s %s ===", (int)getpid(), __DATE__, __TIME__);
+    LOGI("关键开关：DM_WIN_SRC=%s DM_WIN_LEVEL=%s DM_GFX_PROBE=%s DM_NO_DEPTH_TEST=%s",
+         getenv("DM_WIN_SRC") ? getenv("DM_WIN_SRC") : "(缺省 28)",
+         getenv("DM_WIN_LEVEL") ? getenv("DM_WIN_LEVEL") : "(缺省 0)",
+         getenv("DM_GFX_PROBE") ? getenv("DM_GFX_PROBE") : "(关)",
+         getenv("DM_NO_DEPTH_TEST") ? getenv("DM_NO_DEPTH_TEST") : "(关)");
     probe_paths();
     g_img = malloc((size_t)IMG_W * IMG_H * 4);
     if (!g_img) { LOGE("测试图那块内存分配不出"); return; }
@@ -455,7 +599,15 @@ void android_main(struct android_app *app) {
     // uses per frame); DM_WIN_SRC=<serial> changes it and 0 turns it off, back to the test pattern.
     const char *src = getenv("DM_WIN_SRC");
     g_src_ser = src ? strtoull(src, NULL, 10) : 28;
-    LOGI("贴图查看器的源序号 %llu（DM_WIN_SRC 可改，0 = 关）", (unsigned long long)g_src_ser);
+    // 读哪一级：真机上两条"渲染区超出附件（1600×900 对 800×450）"的告警说明游戏是**通过 view 往某一级 mip 里画**，
+    // 而查看器一直读第 0 级 —— 若画在第 1 级上，屏幕就永远是"合法的黑"，读错一级足以解释"目标全零"。
+    // Which level: the device's two "render area exceeds the attachment (1600x900 vs 800x450)" warnings say the game
+    // draws **into a mip level through a view**, while the viewer has always read level 0 -- if it draws into level 1 the
+    // screen is a legitimate black forever, and reading the wrong level is enough to explain "the targets are all zero".
+    const char *lv = getenv("DM_WIN_LEVEL");
+    g_src_lv = lv ? (unsigned)strtoul(lv, NULL, 10) : 0;
+    LOGI("贴图查看器的源序号 %llu、第 %u 级（DM_WIN_SRC / DM_WIN_LEVEL 可改，序号 0 = 关）",
+         (unsigned long long)g_src_ser, g_src_lv);
     // 按钮：画面 70% 宽、9% 高，横居中、贴底部 12% 处（**图像坐标**，触摸会换算到这里）
     // The button: 70% of the width and 9% of the height, centred, 12% up from the bottom (in **image** coordinates; a
     // touch is mapped into that space)
@@ -479,12 +631,36 @@ void android_main(struct android_app *app) {
             timeout = vk_win_live() ? 0 : -1;
         }
         perm_tick(now_s());
+        // 每秒一条心跳 + 卡死判定：进程被系统 SIGKILL 时，日志文件里这些行就是**唯一现场**（处理器来不及跑）
+        // One heartbeat per second plus the stall judgement: when the system SIGKILLs the process these lines in the log
+        // file are the **only** scene left (no handler ever runs).
+        {
+            double now = now_s();
+            static double last_hb;
+            if (now - last_hb >= 1.0) {
+                last_hb = now;
+                uint64_t p = vk_present_count();
+                static char dl[640];
+                vk_diag_line(dl, sizeof dl);
+                if (p == g_hb_present) g_hb_stall_s++;
+                else { g_hb_stall_s = 0; g_hb_present = p; }
+                LOGI("心跳：%s；查看器 读成 %llu、跳过 %llu；%s", dl, (unsigned long long)g_view_ok,
+                     (unsigned long long)g_view_skip, g_hb_stall_s ? "出图没有推进" : "出图在推进");
+                if (g_hb_stall_s == 8)
+                    LOGE("卡死报告：连续 8 秒没有新出图（上面最后一条心跳即现场；客体线程现场见宿主的看门狗转储）");
+            }
+        }
         if (vk_win_live()) {
             double t = now_s();
             // 先试贴图查看器（游戏自己那张渲染目标）；读不回来才回落到测试图 —— 于是"黑屏"与"坏了"分得开
             // Try the texture viewer first (one of the game's own render targets) and fall back to the test pattern only
             // when it cannot be read -- so "a black screen" and "broken" stay distinguishable
-            if (!viewer_frame(t)) { paint(t); vk_win_present_rgba(g_img, IMG_W, IMG_H); }
+            if (!viewer_frame(t)) {
+                paint(t);
+                g_hb_blink ^= 1;
+                hud_overlay(g_img, IMG_W, IMG_H);
+                vk_win_present_rgba(g_img, IMG_W, IMG_H);
+            }
         }
     }
 }

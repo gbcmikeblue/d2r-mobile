@@ -907,6 +907,60 @@ int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap) {
     return n;
 }
 
+// ---------- 对照实验（见 vk_tex.h 的说明）----------
+// ---------- The control experiment (see the note in vk_tex.h) ----------
+int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a) {
+    if (!serial) return 0;
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return 0;
+    VkImage img = VK_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+    VkImageLayout lay = VK_IMAGE_LAYOUT_UNDEFINED;
+    int depth_like = 0;
+    pthread_mutex_lock(&g_mu);
+    ent_t *e = find_slot(serial, 0);
+    if (e && e->img) { img = e->img; w = e->w; h = e->h; lay = e->lay; depth_like = e->depth_like || e->dsa; }
+    pthread_mutex_unlock(&g_mu);
+    if (!img) {
+        static int said;
+        if (!said++) LOG("【黄】对照实验：序号 %llu 没有图像，清不了（这张贴图还没被用过）", (unsigned long long)serial);
+        return 0;
+    }
+    if (depth_like) {
+        static int said;
+        if (!said++) LOG("【黄】对照实验：序号 %llu 是深度/模板贴图，vkCmdClearColorImage 用不得，跳过", (unsigned long long)serial);
+        return 0;
+    }
+    vkQueueWaitIdle(vk_queue());
+    int ok = 0;
+    if (one_begin()) {
+        VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = lay, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = img, .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS } };
+        vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+        VkClearColorValue c;
+        c.float32[0] = r; c.float32[1] = g; c.float32[2] = b; c.float32[3] = a;
+        VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+        vkCmdClearColorImage(g_cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &rng);
+        ok = one_end();
+    }
+    if (ok) {
+        pthread_mutex_lock(&g_mu);
+        ent_t *e2 = find_slot(serial, 0);
+        if (e2 && e2->img == img) { e2->lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; e2->gpu_written = 1; }
+        pthread_mutex_unlock(&g_mu);
+        LOG("[vk] 对照实验：序号 %llu（%ux%u）已清成 (%.2f, %.2f, %.2f, %.2f)", (unsigned long long)serial, w, h,
+            (double)r, (double)g, (double)b, (double)a);
+    } else {
+        static int said;
+        if (!said++) LOG("【红】对照实验：序号 %llu 的清除没走通（命令缓冲那一套）", (unsigned long long)serial);
+    }
+    return ok;
+}
+
 void vk_tex_dump_ser(uint64_t serial) {
     pthread_mutex_lock(&g_mu);
     ent_t *e = find_slot(serial, 0);
