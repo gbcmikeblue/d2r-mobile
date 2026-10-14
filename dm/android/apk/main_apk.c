@@ -26,7 +26,16 @@
 #include <time.h>
 #include <unistd.h>
 #include "vk_device.h"
+#include "vk_png.h"
 #include "vk_win.h"
+
+// 贴图查看器只用这两个入口，所以**就地声明**，而不是去包含 vk_tex.h —— 那个头会带进宿主的内部头（nvn_obj.h）与
+// 兼容层，而 app 这一侧是干净的安卓代码（见 CMakeLists 里那条说明：**不给**本工程加 dm_android_compat）。
+// The texture viewer uses only these two entry points, so they are declared here rather than by including vk_tex.h --
+// that header pulls in the host's internal headers (nvn_obj.h) and the compat layer, while the app side is clean
+// Android code (see the note in CMakeLists: the dm_android_compat force-include is deliberately **not** added here).
+int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h);
+int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, int cap);
 
 // 宿主那套的环境准备与 dm_main 的交接（dm/android/main_android.c）：**与 APK 必须完全一致**，所以那边只留一个实现，
 // 这里直接调它，而不是把环境准备抄一遍（抄一遍就会漂）。
@@ -161,6 +170,18 @@ static void probe_paths(void) {
         if (g) { fputc('x', g); fclose(g); remove(wpaths[i]); LOGI("  能写 %s", wpaths[i]); }
         else LOGE("  写不了 %s（errno %d：%s）", wpaths[i], errno, strerror(errno));
     }
+    // 建目录单独测：**能建文件不等于能建目录**，而客体要的正是建目录（真机上就是这里报 errno=13 让它卡住的）
+    // Test mkdir separately: **being able to create a file does not mean being able to create a directory**, and the
+    // guest needs exactly that (on the device this is where errno=13 stalled it).
+    static const char *dpaths[] = {
+        "/sdcard/Android/data/ai.d2rm.dm/files/probe_dir",     // 外部（FUSE，带包作用域）| external (FUSE, package scoped)
+        "/data/data/ai.d2rm.dm/files/probe_dir",                // 内部（本 uid 自己的）| internal (this uid's own)
+    };
+    for (unsigned i = 0; i < sizeof dpaths / sizeof dpaths[0]; i++) {
+        if (mkdir(dpaths[i], 0777) == 0) { rmdir(dpaths[i]); LOGI("  能建目录 %s", dpaths[i]); }
+        else if (errno == EEXIST) LOGI("  能建目录 %s（已存在）", dpaths[i]);
+        else LOGE("  建不了目录 %s（errno %d：%s）", dpaths[i], errno, strerror(errno));
+    }
 }
 
 // ---------- 权限：什么时候要用户点一下，以及那个按钮 ----------
@@ -274,6 +295,69 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
     return 1;
 }
 
+// ---------- 贴图查看器（M3-2c）：把游戏自己的一张渲染目标搬上手机屏 ----------
+// 为什么是"游戏自己的那张"而不是"出图纹理"：真机量过 —— **游戏从没往要上屏的那张纹理里写过**（既没当渲染目标、
+// 也没被 T2T 拷过），而它每帧都在往自己那三张 1600×900 里画（序号 28 = RGBA16F、27 = RGBA8、26 = B10G11R11，
+// 每帧 5400/5400/4800 次）。所以画面只能从那里取，默认取用得最多的 28，可用 DM_WIN_SRC=<序号> 换。
+// 今天它多半是**黑的**——那就说明渲染没落下来；一旦渲染链修好，手机屏上直接就是画面，不再需要把 PNG 拉到电脑上。
+// ---------- Texture viewer (M3-2c): put one of the game's own render targets on the phone screen ----------
+// Why "one of the game's own" and not "the present texture": it was measured on the device that **the game never writes
+// the texture it presents** (neither as a render target nor as a T2T destination) while it renders into its own 1600x900
+// trio every frame (serial 28 = RGBA16F, 27 = RGBA8, 26 = B10G11R11, used 5400/5400/4800 times per frame). So the
+// picture can only come from there; the default is the most-used one (28), changeable with DM_WIN_SRC=<serial>. Today it
+// is most likely **black** -- which means the rendering is not landing; once the render chain is fixed the phone screen
+// shows the picture directly, with no more pulling PNGs onto a PC.
+static uint64_t g_src_ser;
+static uint8_t *g_src_buf;
+static uint32_t g_src_w, g_src_h;
+static uint64_t g_view_n, g_view_ok, g_view_skip;
+static int g_view_said_fail;
+
+// 抓一帧并上屏；成功返回 1。失败时回落到测试图，手机屏上仍然有东西（不会变成"全黑所以看不出是坏了还是没东西"）。
+// Grab one frame and present it, returning 1 on success. On failure it falls back to the test pattern so the screen
+// still shows something (rather than going all black, which cannot be told apart from "broken" or "empty").
+static int viewer_frame(double t) {
+    if (!g_src_ser) return 0;
+    g_view_n++;
+    // 尺寸先问一次（贴图层的入口里有），再按它准备缓冲：源尺寸变了就换一块
+    // Ask the size first (the texture layer's entry has it) and size the buffer to it: replaced when the source changes
+    uint32_t need_w = 0, need_h = 0;
+    if (!g_src_buf) {
+        static uint64_t ser[64]; static uint32_t ws[64], hs[64];
+        int n = vk_tex_list(ser, ws, hs, 64);
+        for (int i = 0; i < n; i++) if (ser[i] == g_src_ser) { need_w = ws[i]; need_h = hs[i]; break; }
+        if (!need_w) need_w = IMG_W, need_h = IMG_H;
+        g_src_buf = malloc((size_t)need_w * need_h * 4);
+        if (!g_src_buf) { LOGE("查看器：%ux%u 的缓冲分配不出", need_w, need_h); g_src_ser = 0; return 0; }
+        g_src_w = need_w; g_src_h = need_h;
+        LOGI("贴图查看器：源序号 %llu（%ux%u）", (unsigned long long)g_src_ser, g_src_w, g_src_h);
+    }
+    uint32_t gw = 0, gh = 0;
+    if (!vk_tex_grab_ser(g_src_ser, 0, g_src_buf, (size_t)g_src_w * 4, &gw, &gh)) {
+        g_view_skip++;
+        if (!g_view_said_fail++) LOGE("查看器：序号 %llu 读不回来（先回落到测试图）", (unsigned long long)g_src_ser);
+        return 0;
+    }
+    g_view_ok++;
+    // 每约 2 秒报一行亮度统计：白 / 黑 / 有内容从此是日志里的数（不必把图拉下来才知道）
+    // About once every two seconds, one luminance line: white / black / has content become numbers in the log (no need
+    // to pull the file down to find out)
+    if (g_view_ok % 60 == 1) {
+        uint64_t sum = 0; uint8_t lo = 255, hi = 0;
+        size_t np = (size_t)gw * gh;
+        for (size_t i = 0; i < np; i++) {
+            uint8_t l = (uint8_t)(((unsigned)g_src_buf[i * 4] + g_src_buf[i * 4 + 1] + g_src_buf[i * 4 + 2]) / 3);
+            sum += l;
+            if (l < lo) lo = l;
+            if (l > hi) hi = l;
+        }
+        LOGI("查看器：序号 %llu %ux%u 第 %llu 次，亮度 均值 %.1f、最小 %u、最大 %u（读成功 %llu、跳过 %llu）",
+             (unsigned long long)g_src_ser, gw, gh, (unsigned long long)g_view_ok, np ? (double)sum / (double)np : 0.0,
+             lo, hi, (unsigned long long)g_view_ok, (unsigned long long)g_view_skip);
+    }
+    return vk_win_present_rgba(g_src_buf, gw, gh);
+}
+
 // 画一帧：底色缓慢变色 + 一根横向滑动的白条 + （未授权时）橙块。全在主机内存里画，然后交给 vk_win 上屏。
 // One frame: a slowly shifting background, a white bar sliding sideways and (while not granted) the orange block. All
 // painted in host memory and then handed to vk_win for presentation.
@@ -317,16 +401,27 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
             // The game starts only after the window is up (the order is explained above guest_thread) and only once
             if (!g_guest_started) {
                 g_guest_started = 1;
-                // 环境按量出来的结论设：根**原地读**（9.1 GB 不用搬），存档与临时指到 app 可写目录（/data/local/tmp
-                // 读得到但写不进，SELinux 的 shell_data_file）
-                // The environment follows the measurements: the root is **read in place** (no 9.1 GB copy) while saves and
-                // temporary files point at a directory the app may write (/data/local/tmp is readable but not writable --
-                // SELinux's shell_data_file)
-                mkdir("/sdcard/Android/data/ai.d2rm.dm/files/save", 0777);
-                mkdir("/sdcard/Android/data/ai.d2rm.dm/files/temp", 0777);
+                // 环境按量出来的结论设：根**原地读**（9.1 GB 不用搬）；存档与临时用 app 的**内部**目录。
+                // 为什么不用 /sdcard/Android/data/<包>/files：真机上客体在那里 **mkdir 报 errno=13（EACCES）**
+                // （`fs mkdir .../temp/Diablo II 失败 errno=13`），随后就卡在客体初始化里；内部目录是这个 uid
+                // 自己的，native 侧读写一律放行（外部那个是 FUSE，还多一层包作用域的门）。
+                // The environment follows the measurements: the root is **read in place** (no 9.1 GB copy) and saves and
+                // temporary files use the app's **internal** directory. Why not /sdcard/Android/data/<pkg>/files: on the
+                // device the guest's **mkdir there reports errno=13 (EACCES)** (`fs mkdir .../temp/Diablo II failed
+                // errno=13`) and it then stalls inside guest initialisation; the internal directory belongs to this uid,
+                // so native reads and writes are allowed outright (the external one is FUSE with a package-scope door on
+                // top).
+                const char *in = (app->activity && app->activity->internalDataPath) ? app->activity->internalDataPath
+                                                                                   : "/data/data/ai.d2rm.dm/files";
+                static char p_save[512], p_temp[512];
+                snprintf(p_save, sizeof p_save, "%s/save", in);
+                snprintf(p_temp, sizeof p_temp, "%s/temp", in);
+                int m1 = mkdir(p_save, 0777), m2 = mkdir(p_temp, 0777);
+                LOGI("存档与临时：%s（mkdir %d/%s）、%s（mkdir %d/%s）", p_save, m1, m1 ? strerror(errno) : "好",
+                     p_temp, m2, m2 ? strerror(errno) : "好");
                 setenv("DM_ROOT", "/data/local/tmp/dm", 1);
-                setenv("DM_SAVE", "/sdcard/Android/data/ai.d2rm.dm/files/save", 1);
-                setenv("DM_TEMP", "/sdcard/Android/data/ai.d2rm.dm/files/temp", 1);
+                setenv("DM_SAVE", p_save, 1);
+                setenv("DM_TEMP", p_temp, 1);
                 pthread_t th;
                 if (pthread_create(&th, NULL, guest_thread, NULL) == 0) pthread_detach(th);
                 else LOGE("起不了游戏线程：%s", strerror(errno));
@@ -354,6 +449,13 @@ void android_main(struct android_app *app) {
     probe_paths();
     g_img = malloc((size_t)IMG_W * IMG_H * 4);
     if (!g_img) { LOGE("测试图那块内存分配不出"); return; }
+    // 查看器的源：默认序号 28 = 真机上用得最多的那张渲染目标（1600×900、RGBA16F、每帧 5400 次）；
+    // DM_WIN_SRC=<序号> 可换，给 0 就关掉、回到测试图。
+    // The viewer's source: serial 28 by default = the most-used render target on the device (1600x900, RGBA16F, 5400
+    // uses per frame); DM_WIN_SRC=<serial> changes it and 0 turns it off, back to the test pattern.
+    const char *src = getenv("DM_WIN_SRC");
+    g_src_ser = src ? strtoull(src, NULL, 10) : 28;
+    LOGI("贴图查看器的源序号 %llu（DM_WIN_SRC 可改，0 = 关）", (unsigned long long)g_src_ser);
     // 按钮：画面 70% 宽、9% 高，横居中、贴底部 12% 处（**图像坐标**，触摸会换算到这里）
     // The button: 70% of the width and 9% of the height, centred, 12% up from the bottom (in **image** coordinates; a
     // touch is mapped into that space)
@@ -378,8 +480,11 @@ void android_main(struct android_app *app) {
         }
         perm_tick(now_s());
         if (vk_win_live()) {
-            paint(now_s());
-            vk_win_present_rgba(g_img, IMG_W, IMG_H);
+            double t = now_s();
+            // 先试贴图查看器（游戏自己那张渲染目标）；读不回来才回落到测试图 —— 于是"黑屏"与"坏了"分得开
+            // Try the texture viewer first (one of the game's own render targets) and fall back to the test pattern only
+            // when it cannot be read -- so "a black screen" and "broken" stay distinguishable
+            if (!viewer_frame(t)) { paint(t); vk_win_present_rgba(g_img, IMG_W, IMG_H); }
         }
     }
 }
