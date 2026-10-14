@@ -73,6 +73,16 @@ target_compile_options(dmhost_android PRIVATE
 # work through them after M1's acceptance.
 target_compile_options(dmhost_android PRIVATE -w)
 
+# M2 第一步的探针：不进宿主，也不进 APK，只用来量设备的 Vulkan 能力（离屏清屏 + 回读 + 内存模型）。
+# 之所以先做离屏：宿主现在是 adb 推上去跑的可执行文件，没有窗口，而窗口/交换链要 APK 才有。
+# M2 step 1 probe: not part of the host or any APK, it only measures the device's Vulkan capabilities
+# (offscreen clear + readback + memory model). Offscreen comes first because the host is currently an
+# executable pushed with adb and has no window, and a window / swapchain needs an APK.
+add_executable(vk_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_probe.c)
+target_link_libraries(vk_probe PRIVATE vulkan)
+target_link_options(vk_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk_probe PRIVATE ${COMPAT})
+
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；
 # 打成 APK 留到 M2 之后（那时才有画面）。

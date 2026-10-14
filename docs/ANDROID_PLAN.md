@@ -302,6 +302,48 @@ there is something to show.
 **M1 conclusion**: the acceptance criterion -- "the host runs and the log shows the game's `UNIMPL` lines" --
 is met, and exceeded all the way to `nnMain`. Next comes M2.
 
+### M2 step 1: the Vulkan path and the memory model, measured (2026-10-14)
+
+The host is currently an executable pushed with adb and **has no window**, and a window / swapchain needs an
+APK. So M2 starts **offscreen**: that settles three questions at once -- can Vulkan be used, is the clear
+correct, and how is memory laid out -- and the last one is exactly the assumption the feasibility analysis
+flagged as **risk number one**, NVN's zero-copy "GPU address = CPU address".
+
+Probe: `dm/android/vk/vk_probe.c` (not part of the host or any APK, it only measures the device). Device
+result (Redmi K90 / Adreno 830):
+
+```
+instance created: loader supports Vulkan 1.4.0
+1 physical device
+  [0] Adreno (TM) 830: driver 512.800.71, Vulkan 1.3.284, type 1
+=== memory model ===
+  heap 0: 15113 MB (device local)      heap 1: 4095 MB (device local)
+  types 0-2: DEVICE_LOCAL
+  type 3:    DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED
+  types 4/5: DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT
+  type 6:    DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED
+  => zero-copy (HOST_VISIBLE+HOST_COHERENT) available: yes (type 6)
+  queue family 0: 3 queues, flags 0x19f (graphics / compute / transfer / sparse); family 1 transfer; family 2 compute
+offscreen image 256x256, video memory 260 KB
+clear readback: all match (first pixel 64,128,191,255)
+```
+
+**Update to the risk list**
+
+- **Risk number one, "unified memory": confirmed.** The Adreno 830 offers
+  `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` (types 4 / 5 / 6, type 6 with `HOST_CACHED` as well). NVN's
+  zero-copy therefore has a landing place on the Vulkan side: map memory pools to host-visible +
+  host-coherent `VkDeviceMemory`, with type 6 additionally offering a host-cached variant.
+- **Shaders**: the device is Vulkan **1.3** and the loader 1.4, so the **SPIR-V 1.3** Recon B produced
+  (6923 of them) can go straight into `vkCreateShaderModule` with no version downgrade.
+- **The path works**: an offscreen clear plus a pixel-by-pixel readback all match, so device / queue /
+  command buffer / memory binding / image barriers / image-to-buffer copy are all sound; the rest of M2 only
+  fills in NVN's semantics.
+
+**Next**: memory pool mapping (NVN MemoryPool -> `VkDeviceMemory`, starting along the zero-copy route) and a
+minimal command set (`SetRenderTargets` / clear / `DrawArrays` / present). The window and swapchain must
+wait for the APK (`ANativeWindow`).
+
 ### M2 — minimal Vulkan replay layer (the largest item)
 
 - [ ] Vulkan skeleton: device, queue, `ANativeWindow` swapchain

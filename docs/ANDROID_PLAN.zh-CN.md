@@ -297,6 +297,43 @@ nninitInitializeSdkModule
 
 **M1 结论**：验收判据「宿主跑起来、日志出现游戏的 `UNIMPL`」已达成，并超出到 `nnMain`。下一步进入 M2。
 
+### M2 第 1 步：Vulkan 通路与内存模型实测（2026-10-14）
+
+宿主现在是 adb 推上去跑的可执行文件、**没有窗口**，而窗口 / 交换链要 APK 才有。所以 M2 先做**离屏**：
+这一步同时把「Vulkan 能不能用」「清屏对不对」「内存怎么摆」三件事问清，而最后一项正是可行性分析里
+列为**头号风险**的那条假设——NVN 的「GPU 地址 = CPU 地址」零拷贝。
+
+探针：`dm/android/vk/vk_probe.c`（不进宿主、不进 APK，只量设备）。真机（Redmi K90 / Adreno 830）结果：
+
+```
+实例建立成功：loader 支持的 Vulkan 1.4.0
+物理设备 1 个
+  [0] Adreno (TM) 830：驱动 512.800.71，Vulkan 1.3.284，类型 1
+=== 内存模型 ===
+  堆 0：15113 MB（设备本地）        堆 1：4095 MB（设备本地）
+  类型 0–2：DEVICE_LOCAL
+  类型 3：  DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED
+  类型 4/5：DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT
+  类型 6：  DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED
+  ⇒ 零拷贝（HOST_VISIBLE+HOST_COHERENT）可用：是（类型 6）
+  队列族 0：3 个，标志 0x19f（图形 / 计算 / 传输 / 稀疏）；族 1 传输；族 2 计算
+离屏贴图 256x256，显存 260 KB
+清屏回读：全部符合（首像素 64,128,191,255）
+```
+
+**对风险清单的更新**
+
+- **头号风险「统一内存」：确认成立。** Adreno 830 有 `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`
+  （类型 4 / 5 / 6，其中类型 6 还带 `HOST_CACHED`）。也就是 NVN 的零拷贝在 Vulkan 侧有落点：
+  内存池映射到 host-visible + host-coherent 的 `VkDeviceMemory`；类型 6 还多给了一层「主机侧带缓存」的选择。
+- **着色器**：设备是 Vulkan **1.3**、loader 1.4 ⇒ Recon B 产出的那批 **SPIR-V 1.3**（6923 个）可以直接喂给
+  `vkCreateShaderModule`，不需要再降版本。
+- **通路**：离屏清屏 + 逐像素回读全部符合 ⇒ 设备 / 队列 / 命令缓冲 / 内存绑定 / 图像屏障 / 图像到缓冲拷贝
+  这一整条路是通的，M2 后续只是往里填 NVN 的语义。
+
+**下一步**：内存池映射（NVN MemoryPool → `VkDeviceMemory`，先按零拷贝那条路走）与最小命令集
+（`SetRenderTargets` / 清屏 / `DrawArrays` / present）。窗口与交换链要等 APK（`ANativeWindow`）。
+
 ### M2 —— 最小 Vulkan 回放层（最大工作量）
 
 - [ ] 搭 Vulkan 骨架：设备、队列、`ANativeWindow` 交换链
