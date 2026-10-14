@@ -20,7 +20,7 @@ set "REPO=%CD%"
 popd
 
 set "NDK=C:\Android\Sdk\ndk\30.0.16248370"
-set "JDK=C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot"
+set "JDK=C:\Program Files\Eclipse Adoptium\jdk-21.0.12.1+1"
 set "BT=C:\Android\Sdk\build-tools\36.0.0"
 set "CMAKEX=C:\Android\Sdk\cmake\3.31.6\bin\cmake.exe"
 set "NINJAX=C:\Android\Sdk\cmake\3.31.6\bin\ninja.exe"

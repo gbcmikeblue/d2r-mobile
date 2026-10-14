@@ -45,6 +45,40 @@ Python 环境：`python -m venv .venv`，再 `.venv\Scripts\pip install pillow n
 
 `dm\android\apk\build_apk.cmd:22-27` 和 `dm\android\apk\install_apk.cmd:13` 里写死了上一台机器的绝对路径（NDK / JDK / build-tools / CMake / ninja / android.jar / adb），换机器必须改这两段。`.work\apk-build`、`.work\apk-keys` 是相对脚本自身推导的，不用动。
 
+**实测（第二台机器）**：要改的只有 **JDK 一行**（`build_apk.cmd:23`）——NDK / build-tools / CMake / android.jar 只要按上面那张表装到 `C:\Android\Sdk`，就与文档里写的一致；`install_apk.cmd:13` 的 adb 路径同理。改完直接 `build_apk.cmd` 出包通过。
+
+### 三个由游戏文件生成的头文件（不在上面那张表里）
+
+`dm\host` 下有三个**由游戏文件生成、被 `dm\host\.gitignore` 忽略**的头文件：
+
+| 头文件 | 生成脚本 |
+|---|---|
+| `dm\host\dm_vault_tab.h` | `dm\ios\tools\gen_vault_table.py` |
+| `dm\host\dm_hud_exp.h` | `dm\ios\tools\gen_hud_exp.py` |
+| `dm\host\dm_bright_levels.inc` | `dm\tools\gen_bright_levels.py` |
+
+它们**既不在 git 里，也不在上面那张「要带什么」的表里**，但缺了它们 `build_apk.cmd` 走不过第 1 步：`dm\host\diag.c:6` 直接报
+`'dm_hud_exp.h' file not found`（是编译期，不是链接期）。这不是缺陷而是设计——它们由玩家自己的游戏文件派生，所以
+**数据取回之后按 `dm\host\Makefile:19-29` 的规则重生成一次**即可（约 1 分钟）。
+
+两条 Windows 约定（第一条见 [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 第六节）：
+
+- 必须带 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`，否则按 GBK 输出会**截断表头**；
+- **重定向必须用 cmd 的 `>`**：这些是 C 头文件，PowerShell 的 `>` 写出来是 **UTF-16LE**（`FF FE` 开头、体积约两倍），下一步编译直接过不去。
+
+照抄即可（cmd；`REPO` 换成自己的仓库路径）：
+
+```bat
+set "REPO=<仓库路径>"
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+set "ROMFS=%REPO%\.work\data\switch\3.3.94012\Update\RomFS"
+cd /d "%REPO%\dm\host"
+"%REPO%\.venv\Scripts\python.exe" ..\ios\tools\gen_vault_table.py "%ROMFS%" > dm_vault_tab.h
+"%REPO%\.venv\Scripts\python.exe" ..\ios\tools\gen_hud_exp.py    "%ROMFS%" > dm_hud_exp.h
+"%REPO%\.venv\Scripts\python.exe" ..\tools\gen_bright_levels.py  "%ROMFS%" > dm_bright_levels.inc
+```
+
 ## 三、恢复步骤
 
 PowerShell；`<仓库>` 换成新电脑上的仓库路径，adb 换成新机器上的路径。
@@ -72,9 +106,27 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 `tar` 用 Windows 自带的 bsdtar 即可；Mac / Linux 上把路径分隔符换成 `/`。
 
+**别忘了第 4 步**：三个派生头文件要由取回的游戏文件重生成一次，见第二节「三个由游戏文件生成的头文件」——
+注意那一步得在 **cmd** 里跑（PowerShell 的 `>` 会把头文件写成 UTF-16）。做完这四步，再按第四节验。
+
+### 手机不稳时：别整目录 pull，改成逐文件 + 重试
+
+整目录 `adb pull` 一断就得从头来。第二台机器上实测的现场是 Hyper-V 虚拟机（`ROOT\VMBUS\0000`）走 USB 直通：
+整目录 pull 传到第 2 个文件（1 GiB 的 `00-00000001.data`）就断，随后 `adb devices` 直接变空。**熄屏不是原因**——
+那台机器 `stay_on_while_plugged_in` 已经是 15、`screen_off_timeout` 5 分钟。改成下面这种做法后 9.3 GB 一遍过：
+1 GiB 那个文件第一次失败、等设备回来重试一次就成功，其余按约 40 MB/s 走完。
+
+形状就三件事：
+
+- **逐文件取**（`adb shell 'cd <源> && find . -type f'` 拿清单，一个个 `adb pull`），**本地大小与远端一致就跳过**，
+  于是脚本可以反复重跑，断了只补没拿到的；
+- 失败先看设备还在不在，不在就 `adb wait-for-device` 等它回来再重试（本机实测：断开约 1 分钟后自行恢复）；
+- 在 cmd 里等重试用 `ping -n 4 127.0.0.1 >nul`，**不要用 `timeout /t`**——它要控制台输入，重定向环境下会直接
+  `ERROR: Input redirection is not supported` 退出，把整个脚本带走。
+
 ## 四、怎么算恢复好了
 
-1. `dm\android\apk\build_apk.cmd` 能出包（产物 `.work\apk-build\dm.apk`）—— 这一步同时验证了 NDK 那段路径改对了。
+1. `dm\android\apk\build_apk.cmd` 能出包（产物 `.work\apk-build\dm.apk`）—— 这一步同时验证了 NDK 那段路径改对了。前提是第二节那三个派生头文件已经生成，否则会停在 `dm\host\diag.c` 的 `'dm_hud_exp.h' file not found`。
 2. `dm\android\apk\install_apk.cmd` 能装上并启动。
 3. 起不来的话按顺序查这三处：`.work\data\switch\3.3.94012\Update\ExeFS\` 里有 `main`/`sdk`/`subsdk0`（校验值见 `setup.sh:84-86`）；`.work\data\switch\3.3.94012\Update\RomFS\data\` 里的资源档案；`.work\build\cache\dm\out\3.3.94012-r41-android\`。
 
@@ -96,6 +148,14 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 六、容易踩的几点
 
 - **git 身份**：这台机器没有配 `user.name` / `user.email`（提交时用 `-c` 临时传与历史一致的身份：`gbcmikeblue <1061589622@qq.com>`）。新电脑先把身份配好，否则 `git commit` 直接以 `Author identity unknown` 失败。
+  注意新机器上**可能已经有一个别人的全局身份**（第二台机器实测：全局是 `bicheng.gao <bicheng.gao@yiartkeji.com>`，与仓库历史不一致）。不要改全局，只设仓库级即可：
+  `git config user.name gbcmikeblue` + `git config user.email 1061589622@qq.com`（`git config` 不带 `--global` 就只作用于本仓库）。
 - `origin` 已是 fork 地址 `git@github.com:gbcmikeblue/d2r-mobile.git`，`android` 分支跟踪 `origin/android`。SSH 用的是 `gbcmikeblue` 那把 key，新电脑要自己生成并加到 GitHub 账号。
 - 中转区要更新就再 `adb push` 一次覆盖；要清空直接 `adb shell rm -rf /sdcard/d2rm/pc`，下次再推回来即可。
 - 手机上这份中转副本**不是**运行时用的那份数据：app 跑起来读的是 `/data/local/tmp/dm`，两者别混。
+- **三个派生头文件不在上面那张表里**：`dm\host` 的 `dm_vault_tab.h` / `dm_hud_exp.h` / `dm_bright_levels.inc` 由游戏文件生成、被 `.gitignore` 忽略，
+  缺了 `build_apk.cmd` 会在 `dm\host\diag.c` 报 `'dm_hud_exp.h' file not found`。数据取回后按第二节的规则重生成一次。
+- **PowerShell 的 `>` 会改编码**（写成 UTF-16LE）。要保原始字节的场合——生成 C 头文件、落日志——一律用 **cmd 的 `>`**。
+  本机实测同一个脚本：PowerShell 版 93,550 字节 UTF-16，cmd 版 47,124 字节 UTF-8。
+- **USB 会整段掉线**：本机（Hyper-V + USB 直通）整目录 `adb pull` 传大文件约 30 秒即断、`adb devices` 随之变空，
+  且与熄屏无关。见第三节「手机不稳时」。

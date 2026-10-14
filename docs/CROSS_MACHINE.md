@@ -43,6 +43,38 @@ Python environment: `python -m venv .venv`, then `.venv\Scripts\pip install pill
 
 `dm\android\apk\build_apk.cmd:22-27` and `dm\android\apk\install_apk.cmd:13` hardcode the previous machine's absolute paths (NDK / JDK / build-tools / CMake / ninja / android.jar / adb), so both blocks have to be edited on a new machine. `.work\apk-build` and `.work\apk-keys` are derived relative to the scripts themselves and need no change.
 
+**Measured (second machine)**: only the **JDK line** had to change (`build_apk.cmd:23`) -- install the NDK / build-tools / CMake / android.jar under `C:\Android\Sdk` as the table above says and they land exactly where the document points; the adb path in `install_apk.cmd:13` likewise. With that one edit, `build_apk.cmd` produced a package straight away.
+
+### The three headers generated from the game files (not in the table above)
+
+`dm\host` holds three headers that are **generated from the game files and gitignored** (`dm\host\.gitignore`):
+
+| Header | Generator |
+|---|---|
+| `dm\host\dm_vault_tab.h` | `dm\ios\tools\gen_vault_table.py` |
+| `dm\host\dm_hud_exp.h` | `dm\ios\tools\gen_hud_exp.py` |
+| `dm\host\dm_bright_levels.inc` | `dm\tools\gen_bright_levels.py` |
+
+They are **neither in git nor in the "what to carry" table above**, yet without them `build_apk.cmd` never gets past step 1: `dm\host\diag.c:6` stops with `'dm_hud_exp.h' file not found` (compile time, not link time). That is by design rather than a defect -- they are derived from the player's own game files, so **regenerate them once the data is back**, following `dm\host\Makefile:19-29` (about a minute).
+
+Two Windows rules (the first is also in [ANDROID_PLAN.md](ANDROID_PLAN.md), section 6):
+
+- `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` are mandatory, otherwise the GBK output **truncates the table headers**;
+- the **redirect has to be cmd's `>`**: these are C headers, and PowerShell's `>` writes **UTF-16LE** (`FF FE` at the front, roughly twice the size), which the next compile step will not accept.
+
+Copy and run as is (cmd; set `REPO` to your repository path):
+
+```bat
+set "REPO=<repository path>"
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+set "ROMFS=%REPO%\.work\data\switch\3.3.94012\Update\RomFS"
+cd /d "%REPO%\dm\host"
+"%REPO%\.venv\Scripts\python.exe" ..\ios\tools\gen_vault_table.py "%ROMFS%" > dm_vault_tab.h
+"%REPO%\.venv\Scripts\python.exe" ..\ios\tools\gen_hud_exp.py    "%ROMFS%" > dm_hud_exp.h
+"%REPO%\.venv\Scripts\python.exe" ..\tools\gen_bright_levels.py  "%ROMFS%" > dm_bright_levels.inc
+```
+
 ## 3. Restoring
 
 PowerShell; replace `<repo>` with the repository path on the new machine and the adb path with the one there.
@@ -71,9 +103,21 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 Windows' bundled bsdtar is enough for `tar`; on Mac / Linux change the separators to `/`.
 
+**Do not forget step 4**: the three generated headers have to be regenerated once from the data just pulled -- see "The three headers generated from the game files" in section 2, and note that this step has to run in **cmd** (PowerShell's `>` would write those headers as UTF-16). With all four done, verify as in section 4.
+
+### When the phone is flaky: pull file by file, not directory by directory
+
+A directory-wide `adb pull` that drops has to start over. What a second machine actually showed, on a Hyper-V VM (`ROOT\VMBUS\0000`) with USB passthrough: the directory pull died on the second file (the 1 GiB `00-00000001.data`) and `adb devices` went empty right after. **The screen locking was not the cause** -- that machine already had `stay_on_while_plugged_in = 15` and a 5-minute `screen_off_timeout`. The shape below got all 9.3 GB through in one pass: the 1 GiB file failed once, succeeded on the retry after the device came back, and the rest ran at about 40 MB/s.
+
+Three things make the shape:
+
+- pull **file by file** (take the list from `adb shell 'cd <src> && find . -type f'`, then `adb pull` each one) and **skip whatever already matches the remote size**, so the script can be rerun as often as needed and a drop only costs the files not yet fetched;
+- on failure check whether the device is still there; if not, wait for it with `adb wait-for-device` and retry (measured here: it came back on its own after about a minute);
+- to wait inside cmd use `ping -n 4 127.0.0.1 >nul`, **not `timeout /t`** -- that one needs console input and exits outright with `ERROR: Input redirection is not supported` when the output is redirected, taking the whole script down with it.
+
 ## 4. How to tell it is restored
 
-1. `dm\android\apk\build_apk.cmd` produces a package (`.work\apk-build\dm.apk`) -- which also proves the NDK block was edited correctly.
+1. `dm\android\apk\build_apk.cmd` produces a package (`.work\apk-build\dm.apk`) -- which also proves the NDK block was edited correctly. This presumes the three generated headers from section 2 exist; otherwise it stops at `'dm_hud_exp.h' file not found` in `dm\host\diag.c`.
 2. `dm\android\apk\install_apk.cmd` installs and starts it.
 3. If it will not start, check these three in order: `main`/`sdk`/`subsdk0` under `.work\data\switch\3.3.94012\Update\ExeFS\` (their checksums are in `setup.sh:84-86`); the resource archives under `.work\data\switch\3.3.94012\Update\RomFS\data\`; and `.work\build\cache\dm\out\3.3.94012-r41-android\`.
 
@@ -99,6 +143,11 @@ Three old rules:
 ## 6. Things that bite
 
 - **git identity**: this machine has no `user.name` / `user.email` configured (commits pass an identity matching the history via `-c`: `gbcmikeblue <1061589622@qq.com>`). Set one up first on a new machine, or `git commit` fails outright with `Author identity unknown`.
+  Note that a new machine may **already carry somebody else's global identity** (measured on the second machine: the global one was `bicheng.gao <bicheng.gao@yiartkeji.com>`, which does not match the repository history). Do not touch the global one; set it per repository instead:
+  `git config user.name gbcmikeblue` plus `git config user.email 1061589622@qq.com` (without `--global`, `git config` only affects this repository).
 - `origin` is already the fork `git@github.com:gbcmikeblue/d2r-mobile.git`, and the `android` branch tracks `origin/android`. SSH uses the `gbcmikeblue` key, so a new machine has to generate its own and add it to the GitHub account.
 - To update the staging area, just `adb push` over it; to clear it, `adb shell rm -rf /sdcard/d2rm/pc` and push it back later.
 - This staging copy is **not** the data the app runs on: at run time the app reads `/data/local/tmp/dm`. Do not mix the two up.
+- **The three generated headers are not in the table above**: `dm\host`'s `dm_vault_tab.h` / `dm_hud_exp.h` / `dm_bright_levels.inc` come from the game files and are gitignored, so without them `build_apk.cmd` stops at `'dm_hud_exp.h' file not found` in `dm\host\diag.c`. Regenerate them from section 2 once the data is back.
+- **PowerShell's `>` changes the encoding** (it writes UTF-16LE). Whenever the raw bytes matter -- generating C headers, dropping logs -- use **cmd's `>`**. Measured on the same script here: 93,550 bytes of UTF-16 from PowerShell against 47,124 bytes of UTF-8 from cmd.
+- **USB drops out entirely**: on this machine (Hyper-V plus USB passthrough) a directory-wide `adb pull` of large files dies after about 30 seconds and `adb devices` goes empty with it, and that has nothing to do with the screen locking. See "When the phone is flaky" in section 3.
