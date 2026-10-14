@@ -20,6 +20,30 @@
     <!-- Vulkan 1.3 是硬要求（设备实测 1.3.284）。| Vulkan 1.3 is a hard requirement (the device reports 1.3.284). -->
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00400003" android:required="true" />
 
+    <!-- 触摸屏：这是个游戏，没有触摸就没法玩。| Touchscreen: this is a game and is unplayable without one. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="true" />
+
+    <!-- 权限集**故意只有两条**，其余一律不申请（少一条权限就少一份需要解释的东西）。 -->
+    <!-- The permission set is **deliberately just two**; nothing else is requested (one fewer permission is one fewer
+         thing needing an explanation). -->
+
+    <!-- ① INTERNET：普通权限，装完即生效、不需要申请。游戏自己会联网（宿主日志里有 LibcurlResolver）。 -->
+    <!-- (1) INTERNET: a normal permission, effective once installed and needing no request. The game goes online by
+         itself (the host log shows LibcurlResolver). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- ② MANAGE_EXTERNAL_STORAGE（"所有文件访问"）：**特殊权限**，必须由用户在系统设置里点开，所以窗口里放了一个按钮
+         （见 main_apk.c；按钮的**有与无**本身就是权限状态，所以不必画字）。它买到的是「数据放在用户看得见、随时能用
+         文件管理器替换的地方」（/sdcard/d2rm，正是入口里已经写好的那条备用路径）。它**不是** /data/local/tmp 的写权限：
+         那里是 SELinux 的 shell_data_file，任何权限都到不了 —— 真机实测：授权后写入仍然 errno 13。 -->
+    <!-- (2) MANAGE_EXTERNAL_STORAGE ("all files access"): a **special** permission the user has to switch on in system
+         settings, which is why the window carries a button (see main_apk.c; the button's **presence or absence is itself
+         the permission state**, so nothing needs drawing in words). What it buys is "data in a place the user can see and
+         replace with a file manager at any time" (/sdcard/d2rm, the very fallback path the entry already knows). It is
+         **not** write access to /data/local/tmp: that is SELinux's shell_data_file and no permission reaches it, measured
+         on the device, where the write still fails with errno 13 even after the grant. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
     <!-- 外部存储读：这一版还不用（数据先不搬），但 M3 之后要从 /sdcard 读游戏数据，先声明不申请权限。
          External storage read: not used by this version yet (the data is not moved over yet), but M3 and later read the
          game data from /sdcard, so it is declared without being requested. -->

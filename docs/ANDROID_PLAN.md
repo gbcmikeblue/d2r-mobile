@@ -513,6 +513,21 @@ help either (measured: the same `errno 13`). The answer is the environment varia
 `DM_ROOT=/data/local/tmp/dm` together with `DM_SAVE` / `DM_TEMP` pointing at
 `/sdcard/Android/data/ai.d2rm.dm/files/{save,temp}` (the directory that "can write" in the positive control).
 
+**The permission set (settled; just two)**: `INTERNET` (a normal permission, effective once installed and needing no
+request) and `MANAGE_EXTERNAL_STORAGE` (a special permission the user has to switch on in system settings). The **orange
+rectangle** in the window is its request button -- **the button's presence or absence is itself the permission state** (a
+button means not granted), so this version draws no words; tapping it opens the grant page. **What that permission buys
+and what it does not is an A/B measurement**:
+
+| `appops` state | write `/data/local/tmp/dm/save` | write `/sdcard/d2rm` | write the app's private dir |
+|---|---|---|---|
+| `allow` (granted) | ✗ `errno 13` | **✓ works** | ✓ |
+| `default` (not granted) | ✗ `errno 13` | ✗ `errno 1` (EPERM) | ✓ |
+
+In other words: **it does not buy write access to `/data/local/tmp`** (that path is SELinux's `shell_data_file` and no
+permission reaches it), and what it does buy is "**data in a place the user can see and replace with a file manager at any
+time**" (`/sdcard/d2rm`, the very fallback path the entry already knows).
+
 - [ ] `front_run`: Android window and main loop (`NativeActivity` / `SurfaceView`)
 - [ ] `front_text_input`: system software keyboard
 - [ ] Touch: reuse `dm_touch_controls.c` (plain C); rewrite input capture and widget rendering

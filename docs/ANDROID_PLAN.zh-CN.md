@@ -477,6 +477,18 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
 `errno 13`）。正解是宿主本来就有的环境变量：`DM_ROOT=/data/local/tmp/dm` + `DM_SAVE` / `DM_TEMP` 指到
 `/sdcard/Android/data/ai.d2rm.dm/files/{save,temp}`（app 正向对照里"能写"的那个目录）。
 
+**权限集（定下来了，只有两条）**：`INTERNET`（普通权限，装完即生效，不需要申请）与 `MANAGE_EXTERNAL_STORAGE`
+（特殊权限，必须由用户在系统设置里点开）。窗口里那块**橙色矩形**就是它的申请按钮 —— **按钮的有与无本身就是权限状态**
+（有按钮 = 还没授权），所以这一版不必画一个字；点它打开授权页。**这条权限买得到什么、买不到什么，是 A/B 实测的**：
+
+| `appops` 状态 | 写 `/data/local/tmp/dm/save` | 写 `/sdcard/d2rm` | 写 app 私有目录 |
+|---|---|---|---|
+| `allow`（已授予）| ✗ `errno 13` | **✓ 能写** | ✓ |
+| `default`（未授予）| ✗ `errno 13` | ✗ `errno 1`（EPERM）| ✓ |
+
+也就是说：**它买不到 `/data/local/tmp` 的写权限**（那条路是 SELinux 的 `shell_data_file`，任何权限都到不了），它买到
+的是「**数据放在用户看得见、随时能用文件管理器替换的地方**」（`/sdcard/d2rm`，正是入口里已经写好的那条备用路径）。
+
 - [ ] `front_run`：安卓窗口与主循环（`NativeActivity` / `SurfaceView`）
 - [ ] `front_text_input`：系统软键盘输入框
 - [ ] 触摸：复用 `dm_touch_controls.c`（纯 C），重写输入采集与控件渲染
