@@ -283,7 +283,7 @@ static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途
 // 这两个计数在"提交"那一段的统计行里要用，而它们属于描述符那一节（定义在后），所以在这里先定下来。
 // These two counters are used by the periodic stats line in the submission section while they belong to the
 // descriptor section (defined further down), so they are declared here first.
-static _Atomic uint64_t g_desc_draws, g_desc_tex_ok, g_desc_tex_blank, g_desc_tex_nosamp;
+static _Atomic uint64_t g_desc_draws, g_desc_tex_ok, g_desc_tex_blank, g_desc_tex_nosamp, g_desc_tex_emptysamp;
 
 #define GPU_RING 1024        // 与苹果侧同一个环大小 | the same ring size as Apple
 #define GPU_PASS_MAX 64      // 一次提交最多记这么多通道；超了就不再写时间戳（那一次的量会偏小） | at most this many passes per submission; beyond it no more timestamps are written (that submission reads low)
@@ -574,9 +574,10 @@ uint64_t mtl_sub_commit(void) {
         // fields would be cut off (measured)
         uint32_t pok = 0, pbad = 0;
         vk_shader_texpair_stats(&pok, &pbad);
-        LOG("[vk] 贴图绑定：解析成功 %llu、写空白 %llu、无采样器 %llu；槽配对 配 %u / 漏 %u（漏的要能在日志里解释）",
+        LOG("[vk] 贴图绑定：配上 %llu、写空白 %llu、空槽采样器 %llu、采样器号查不到 %llu；槽配对 配 %u/漏 %u",
             (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank),
-            (unsigned long long)atomic_load(&g_desc_tex_nosamp), pok, pbad);
+            (unsigned long long)atomic_load(&g_desc_tex_emptysamp), (unsigned long long)atomic_load(&g_desc_tex_nosamp),
+            pok, pbad);
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;
@@ -983,9 +984,27 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                     const treg_e *e = treg_of((uint32_t)h);
                     if (e) {
                         texv = vk_tex_view(&e->t);
+                        // 采样器句柄的高 20 位是号，但 0xFFF 是 NVN 的**空槽哨兵**（真机实测槽上绑的是
+                        // 0xfff00000）：那些槽是用来"填满"的，落到它们上的绑定本来就不会被采样，所以用一个
+                        // 默认采样器是对的、不是缺口。真正值得追的是"绑了号、但注册表里没有它"。
+                        // The handle's high 20 bits are the id, but 0xFFF is NVN's **empty-slot sentinel** (the device
+                        // shows 0xfff00000 bound on those slots): such slots exist to be filled and a binding landing
+                        // on one is never sampled, so using a default sampler is correct rather than a gap. What is
+                        // worth chasing is "an id is bound but the registry lacks it".
                         uint64_t sh_ = g_rs.samp[stg_t][tr->nvn_slot];
-                        if (sh_) texs = samp_of_id((uint32_t)(sh_ >> 20));
+                        uint32_t sid = (uint32_t)(sh_ >> 20);
+                        int empty = (sh_ == 0) || (sid == 0xfffu);
+                        if (!empty) texs = samp_of_id(sid);
                         if (texv) atomic_fetch_add(&g_desc_tex_ok, 1);
+                        if (!texs) {
+                            if (empty) atomic_fetch_add(&g_desc_tex_emptysamp, 1);
+                            else {
+                                static _Atomic uint64_t miss_said;
+                                if (atomic_fetch_add(&g_desc_tex_nosamp, 1) < 6 && atomic_fetch_add(&miss_said, 1) < 6)
+                                    LOG("【查】槽 %d 的采样器号 %u 在注册表里没有（采样器句柄 0x%llx、注册表 %llu 项）",
+                                        tr->nvn_slot, sid, (unsigned long long)sh_, (unsigned long long)atomic_load(&g_sreg_n));
+                            }
+                        }
                     }
                 }
             }
@@ -1015,7 +1034,8 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 // has no such array (verified).
                 ii[nw] = (VkDescriptorImageInfo){ texs ? texs : vk_pipe_dummy_sampler(), texv,
                                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                if (!texs) atomic_fetch_add(&g_desc_tex_nosamp, 1);
+                // 计数已在解析那一段做过（空槽 / 取不到号分开计），这里不再重复加 | counted in the resolution block
+                // above (empty versus missing, separately); not counted again here
             }
             w.descriptorType = b[i].type;
             w.pImageInfo = &ii[nw];
