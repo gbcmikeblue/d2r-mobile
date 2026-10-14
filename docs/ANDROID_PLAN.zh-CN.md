@@ -120,11 +120,26 @@ English: [ANDROID_PLAN.md](ANDROID_PLAN.md)
 
 ### 探路 B —— 着色器翻译链落地
 
-- [ ] 用 .NET SDK 编译 `dm/gfx/tools/dmsh_xlate`
-- [ ] 对 `.work/` 里的游戏文件跑着色器翻译，产出 SPIR-V
-- [ ] 抽查若干产物，确认是 **Vulkan 目标**的 SPIR-V（可用 `spirv-dis` / `spirv-val` 验证）
-- [ ] 记录产物目录与反射 json 的格式（后续 Vulkan 回放要用）
-- [ ] **验收**：确认「NVN 着色器 → Vulkan SPIR-V」在本机可复现
+- [x] 用 .NET SDK 编译 `dm/gfx/tools/dmsh_xlate`
+- [x] 对 `.work/` 里的游戏文件跑着色器翻译，产出 SPIR-V
+- [x] 确认产物是 **Vulkan 目标**的 SPIR-V（版本与魔数）
+- [x] 记录产物目录与反射 json 的格式（后续 Vulkan 回放要用）
+- [x] **验收**：确认「NVN 着色器 → Vulkan SPIR-V」在本机可复现
+
+**结论（实测）**
+
+- `dotnet publish dm/gfx/tools/dmsh_xlate -c Release` **编译成功**（.NET SDK 10.0.402 + 仓内 Ryujinx 库，`Spv.Generator` / `Ryujinx.Common` / `Ryujinx.Graphics.Shader` / `dmsh_xlate` 四个工程全部还原并生成）。
+- 从游戏 RomFS 提取 **162 个着色器包**（vs 43 / ps 96 / cs 21 / ds 1 / hs 1）。
+- 逐包按 `BTCDBTCD` 切记录 → 共 **10847 个变体**；按控制段 `sha256[:16]` 去重后 **6923 个唯一键**。
+- `dmsh_xlate`：**翻译 10847 成功，0 失败**。
+- 产出 **6923 个 `.spv`**（魔数 `0x07230203` 全部正确，异常 0）+ 6923 个 `.res.json` 反射。
+- **SPIR-V 版本 1.3**（对应 Vulkan 1.1 目标；红米 K90 的 Adreno 驱动支持更高版本，向下兼容）。
+
+**意义**：这是整套方案里"最有利的一块"，现在**已在本机完整落袋**——安卓侧写 Vulkan 回放层时，直接就有 6923 个现成的 SPIR-V 着色器可用，**不需要任何运行时翻译**（这正是当初断言"安卓可行"的关键依据之一）。
+
+本次只跑了链的**前半段**（NVN → SPIR-V）。后半段（`spirv-cross` → MSL → `metallib`）是苹果专有的，安卓用不上，跳过。
+
+产物在 `.work/spv/`（已 gitignore，不进仓库）。
 
 ### M1 —— 无窗口跑通宿主
 
@@ -203,7 +218,10 @@ English: [ANDROID_PLAN.md](ANDROID_PLAN.md)
 
 ### 编码
 
-- **Python 脚本一律设 `PYTHONIOENCODING=utf-8`**。Windows 控制台代码页是 GBK；脚本注释里含 `U+2212` 这类字符时会 `UnicodeEncodeError` **中途退出**（表现为生成的表头被截断）。
+- **Python 一律带 `PYTHONUTF8=1`（并加 `PYTHONIOENCODING=utf-8`）**。Windows 上 Python 默认按 GBK 处理文件与标准输出，会踩两种坑：
+  - 输出侧：脚本注释含 `U+2212` 这类字符时 `UnicodeEncodeError` **中途退出**（表现为生成的表头被截断）；
+  - 输入侧：仓库里的表是 UTF-8，而脚本里 `open(path)` 未指定编码 → `UnicodeDecodeError`（读 `shader_facts.tsv` 时踩到）。
+  `PYTHONUTF8=1` 让所有 `open()` 与 stdio 默认走 UTF-8，一次解决两侧问题。
 - **重定向到文件用 cmd 的 `>`**（保持原始字节），不要在 PowerShell 里用管道 + `Out-File`（会改编码与行尾）。
 - **读文件显式指定编码**：PowerShell 用 `-Encoding`，或直接 `[System.IO.File]::ReadAllLines()`。
 - **路径一律纯 ASCII**。本机用户目录名含中文（`C:\Users\ZhuanZ（无密码）`），已经因此踩过两个坑：

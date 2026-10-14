@@ -120,11 +120,26 @@ Principle: **do not rewrite gameplay**; reuse the existing host and replace only
 
 ### Recon B — land the shader translation chain
 
-- [ ] Build `dm/gfx/tools/dmsh_xlate` with the .NET SDK
-- [ ] Run shader translation over the game files in `.work/`, producing SPIR-V
-- [ ] Spot-check the output and confirm it is **Vulkan-targeted** SPIR-V (`spirv-dis` / `spirv-val`)
-- [ ] Record the output layout and the reflection json format (the Vulkan replay needs them)
-- [ ] **Acceptance**: "NVN shader → Vulkan SPIR-V" reproduces on this machine
+- [x] Build `dm/gfx/tools/dmsh_xlate` with the .NET SDK
+- [x] Run shader translation over the game files in `.work/`, producing SPIR-V
+- [x] Confirm the output is **Vulkan-targeted** SPIR-V (version and magic)
+- [x] Record the output layout and the reflection json format (the Vulkan replay needs them)
+- [x] **Acceptance**: "NVN shader → Vulkan SPIR-V" reproduces on this machine
+
+**Result (measured)**
+
+- `dotnet publish dm/gfx/tools/dmsh_xlate -c Release` **succeeds** (.NET SDK 10.0.402 plus the in-repo Ryujinx libraries; `Spv.Generator` / `Ryujinx.Common` / `Ryujinx.Graphics.Shader` / `dmsh_xlate` all restore and build).
+- **162 shader packages** extracted from the game RomFS (vs 43 / ps 96 / cs 21 / ds 1 / hs 1).
+- Splitting each package into records on `BTCDBTCD` gives **10847 variants**; de-duplicated by control-segment `sha256[:16]` that is **6923 unique keys**.
+- `dmsh_xlate`: **10847 translated, 0 failed**.
+- Output: **6923 `.spv` files** (magic `0x07230203` correct in every one, 0 anomalies) plus 6923 `.res.json` reflection files.
+- **SPIR-V version 1.3** (a Vulkan 1.1 target; the Adreno driver on the Redmi K90 supports newer and is backward compatible).
+
+**Why it matters**: this is the most favourable piece of the whole plan, and it is now **banked on this machine** — when the Android Vulkan replay layer is written, 6923 ready-made SPIR-V shaders are available with **no runtime translation at all**. That was one of the key reasons Android looked feasible in the first place.
+
+Only the **front half** of the chain was run here (NVN → SPIR-V). The back half (`spirv-cross` → MSL → `metallib`) is Apple-specific and is not needed on Android.
+
+The output lives in `.work/spv/` (gitignored; not committed).
 
 ### M1 — host runs headless
 
@@ -203,7 +218,10 @@ The port is currently being driven from a Windows machine. These are the traps a
 
 ### Encoding
 
-- **Always set `PYTHONIOENCODING=utf-8` for Python scripts.** The Windows console code page is GBK, and a character such as `U+2212` in a script's comments raises `UnicodeEncodeError` and **aborts the script midway** (seen as truncated generated headers).
+- **Always run Python with `PYTHONUTF8=1` (plus `PYTHONIOENCODING=utf-8`).** On Windows, Python defaults to GBK for both files and stdio, which bites in two ways:
+  - on output, a character such as `U+2212` in a script's comments raises `UnicodeEncodeError` and **aborts the script midway** (seen as truncated generated headers);
+  - on input, the tables in the repository are UTF-8 while a script's `open(path)` carries no encoding → `UnicodeDecodeError` (hit when reading `shader_facts.tsv`).
+  `PYTHONUTF8=1` makes every `open()` and stdio default to UTF-8, fixing both sides at once.
 - **Redirect to a file with cmd's `>`** (preserves raw bytes); do not use a PowerShell pipeline plus `Out-File` (it changes encoding and line endings).
 - **Read files with an explicit encoding**: PowerShell `-Encoding`, or `[System.IO.File]::ReadAllLines()`.
 - **Keep every path pure ASCII.** The user directory on this machine contains non-ASCII characters (`C:\Users\ZhuanZ（无密码）`), which has already caused two problems:
