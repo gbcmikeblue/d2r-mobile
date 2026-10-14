@@ -59,3 +59,13 @@ int vk_spv_scan(const uint32_t *code, size_t bytes, vk_spv_bind *out, int cap,
 
 // 种类名（日志用）| a kind's name (for logs)
 const char *vk_spv_kind_name(int kind);
+
+// 把模块里所有描述符变量的 DescriptorSet 装饰改写成 new_set，返回改写了几条；不是 SPIR-V 或结构不对返回 -1。
+// 这是"按阶段分空间"的落点（见 vk_shader.c 的调用处）：Vulkan 里一条 binding 只能有一个类型，而 NVN 的常量段与
+// 贴图是两个互不相干的空间、翻译器会给不同阶段复用同一个号，所以片元阶段的绑定整体挪到 set 1，顶点留在 set 0。
+// Rewrite every descriptor variable's DescriptorSet decoration to new_set and return how many were rewritten (-1 when
+// it is not SPIR-V or the structure is wrong). This is where "a space per stage" lands (see the call site in
+// vk_shader.c): in Vulkan one binding can have only one type, while NVN's constant bank and textures are two
+// unrelated spaces and the translator reuses one number across stages, so the fragment stage's bindings all move to
+// set 1 while the vertex stage stays on set 0.
+int vk_spv_force_set(uint32_t *code, size_t bytes, uint32_t new_set);

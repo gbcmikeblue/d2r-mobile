@@ -214,6 +214,8 @@ static uint32_t js_count(const char *a) {
 // 返回 0 表示坏（缺字段、类型不对）；此时调用方按"产物坏了"处理（报红计次），不建管线
 // Returns 0 for a broken file (missing field, wrong type); the caller then treats it as a broken artifact
 // (logged and counted) and builds no pipeline
+static uint32_t g_set_moved;   // 被挪到 set 1 的片元绑定条数（诊断用）| fragment bindings moved to set 1 (for diagnostics)
+
 static int parse_ref(const char *txt, vk_shader *sh) {
     const char *v;
     if (!(v = js_find(txt, "key")) || !js_str(v, sh->key, sizeof sh->key)) return 0;
@@ -337,6 +339,31 @@ static vk_shader *load(const char *key, int stage) {
         g_bad++;
         return NULL;
     }
+    // ---- 阶段分空间：片元着色器的描述符绑定整体挪到 set 1（顶点留在 set 0）----
+    // 为什么必须挪：真机上出现过"顶点说 binding 1 是 uniform 缓冲、片元说它是组合图像采样器"——Vulkan 里一条
+    // binding 只能有一个类型，这种事无解；而根子在 NVN 那边：常量段与贴图是两个互不相干的空间，翻译器给不同
+    // 阶段复用同一个号（Metal 那边按阶段分开的参数缓冲不会撞，所以那边没这个问题）。按**阶段**分 set 是最小的
+    // 正确修法：阶段在装载时就已知，于是每个片元着色器只有一个变体，不必按程序组合生成变体。
+    // 改写发生在建模块**之前**，所以扫描器（下面）读到的就是改写后的 set。
+    // ---- a space per stage: the fragment stage's descriptor bindings all move to set 1 (the vertex stage stays on
+    // set 0). Why it has to move: the device showed "the vertex shader calls binding 1 a uniform buffer while the
+    // fragment shader calls it a combined image sampler" -- in Vulkan one binding can have only one type and that has
+    // no answer; the root is on the NVN side, where the constant bank and the textures are two unrelated spaces and
+    // the translator reuses one number across stages (Metal's per-stage argument buffers do not collide, which is why
+    // this never came up there). Splitting sets by **stage** is the smallest correct fix: the stage is known at load
+    // time, so each fragment shader has a single variant and no per-program combinations are needed.
+    // The rewrite happens **before** module creation, so the scanner below sees the rewritten set.
+    if (sh->stage == VK_STAGE_PS) {
+        int np = vk_spv_force_set((uint32_t *)code, n, 1);
+        if (np < 0) {
+            if (g_red_bad++ < 5) LOG("【红】着色器 %s 的 SPIR-V 结构不对，没法把片元绑定挪到 set 1（%zu 字节）", key, n);
+            free(code); free_ref(sh); free(sh);
+            g_bad++;
+            return NULL;
+        }
+        g_set_moved += (uint32_t)np;
+    }
+
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = n, .pCode = (const uint32_t *)code };
     VkResult r = vkCreateShaderModule(vk_dev(), &ci, NULL, &sh->mod);
 
@@ -402,6 +429,8 @@ const vk_shader *vk_shader_get(const void *control) {
     if (!vk_shader_ctl_key(control, key)) return NULL;
     return vk_shader_by_key(key, VK_STAGE_NONE);
 }
+
+uint32_t vk_shader_set_moved(void) { return g_set_moved; }
 
 void vk_shader_stats(uint32_t *loaded, uint32_t *missing, uint32_t *bad) {
     if (loaded) *loaded = g_loaded;

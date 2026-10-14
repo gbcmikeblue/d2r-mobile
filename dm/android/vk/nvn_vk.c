@@ -280,6 +280,11 @@ static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途
 // fence has signalled, with "last end minus first start" as the submission's GPU span accumulated into a per-frame
 // ring -- the same semantics as Apple's (whose GPUStartTime/GPUEndTime are also looked up by frame number and
 // return -1 while incomplete).
+// 这两个计数在"提交"那一段的统计行里要用，而它们属于描述符那一节（定义在后），所以在这里先定下来。
+// These two counters are used by the periodic stats line in the submission section while they belong to the
+// descriptor section (defined further down), so they are declared here first.
+static _Atomic uint64_t g_desc_draws, g_desc_tex_ok, g_desc_tex_blank;
+
 #define GPU_RING 1024        // 与苹果侧同一个环大小 | the same ring size as Apple
 #define GPU_PASS_MAX 64      // 一次提交最多记这么多通道；超了就不再写时间戳（那一次的量会偏小） | at most this many passes per submission; beyond it no more timestamps are written (that submission reads low)
 typedef struct { _Atomic uint64_t frame, ns, pending, t0, t1; } gpu_rec;
@@ -559,10 +564,16 @@ uint64_t mtl_sub_commit(void) {
         // Shortest possible prefix and the unhandled count on its own line: the host LOG has a length limit,
         // and a long prefix truncates even five entries (measured).
         LOG("[vk] 提交 %llu，op 前 5：%s", (unsigned long long)g_sub_total, line);
-        LOG("[vk] 本窗口 %llu 条；开通道 %llu 次、清除 %llu 次、影子绑定 %llu 条、绘制跳过 %llu 条；未执行累计 %llu",
+        LOG("[vk] 本窗口 %llu 条；开通道 %llu 次、清除 %llu 次、影子绑定 %llu 条、绘制跳过 %llu 条；未执行累计 %llu；片元绑定已挪到 set 1 共 %u 条、真下发 %llu 次（贴图解析成功 %llu）",
             (unsigned long long)total, (unsigned long long)atomic_load(&g_pass_n), (unsigned long long)atomic_load(&g_clear_n),
             (unsigned long long)atomic_load(&g_shadow_n), (unsigned long long)atomic_load(&g_draw_skip),
-            (unsigned long long)atomic_load(&g_op_unhandled));
+            (unsigned long long)atomic_load(&g_op_unhandled), vk_shader_set_moved(),
+            (unsigned long long)atomic_load(&g_desc_draws), (unsigned long long)atomic_load(&g_desc_tex_ok));
+        // 贴图单独一行：上面的行已经接近宿主的长度上限，再挂两项就会被截断（实测过）
+        // Textures get their own line: the line above is already close to the host's length limit and two more
+        // fields would be cut off (measured)
+        LOG("[vk] 贴图绑定：解析成功 %llu、写空白 %llu",
+            (unsigned long long)atomic_load(&g_desc_tex_ok), (unsigned long long)atomic_load(&g_desc_tex_blank));
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;
@@ -687,7 +698,7 @@ static const treg_e *treg_of(uint32_t handle) {
 #define DESC_POOLS 2                      // 一个槽最多两池：满了再开一池，回收时一起销毁 | at most two pools per slot: a second one when full, both destroyed on reap
 static VkDescriptorPool g_dpool[MAX_INFLIGHT][DESC_POOLS];
 static uint8_t g_dpool_n[MAX_INFLIGHT];
-static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_draws, g_desc_skip, g_desc_tex_ok;
+static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_skip;
 
 static void desc_slot_reset(int slot) {
     for (int k = 0; k < DESC_POOLS; k++)
@@ -738,12 +749,16 @@ static const vk_tex_ref *desc_tex_ref(const vk_shader *sh, uint32_t binding) {
     for (uint32_t i = 0; i < sh->ntex; i++) if (sh->tex[i].binding == binding) return &sh->tex[i];
     return NULL;
 }
-// 声明了这条 binding 的着色器（合并表里的每条都要落到某个阶段上）
-// The shader that declares this binding (every entry of the merged table must land on some stage)
-static const vk_shader *desc_stage_of(const vk_shader *const *sh, int n, uint32_t binding) {
+// 声明了这条 (set, binding) 的着色器。**set 必须一起比**：同一个号在 set 0（顶点空间）与 set 1（片元空间）
+// 是两个互不相干的绑定，只按号找会拿到另一个阶段的反射。
+// The shader that declares this (set, binding). **The set must be compared too**: the same number on set 0 (the
+// vertex space) and set 1 (the fragment space) are two unrelated bindings, and looking up by number alone would
+// fetch the other stage's reflection.
+static const vk_shader *desc_stage_of(const vk_shader *const *sh, int n, uint32_t set, uint32_t binding) {
     for (int i = 0; i < n; i++) {
         if (!sh[i]) continue;
-        for (uint32_t k = 0; k < sh[i]->nspv; k++) if (sh[i]->spv[k].binding == binding) return sh[i];
+        for (uint32_t k = 0; k < sh[i]->nspv; k++)
+            if (sh[i]->spv[k].binding == binding && sh[i]->spv[k].set == set) return sh[i];
     }
     return NULL;
 }
@@ -786,7 +801,7 @@ static int desc_buf_range(const vk_shader *sh, const vk_pipe_bind *b, uint64_t *
 // Write every binding for one set. The return value is how many dynamic offsets were filled in (-1 means it cannot
 // be written and the caller skips the draw). The dynamic offsets are in the same order as the vk_pipe_binds table,
 // which is what vkCmdBindDescriptorSets requires.
-static int desc_write(VkDescriptorSet set, const vk_shader *const *sh, int n,
+static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n,
                       const vk_pipe_bind *b, int nb, uint32_t *dyn) {
     // 一屏最多 64 条绑定，用静态数组（mtl_exec 递归，不能用大栈帧 | see the note on gfx_state_fill）
     static VkDescriptorBufferInfo bi[VK_SPV_MAXB];
@@ -794,10 +809,16 @@ static int desc_write(VkDescriptorSet set, const vk_shader *const *sh, int n,
     static VkWriteDescriptorSet wr[VK_SPV_MAXB];
     int nw = 0, nd = 0;
     for (int i = 0; i < nb; i++) {
-        const vk_shader *st = desc_stage_of(sh, n, b[i].binding);
+        // 每条绑定写进它自己那个 set（set 0 = 顶点空间、set 1 = 片元空间）。表按 (set, binding) 升序，
+        // 所以动态偏移也是按这个顺序落进 dyn[] —— 正是 vkCmdBindDescriptorSets 消费它们的顺序。
+        // Every binding goes into its own set (set 0 = the vertex space, set 1 = the fragment space). The table is
+        // sorted by (set, binding), so the dynamic offsets land in dyn[] in that order -- which is exactly the order
+        // vkCmdBindDescriptorSets consumes them in.
+        if (b[i].set > 1 || !sets[b[i].set]) continue;
+        const vk_shader *st = desc_stage_of(sh, n, b[i].set, b[i].binding);
         if (!st) continue;
         VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = set, .dstBinding = b[i].binding, .descriptorCount = b[i].count ? b[i].count : 1 };
+            .dstSet = sets[b[i].set], .dstBinding = b[i].binding, .descriptorCount = b[i].count ? b[i].count : 1 };
         if (b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
             uint64_t a = 0, sz = 0;
             void *buf = NULL; uint64_t off = 0;
@@ -845,7 +866,12 @@ static int desc_write(VkDescriptorSet set, const vk_shader *const *sh, int n,
                 if (e) texv = vk_tex_view(&e->t);
             }
             if (!texv) {
-                if (atomic_fetch_add(&g_desc_blank, 1) < 8) {
+                // 用**自己的**计数器：早先和图"拿不到缓冲地址"共用 g_desc_blank，前 8 条被 UBO 的空白占掉，
+                // 于是贴图这条诊断在真机上一行都没打出来（查了半天）。
+                // Its **own** counter: it used to share g_desc_blank with the "buffer address unavailable" case, so
+                // the first eight were taken by UBO blanks and this texture diagnostic never printed a single line on
+                // the device (which cost a while to figure out).
+                if (atomic_fetch_add(&g_desc_tex_blank, 1) < 8) {
                     int stg = st->stage >= 0 && st->stage < 6 ? st->stage : 0;
                     LOG("【黄】binding %u（%s）贴图写空白：res.json 说 cbuf_slot=%d handle=0x%x；该阶段贴图句柄 %llx/%llx/%llx、常量段 %llx/%llx/%llx/%llx",
                         b[i].binding, vk_spv_kind_name(b[i].kind), tr ? tr->cbuf_slot : -999, tr ? (unsigned)tr->handle : 0u,
@@ -1310,14 +1336,22 @@ void mtl_exec(const uint8_t *p) {
             int wrote = 0;
             if (pl && g_rs.open && g_cur_slot >= 0) {
                 VkCommandBuffer cb = g_inf[g_cur_slot].cb;
-                VkDescriptorSetLayout dsl = vk_pipe_set_layout((const vk_shader *const *)shs, nsh);
+                // 两个空间都取（set 0 = 顶点、set 1 = 片元），每个绘制固定分配两个集：其中一个没有绑定时
+                // 它是个**空布局**（写入侧跳过它，但仍然要绑——管线布局里它有位置）。
+                // Both spaces are fetched (set 0 = vertex, set 1 = fragment) and each draw allocates two sets fixed:
+                // when one has no bindings it is an **empty layout** (the write side skips it but it is still bound,
+                // because the pipeline layout has a slot for it).
+                VkDescriptorSetLayout dsl0 = vk_pipe_set_layout_set((const vk_shader *const *)shs, nsh, 0);
+                VkDescriptorSetLayout dsl1 = vk_pipe_set_layout_set((const vk_shader *const *)shs, nsh, 1);
                 VkPipelineLayout lay = vk_pipe_layout((const vk_shader *const *)shs, nsh);
-                VkDescriptorSet set = dsl ? desc_alloc(g_cur_slot, dsl) : VK_NULL_HANDLE;
-                int nb = set ? vk_pipe_binds((const vk_shader *const *)shs, nsh, binds, VK_SPV_MAXB) : -1;
-                int nd = nb >= 0 ? desc_write(set, (const vk_shader *const *)shs, nsh, binds, nb, dyn) : -1;
+                VkDescriptorSet sets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+                if (dsl0) sets[0] = desc_alloc(g_cur_slot, dsl0);
+                if (dsl1) sets[1] = desc_alloc(g_cur_slot, dsl1);
+                int nb = (sets[0] && sets[1]) ? vk_pipe_binds((const vk_shader *const *)shs, nsh, binds, VK_SPV_MAXB) : -1;
+                int nd = nb >= 0 ? desc_write(sets, (const vk_shader *const *)shs, nsh, binds, nb, dyn) : -1;
                 if (nd >= 0) {
                     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
-                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 1, &set, (uint32_t)nd, dyn);
+                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 2, sets, (uint32_t)nd, dyn);
                     // 顶点流：只绑管线真的用到的那些；其余属性走常量回退，落在 VK_PIPE_DUMMY_BIND 上
                     // Vertex streams: bind only the ones the pipeline really uses; the remaining attributes come
                     // from the constant fallback that lives on VK_PIPE_DUMMY_BIND

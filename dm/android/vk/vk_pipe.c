@@ -53,10 +53,10 @@ static VkShaderStageFlags stage_flag(int st) {
 // 往合并表里加一条：同号则并入阶段（类型不一致要报红——同一号两种类型是翻译产物本身有问题）
 // Add one entry to the merged table: an existing number merges its stages (a type mismatch is reported as a
 // failure -- one number with two types means the translated artifacts themselves are inconsistent)
-static int add_bind(bind_t *b, int *nb, int cap, uint32_t binding, uint32_t count, VkDescriptorType type, VkShaderStageFlags sf,
-                    const char *skey, int kind) {
+static int add_bind(bind_t *b, int *nb, int cap, uint32_t set, uint32_t binding, uint32_t count, VkDescriptorType type,
+                    VkShaderStageFlags sf, const char *skey, int kind) {
     for (int i = 0; i < *nb; i++) {
-        if (b[i].binding != binding) continue;
+        if (b[i].binding != binding || b[i].set != set) continue;
         if (b[i].type != type) {
             // 两个阶段对同一条 binding 的解读不同：说清是哪两个着色器、各是什么种类——只报 VkDescriptorType 的数字
             // 看不出是谁（真机上出现过一次"8 与 1"）。
@@ -72,14 +72,15 @@ static int add_bind(bind_t *b, int *nb, int cap, uint32_t binding, uint32_t coun
         return 0;
     }
     if (*nb >= cap) return -1;
-    b[*nb].binding = binding; b[*nb].count = count ? count : 1; b[*nb].type = type; b[*nb].stage = sf; b[*nb].kind = kind;
+    b[*nb].set = set; b[*nb].binding = binding; b[*nb].count = count ? count : 1; b[*nb].type = type; b[*nb].stage = sf; b[*nb].kind = kind;
     (*nb)++;
     return 0;
 }
 
 static int cmp_bind(const void *a, const void *b) {
-    uint32_t x = ((const bind_t *)a)->binding, y = ((const bind_t *)b)->binding;
-    return x < y ? -1 : x > y ? 1 : 0;
+    const bind_t *x = a, *y = b;
+    if (x->set != y->set) return x->set < y->set ? -1 : 1;
+    return x->binding < y->binding ? -1 : x->binding > y->binding ? 1 : 0;
 }
 
 // SPIR-V 声明的种类 → Vulkan 描述符类型。缓冲一律用 dynamic（数据在零拷贝池里，每次绘制只换偏移）。
@@ -110,16 +111,20 @@ static int merge_binds(const vk_shader *const *sh, int n, bind_t *out, int cap) 
         if (!sf) { LOG("【红】着色器 %s 的阶段 %d 没有对应的 Vulkan 阶段位", s->key, s->stage); return -1; }
         for (uint32_t k = 0; k < s->nspv; k++) {
             const vk_spv_bind *b = &s->spv[k];
-            if (b->set != 0) {   // 目前只建 set 0 的布局；出现了别的 set 要报红（否则那条绑定会缺）| only set 0 is built for now; another set must be reported or that binding would be missing
+            // 两个空间：set 0 = 顶点阶段、set 1 = 片元阶段（见 vk_shader.c 装载处的"按阶段分空间"）。
+            // 出现别的 set 说明产物形态变了，报红并按设计跳过。
+            // Two spaces: set 0 = the vertex stage, set 1 = the fragment stage (see "a space per stage" at the load
+            // site in vk_shader.c). Another set means the artifacts changed shape: reported and skipped by design.
+            if (b->set > 1) {
                 static int said;
-                if (!said++) LOG("【红】着色器 %s 的 binding %u 在 set %u：目前只建 set 0 的布局", s->key, b->binding, b->set);
+                if (!said++) LOG("【红】着色器 %s 的 binding %u 在 set %u：只认识 0/1 两个空间", s->key, b->binding, b->set);
                 continue;
             }
             if (b->kind == VK_SPV_OTHER) {
                 static int said2;
                 if (!said2++) LOG("【黄】着色器 %s 的 binding %u 种类认不出来：按存储缓冲建（可能要改 vk_spv.c）", s->key, b->binding);
             }
-            if (add_bind(out, &nb, cap, b->binding, b->count, desc_type_of(b->kind), sf, s->key, b->kind) < 0) return -1;
+            if (add_bind(out, &nb, cap, b->set, b->binding, b->count, desc_type_of(b->kind), sf, s->key, b->kind) < 0) return -1;
         }
     }
     qsort(out, (size_t)nb, sizeof *out, cmp_bind);
@@ -140,14 +145,14 @@ int vk_pipe_binds(const vk_shader *const *sh, int n, vk_pipe_bind *out, int cap)
 static void key_of_binds(const bind_t *b, int nb, char *out, size_t n) {
     size_t o = 0;
     for (int i = 0; i < nb && o + 40 < n; i++)
-        o += (size_t)snprintf(out + o, n - o, "%u:%u:%d:%x;", b[i].binding, b[i].count, (int)b[i].type, (unsigned)b[i].stage);
+        o += (size_t)snprintf(out + o, n - o, "%u/%u:%u:%d:%x;", b[i].set, b[i].binding, b[i].count, (int)b[i].type, (unsigned)b[i].stage);
     out[o] = 0;
 }
 
 // 布局缓存：开放寻址、线性探测，存的是键字符串（不超过 1 KB）与两个句柄
 // Layout cache: open addressing with linear probing, holding the key string (under 1 KB) and the two handles
 #define LAY_TAB 1024
-typedef struct { char *key; VkDescriptorSetLayout dsl; VkPipelineLayout lay; } lay_e;
+typedef struct { char *key; VkDescriptorSetLayout dsl[2]; VkPipelineLayout lay; } lay_e;
 static lay_e g_lay[LAY_TAB];
 
 static uint32_t str_hash(const char *s) {
@@ -159,49 +164,57 @@ static uint32_t str_hash(const char *s) {
 // 按一张绑定表建描述符集布局与管线布局。variant 见 vk_pipe.h（0 = 正常；诊断变体不进缓存）。
 // Build a descriptor set layout and pipeline layout from one binding table. See vk_pipe.h for `variant`
 // (0 = normal; the diagnostic variants are never cached).
-static int build_layout(const bind_t *b, int nb, int variant, VkDescriptorSetLayout *out_dsl, VkPipelineLayout *out_lay, const char *key) {
-    bind_t bb[MAX_B * 2];
-    int n = 0;
-    for (int i = 0; i < nb && n < MAX_B * 2; i++) bb[n++] = b[i];
-    if (variant >= 2) {   // 把表里缺的 binding 号补进来：分辨"驱动要的号我没建"这类不匹配 | add the binding numbers the table lacks: tells apart "the driver wants a number I did not create"
-        VkDescriptorType t = variant == 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
-                            : variant == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
-                                           : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        for (uint32_t num = 0; num < 16 && n < MAX_B * 2; num++) {
-            int have = 0;
-            for (int i = 0; i < nb; i++) if (b[i].binding == num) { have = 1; break; }
-            if (!have) { bb[n].binding = num; bb[n].count = 1; bb[n].type = t; bb[n].stage = VK_SHADER_STAGE_COMPUTE_BIT; n++; }
-        }
-    }
+static int build_layout(const bind_t *b, int nb, int variant, VkDescriptorSetLayout out_dsl[2], VkPipelineLayout *out_lay, const char *key) {
+    // **两个 set 总是都建**（空的也建）：管线布局要求 set 号连续，而"片元在 set 1、顶点那条 set 0 是空的"
+    // 这种组合很常见（比如只有片元的程序），留一个空布局反而省掉写入侧一堆条件分支。
+    // **Both sets are always created** (empty ones included): a pipeline layout wants consecutive set numbers, and
+    // combinations like "the fragment side is on set 1 while set 0 is empty" are common (a fragment-only program,
+    // say), so keeping an empty layout saves the write side a pile of conditionals.
     VkDescriptorSetLayoutBinding lb[MAX_B * 2];
-    for (int i = 0; i < n; i++) {
-        lb[i].binding = bb[i].binding;
-        lb[i].descriptorType = bb[i].type;
-        lb[i].descriptorCount = bb[i].count ? bb[i].count : 1;   // 元素个数取自 SPIR-V，见 vk_spv.h | the element count comes from the SPIR-V, see vk_spv.h
-        lb[i].stageFlags = bb[i].stage;
-        lb[i].pImmutableSamplers = NULL;
-    }
-    VkDescriptorSetLayoutCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                            .bindingCount = (uint32_t)n, .pBindings = lb };
-    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-    VkResult r = vkCreateDescriptorSetLayout(vk_dev(), &dci, NULL, &dsl);
-    if (r != VK_SUCCESS) {
-        LOG("【红】建描述符集布局失败：VkResult %d（%d 条绑定，键 %s）", (int)r, n, key);
-        return 0;
+    for (uint32_t set = 0; set < 2; set++) {
+        int n = 0;
+        for (int i = 0; i < nb && n < MAX_B * 2; i++) {
+            if (b[i].set != set) continue;
+            lb[n].binding = b[i].binding;
+            lb[n].descriptorType = b[i].type;
+            lb[n].descriptorCount = b[i].count ? b[i].count : 1;   // 元素个数取自 SPIR-V，见 vk_spv.h | the element count comes from the SPIR-V, see vk_spv.h
+            lb[n].stageFlags = b[i].stage;
+            lb[n].pImmutableSamplers = NULL;
+            n++;
+        }
+        if (variant >= 2 && set == 0) {   // 把表里缺的 binding 号补进来（只在 set 0，够分辨不匹配了）| add the binding numbers the table lacks (set 0 only, enough to tell a mismatch apart)
+            VkDescriptorType t = variant == 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                                : variant == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                                               : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            for (uint32_t num = 0; num < 16 && n < MAX_B * 2; num++) {
+                int have = 0;
+                for (int i = 0; i < nb; i++) if (b[i].set == 0 && b[i].binding == num) { have = 1; break; }
+                if (!have) {
+                    lb[n].binding = num; lb[n].descriptorType = t; lb[n].descriptorCount = 1;
+                    lb[n].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; lb[n].pImmutableSamplers = NULL; n++;
+                }
+            }
+        }
+        VkDescriptorSetLayoutCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                                .bindingCount = (uint32_t)n, .pBindings = lb };
+        VkResult r = vkCreateDescriptorSetLayout(vk_dev(), &dci, NULL, &out_dsl[set]);
+        if (r != VK_SUCCESS) {
+            LOG("【红】建描述符集布局失败：VkResult %d（set %u、%d 条绑定，键 %s）", (int)r, set, n, key);
+            if (out_dsl[0]) { vkDestroyDescriptorSetLayout(vk_dev(), out_dsl[0], NULL); out_dsl[0] = VK_NULL_HANDLE; }
+            return 0;
+        }
     }
     VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 256 };
     VkPipelineLayoutCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                       .setLayoutCount = 1, .pSetLayouts = &dsl,
+                                       .setLayoutCount = 2, .pSetLayouts = out_dsl,
                                        .pushConstantRangeCount = variant == 1 ? 1u : 0u,
                                        .pPushConstantRanges = variant == 1 ? &pcr : NULL };
-    VkPipelineLayout lay = VK_NULL_HANDLE;
-    r = vkCreatePipelineLayout(vk_dev(), &pci, NULL, &lay);
+    VkResult r = vkCreatePipelineLayout(vk_dev(), &pci, NULL, out_lay);
     if (r != VK_SUCCESS) {
-        vkDestroyDescriptorSetLayout(vk_dev(), dsl, NULL);
         LOG("【红】建管线布局失败：VkResult %d（键 %s）", (int)r, key);
+        for (int k = 0; k < 2; k++) if (out_dsl[k]) { vkDestroyDescriptorSetLayout(vk_dev(), out_dsl[k], NULL); out_dsl[k] = VK_NULL_HANDLE; }
         return 0;
     }
-    *out_dsl = dsl; *out_lay = lay;
     return 1;
 }
 
@@ -218,12 +231,11 @@ static lay_e *lay_get_or_make(const vk_shader *const *sh, int n) {
     for (uint32_t k = 0; k < LAY_TAB; k++) {
         lay_e *e = &g_lay[(h + k) & (LAY_TAB - 1)];
         if (!e->key) {   // 空槽：建 | empty slot: build it here
-            VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
             VkPipelineLayout lay = VK_NULL_HANDLE;
-            if (!build_layout(b, nb, 0, &dsl, &lay, key)) { g_n_fail++; return NULL; }
+            if (!build_layout(b, nb, 0, e->dsl, &lay, key)) { g_n_fail++; return NULL; }
             e->key = strdup(key);
-            e->dsl = dsl; e->lay = lay;
-            g_n_dsl++; g_n_lay++;
+            e->lay = lay;
+            g_n_dsl += 2; g_n_lay++;   // 两个 set 布局（空的那个也算一个）| two set layouts (the empty one included)
             return e;
         }
         if (!strcmp(e->key, key)) return e;
@@ -234,8 +246,12 @@ static lay_e *lay_get_or_make(const vk_shader *const *sh, int n) {
 }
 
 VkDescriptorSetLayout vk_pipe_set_layout(const vk_shader *const *sh, int n) {
+    return vk_pipe_set_layout_set(sh, n, 0);
+}
+VkDescriptorSetLayout vk_pipe_set_layout_set(const vk_shader *const *sh, int n, uint32_t set) {
+    if (set > 1) return VK_NULL_HANDLE;
     lay_e *e = lay_get_or_make(sh, n);
-    return e ? e->dsl : VK_NULL_HANDLE;
+    return e ? e->dsl[set] : VK_NULL_HANDLE;
 }
 VkPipelineLayout vk_pipe_layout(const vk_shader *const *sh, int n) {
     lay_e *e = lay_get_or_make(sh, n);

@@ -94,3 +94,7 @@ const vk_shader *vk_shader_by_key(const char *key, int stage);
 
 // 装载计数：成功 / 键不在产物里（缺）、产物在但坏掉（json 或 SPIR-V 有问题）| Load counters: succeeded / key not among the artifacts (missing) / artifact present but broken (json or SPIR-V)
 void vk_shader_stats(uint32_t *loaded, uint32_t *missing, uint32_t *bad);
+
+// 被挪到 set 1 的片元绑定条数（"按阶段分空间"生效的证据；诊断用）
+// How many fragment bindings were moved to set 1 (evidence that "a space per stage" is in effect; for diagnostics)
+uint32_t vk_shader_set_moved(void);

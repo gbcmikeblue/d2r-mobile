@@ -116,8 +116,20 @@ VkSampler vk_pipe_dummy_sampler(void);
 // 所以这张表要能取出来，而不是在两边各算一次。
 // The merged binding table (**layout order = ascending binding**). Descriptor writing must fill its dynamic
 // offset array in that same order, so the table must be obtainable rather than computed separately on both sides.
-typedef struct { uint32_t binding, count; VkDescriptorType type; VkShaderStageFlags stage; int kind; } vk_pipe_bind;
+// set 是"阶段空间"：顶点阶段在 set 0、片元阶段在 set 1（见 vk_shader.c 装载处的改写说明）。表按
+// (set, binding) 升序——描述符写入要按同一个顺序填动态偏移数组。
+// `set` is the stage space: the vertex stage lives on set 0 and the fragment stage on set 1 (see the rewrite note at
+// the load site in vk_shader.c). The table is sorted by (set, binding) -- descriptor writing fills its dynamic offset
+// array in that same order.
+typedef struct { uint32_t set, binding, count; VkDescriptorType type; VkShaderStageFlags stage; int kind; } vk_pipe_bind;
 int vk_pipe_binds(const vk_shader *const *sh, int n, vk_pipe_bind *out, int cap);
+
+// 指定 set 的描述符集布局（0 = 顶点空间，1 = 片元空间）；该 set 没有绑定时返回一个**空布局**（不是 NULL），
+// 因为管线布局要求 set 号连续，写入侧也据此决定要绑几个 set。
+// The descriptor set layout of one set (0 = the vertex space, 1 = the fragment space); a set with no bindings yields
+// an **empty layout** (not NULL), because a pipeline layout wants consecutive set numbers and the write side uses
+// that to decide how many sets to bind.
+VkDescriptorSetLayout vk_pipe_set_layout_set(const vk_shader *const *sh, int n, uint32_t set);
 
 // 按 NVN 图元号的累计绘制次数（out 至少 16 项）：用来看那四种没有对应物的图元到底会不会出现
 // Cumulative draw count per NVN primitive number (out needs at least 16 entries): shows whether those four

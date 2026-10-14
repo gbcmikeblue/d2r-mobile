@@ -87,6 +87,26 @@ static int kind_of(uint32_t type_id, uint32_t *count_out) {
     return VK_SPV_OTHER;
 }
 
+// 改写 DescriptorSet 装饰：同一趟指令游走（同样停在第一个 OpFunction），只动 o[3] 那一个立即数。
+// 注意不改任何别的字——SPIR-V 的指令流长度不变，所以不需要重建模块的其他任何部分。
+// Rewriting the DescriptorSet decoration: the same instruction walk (also stopping at the first OpFunction) that
+// touches only the single immediate word o[3]. Nothing else is changed -- the instruction stream keeps its length, so
+// no other part of the module needs rebuilding.
+int vk_spv_force_set(uint32_t *code, size_t bytes, uint32_t new_set) {
+    if (!code || bytes < 20 || (bytes & 3)) return -1;
+    if (code[0] != SPV_MAGIC) return -1;
+    size_t nw = bytes / 4;
+    int n = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t word0 = code[i], op = word0 & 0xFFFFu, wc = word0 >> 16;
+        if (wc == 0 || i + wc > nw) return -1;
+        if (op == OP_FUNCTION) break;
+        if (op == OP_DECORATE && wc >= 4 && code[i + 2] == DEC_SET) { code[i + 3] = new_set; n++; }
+        i += wc;
+    }
+    return n;
+}
+
 const char *vk_spv_kind_name(int kind) {
     switch (kind) {
         case VK_SPV_UBO: return "uniform buffer";
