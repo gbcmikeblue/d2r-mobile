@@ -277,6 +277,7 @@ static int parse_ref(const char *txt, vk_shader *sh) {
                 if ((b = js_find(e, "cbuf_slot"))) js_int(b, &r->cbuf_slot);
                 if ((b = js_find(e, "handle"))) js_int(b, &r->handle);
                 if ((b = js_find(e, "format"))) js_str(b, r->format, sizeof r->format);
+                r->writable = (i == 1);   // i==1 即 images 数组：可写图像 | i==1 means the images array: a writable image
                 sh->ntex++;
             }
         }

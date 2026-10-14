@@ -57,6 +57,7 @@ add_library(dmhost_android STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_tex.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
   ${HOST_SRC}
   ${DM}/host/entry.S
@@ -129,6 +130,17 @@ add_executable(vk_shader_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader_probe.c 
 target_link_libraries(vk_shader_probe PRIVATE vulkan)
 target_link_options(vk_shader_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk_shader_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DM}/host ${COMPAT})
+
+# 管线层的自检：给全库每份着色器建一次描述符集布局 + 管线布局（把"每个 binding 号是什么类型、属于哪个阶段"
+# 这套解读交给驱动判），并给每个计算着色器建一条计算管线（不需要渲染状态，是补齐影子状态前唯一能闭环验的地方）。
+# Self-check of the pipeline layer: build a descriptor set layout plus pipeline layout for every shader in the
+# library (handing the reading of "which type is this binding number, which stage owns it" to the driver) and a
+# compute pipeline for every compute shader (needing no render state, which makes this the only place the chain can
+# be closed before the shadow state is complete).
+add_executable(vk_pipe_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c)
+target_link_libraries(vk_pipe_probe PRIVATE vulkan)
+target_link_options(vk_pipe_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk_pipe_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DM}/host ${COMPAT})
 
 add_executable(vk_fdmap_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_fdmap_probe.c)
 target_link_libraries(vk_fdmap_probe PRIVATE vulkan)

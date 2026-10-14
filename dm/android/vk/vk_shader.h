@@ -39,9 +39,12 @@ enum { VK_STAGE_VS = 0, VK_STAGE_PS = 1, VK_STAGE_HS = 3, VK_STAGE_DS = 4, VK_ST
 typedef struct { uint32_t binding; int32_t slot; } vk_cbuf_ref;
 // 存储缓冲：地址不在常量段里、而在 c[cb_slot][cb_offset] 指向的全局内存里 | storage buffer: its address is not in the constant segment but in global memory pointed at by c[cb_slot][cb_offset]
 typedef struct { uint32_t binding; int32_t slot, cb_slot, cb_offset; uint32_t flags; } vk_sbuf_ref;
-// 贴图/图像：句柄的来处（cbuf_slot < 0 表示句柄是常量里 baked 进来的那个数）与类型/格式，见 res.json
-// Texture/image: where the handle comes from (cbuf_slot < 0 means the handle is the number baked into the constants) plus type/format, as in res.json
-typedef struct { uint32_t binding, type, array, separate, flags; int32_t cbuf_slot, handle; char format[24]; } vk_tex_ref;
+// 贴图/图像：句柄的来处（cbuf_slot < 0 表示句柄是常量里 baked 进来的那个数）与类型/格式，见 res.json。
+// writable 区分来源：res.json 的 images 数组（可写图像 → STORAGE_IMAGE）与 textures 数组（只读 → 组合图像采样器）。
+// Texture/image: where the handle comes from (cbuf_slot < 0 means the handle is the number baked into the constants)
+// plus type/format, as in res.json. `writable` records the source: the images array of res.json (a writable image ->
+// STORAGE_IMAGE) versus the textures array (read-only -> a combined image sampler).
+typedef struct { uint32_t binding, type, array, separate, flags, writable; int32_t cbuf_slot, handle; char format[24]; } vk_tex_ref;
 
 typedef struct {
     char key[VK_SHADER_KEY_LEN + 1];
