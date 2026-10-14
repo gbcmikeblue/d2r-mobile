@@ -223,6 +223,12 @@ typedef struct {
     // 目标与清除（在开通道时物化成 loadOp）
     // Targets and clears (materialised into loadOps when the pass opens)
     const tex_t *color[8]; int ncolor; const tex_t *depth;
+    // 渲染目标各自的 view（SET_RT 载荷里带着）。不是可有可无：限定了 mip/层的 view 才是游戏真正要画的那一层，
+    // 拿底视图去当附件会画到第 0 级上去——真机上"新建子视图 0 张"就是这个缺口的表现。
+    // Each render target's own view (carried in the SET_RT payload). Not optional: a view that limits the mip range
+    // or the layers is the one the game means to draw into, and using the base view as the attachment would draw into
+    // level 0 instead -- the device's "0 sub-views created" is exactly this gap.
+    view_t cview[8]; uint8_t has_cview[8]; view_t dview; uint8_t has_dview;
     int cc_have, cc_mask; float cc[8][4];
     int cd_have, cs_have; float cd; int cs; unsigned cd_mask, cs_mask;
     int open;                        // 通道是否已开 | whether a pass is open
@@ -1083,6 +1089,7 @@ static void pass_begin(void) {
     VkCommandBuffer cb = g_inf[g_cur_slot].cb;
     VkRenderingAttachmentInfo att[8];
     int natt = 0;
+    uint32_t att_w = 0, att_h = 0;   // 附件的有效尺寸（限了 mip 的视图要右移）| the attachment's effective size (a mip-limited view shifts it right)
     for (int i = 0; i < g_rs.ncolor && i < 8; i++) {
         const tex_t *t = g_rs.color[i];
         if (!t) continue;
@@ -1092,7 +1099,7 @@ static void pass_begin(void) {
         // (p_set_rt carries cview/has_cview and the replay layer does not wire it up), and once they are, this must
         // pass them down -- an attachment whose view limits the mip range also has a different size, which has to be
         // handled along with it.
-        VkImageView iv = vk_tex_view(t, NULL);
+        VkImageView iv = vk_tex_view(t, g_rs.has_cview[i] ? &g_rs.cview[i] : NULL);
         if (!iv) continue;
         vk_tex_transition(t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, cb);
         vk_tex_gpu_written(t);
@@ -1104,12 +1111,22 @@ static void pass_begin(void) {
             .clearValue = { .color = { { clr ? g_rs.cc[i][0] : 0.f, clr ? g_rs.cc[i][1] : 0.f,
                                         clr ? g_rs.cc[i][2] : 0.f, clr ? g_rs.cc[i][3] : 0.f } } } };
         att[natt++] = a;   // 布局由纹理层记着（vk_tex_transition），这里不再单独维护 | layouts are tracked by the texture layer (vk_tex_transition), so nothing extra is kept here
+        // 限了 mip/层的视图，附件尺寸不是底图尺寸：有效尺寸 = 底图 >> base_level（层范围不影响二维尺寸）
+        // A view that limits mip levels or layers does not have the base image's size: the effective size is the
+        // base shifted right by base_level (the layer range does not affect the 2D size)
+        uint32_t al = (g_rs.has_cview[i] && g_rs.cview[i].set_levels && g_rs.cview[i].base_level > 0)
+                      ? (uint32_t)g_rs.cview[i].base_level : 0;
+        uint32_t aw = t->d.width >> (al > 31 ? 0 : al), ah = t->d.height >> (al > 31 ? 0 : al);
+        if (!aw) aw = 1;
+        if (!ah) ah = 1;
+        if (!att_w || aw < att_w) att_w = aw;
+        if (!att_h || ah < att_h) att_h = ah;
     }
     if (!natt && !g_rs.depth) return;
     VkRenderingAttachmentInfo datt = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     int has_d = 0;
     if (g_rs.depth) {
-        VkImageView dv = vk_tex_view(g_rs.depth, NULL);   // 同上：深度附件的 view 还没接 | likewise: the depth attachment's view is not wired up yet
+        VkImageView dv = vk_tex_view(g_rs.depth, g_rs.has_dview ? &g_rs.dview : NULL);
         if (dv) {
             vk_tex_transition(g_rs.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, cb);
             vk_tex_gpu_written(g_rs.depth);
@@ -1131,6 +1148,14 @@ static void pass_begin(void) {
     if (g_rs.nsc) { uint32_t sw = (uint32_t)(g_rs.sc[0].offset.x + (int)g_rs.sc[0].extent.width), sh = (uint32_t)(g_rs.sc[0].offset.y + (int)g_rs.sc[0].extent.height);
                     if (!w || sw < w) w = sw; if (!h || sh < h) h = sh; }
     if (!w || !h) { w = 1; h = 1; }
+    // 渲染区**必须**落在附件里（Vulkan 的要求）。限了 mip 的附件比底图小，而游戏设的视口是按它要画的那一级给的
+    // ——两者本该一致；不一致就在这里钳住并报一次，否则会变成静默的 GPU 错误（真机没有校验层，看不见）。
+    // The render area **must** lie inside the attachment (a Vulkan requirement). A mip-limited attachment is smaller
+    // than the base image while the viewport the game set is for the level it means to draw -- the two should agree,
+    // and any disagreement is clamped and reported once here rather than becoming a silent GPU error (the device has
+    // no validation layers to show it).
+    if (att_w && w > att_w) { static int said; if (!said++) LOG("【黄】渲染区宽 %u 超出附件 %u（限了 mip 的视图）：已按附件钳住", w, att_w); w = att_w; }
+    if (att_h && h > att_h) { static int said; if (!said++) LOG("【黄】渲染区高 %u 超出附件 %u（限了 mip 的视图）：已按附件钳住", h, att_h); h = att_h; }
     ri.renderArea.extent = (VkExtent2D){ w, h };
     if (g_rs.nvp) vkCmdSetViewport(cb, 0, (uint32_t)g_rs.nvp, g_rs.vp);
     if (g_rs.nsc) vkCmdSetScissor(cb, 0, (uint32_t)g_rs.nsc, g_rs.sc);
@@ -1327,8 +1352,15 @@ void mtl_exec(const uint8_t *p) {
             const p_set_rt *r = (const p_set_rt *)a;
             pass_end();
             g_rs.ncolor = r->n < 0 ? 0 : (r->n > 8 ? 8 : r->n);
-            for (int i = 0; i < 8; i++) g_rs.color[i] = i < g_rs.ncolor ? r->color[i] : NULL;
+            for (int i = 0; i < 8; i++) {
+                g_rs.color[i] = i < g_rs.ncolor ? r->color[i] : NULL;
+                // 视图一并存下来（见 rstate_t 里那段说明）：渲染目标那一层常常是"底图的某个 mip"
+                g_rs.cview[i] = r->cview[i];
+                g_rs.has_cview[i] = r->has_cview[i];
+            }
             g_rs.depth = r->depth;
+            g_rs.dview = r->dview;
+            g_rs.has_dview = r->has_dview;
             g_rs.cc_have = 0; g_rs.cc_mask = 0; g_rs.cd_have = 0; g_rs.cs_have = 0;
             break; }
         case OP_CLEAR_COLOR: {
