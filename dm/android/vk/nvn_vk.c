@@ -801,6 +801,71 @@ static int desc_buf_range(const vk_shader *sh, const vk_pipe_bind *b, uint64_t *
 // Write every binding for one set. The return value is how many dynamic offsets were filled in (-1 means it cannot
 // be written and the caller skips the draw). The dynamic offsets are in the same order as the vk_pipe_binds table,
 // which is what vkCmdBindDescriptorSets requires.
+// 贴图句柄来处的取证（一次性，写进日志）。res.json 说"句柄从常量里读"，但编码没定下来
+// （全库抽样 1205 条 cbuf_slot 全是 0x30002，而 handle 是 0x101D815A 这类客体地址）。两条路一起试：
+//   ① 把 res.json 里那个 handle 当**客体地址**读 4 字节——它可能就是"句柄所在的地址"；
+//   ② 扫该阶段绑定的常量段，找"低 20 位是已注册贴图号"的 32 位字——找到了既证明编码、又直接给出该读的值。
+// 这是"用真机的数定案"而不是猜（与仓库一贯做法一致）。
+// First-hand evidence for where a texture handle comes from (once, into the log). res.json says "the handle is read
+// from the constants" but the encoding is not settled (a library-wide sample shows all 1205 cbuf_slot values are
+// 0x30002 while handle is a guest address like 0x101D815A). Two routes are tried together:
+//   1. read 4 bytes at the handle value treated as a **guest address** -- it may be "the address the handle lives at";
+//   2. scan the constants bound for that stage for a 32-bit word whose low 20 bits are a registered texture id --
+//      finding one both proves the encoding and hands over the value to read.
+// This settles it with the device's numbers rather than guessing (the repository's usual way).
+static void desc_tex_probe(const vk_shader *st, const vk_tex_ref *tr) {
+    static int done;
+    if (!tr || done >= 3) return;
+    done++;
+    int stg = st->stage >= 0 && st->stage < 6 ? st->stage : 0;
+    LOG("【查】贴图句柄：binding %u、cbuf_slot=%d、handle=0x%x、阶段 %d、已注册贴图 %llu 项",
+        tr->binding, tr->cbuf_slot, (unsigned)tr->handle, stg, (unsigned long long)atomic_load(&g_treg_n));
+    // 该阶段到底绑了什么。早先我只打印了前三个槽就写下"一张都没绑"——那是个**坏样本**：槽号可以远大于 3，
+    // 于是"没绑"这个结论可能是错的。这里改成普查（贴图 128 槽、采样器 128 槽、图像 32 槽）。
+    // What this stage actually binds. Earlier I printed only the first three slots and concluded "nothing bound" --
+    // that was a **bad sample**: slot numbers can be far above 3, so the conclusion could be wrong. This does a full
+    // census instead (128 texture slots, 128 sampler slots, 32 image slots).
+    int nt = 0, ns = 0, ni = 0;
+    uint64_t t0 = 0, s0 = 0, i0 = 0;
+    for (int k = 0; k < 128; k++) if (g_rs.tex[stg][k]) { if (!nt) t0 = g_rs.tex[stg][k]; nt++; }
+    for (int k = 0; k < 128; k++) if (g_rs.samp[stg][k]) { if (!ns) s0 = g_rs.samp[stg][k]; ns++; }
+    for (int k = 0; k < 32; k++) if (g_rs.img[stg][k]) { if (!ni) i0 = g_rs.img[stg][k]; ni++; }
+    LOG("【查】阶段 %d 绑了：贴图 %d 张、采样器 %d 个、图像 %d 张；贴图池 %s", stg, nt, ns, ni, g_rs.have_texpool ? "已设" : "未设");
+    if (nt) LOG("【查】首个贴图句柄 0x%llx（低 20 位 %u、采样器号 %llu）→ 注册表 %s", (unsigned long long)t0,
+                (unsigned)(t0 & 0xfffffu), (unsigned long long)(t0 >> 20), treg_of((uint32_t)t0) ? "命中" : "不在");
+    if (ns) LOG("【查】首个采样器句柄 0x%llx（低 20 位 %u）", (unsigned long long)s0, (unsigned)(s0 & 0xfffffu));
+    if (ni) LOG("【查】首张图像句柄 0x%llx", (unsigned long long)i0);
+    uint32_t ha = (uint32_t)tr->handle;
+    void *hb = NULL; uint64_t ho = 0;
+    if (ha && mtl_addr(ha, 4, &hb, &ho)) {
+        uint32_t v = 0;
+        memcpy(&v, (const void *)(uintptr_t)ha, 4);
+        LOG("【查】handle 当地址可读：0x%x（低 20 位 %u、采样器号 %u）→ 注册表 %s",
+            v, v & 0xfffffu, v >> 20, treg_of(v) ? "命中" : "不在");
+    } else {
+        LOG("【查】handle 不在任何池里：0x%x", ha);
+    }
+    for (int s = 0; s < 16; s++) {
+        uint64_t a = g_rs.ubo[stg][s].addr, sz = g_rs.ubo[stg][s].size;
+        if (!a || !sz) continue;
+        void *bb = NULL; uint64_t bo = 0;
+        if (!mtl_addr(a, 1, &bb, &bo)) { LOG("【查】常量槽 %d 地址 %llx 不在池里", s, (unsigned long long)a); continue; }
+        size_t lim = sz > 4096 ? 4096 : (size_t)sz;
+        const uint8_t *p = (const uint8_t *)(uintptr_t)a;
+        int hits = 0;
+        for (size_t k = 0; k + 4 <= lim; k += 4) {
+            uint32_t w = 0;
+            memcpy(&w, p + k, 4);
+            if (!w) continue;
+            if (treg_of(w)) {
+                if (hits < 4) LOG("【查】常量槽 %d 偏移 %zu：0x%x（贴图号 %u、采样器号 %u）命中注册表", s, k, w, w & 0xfffffu, w >> 20);
+                hits++;
+            }
+        }
+        LOG("【查】常量槽 %d：地址 %llx、%llu 字节，扫 %zu 字节、命中 %d 处", s, (unsigned long long)a, (unsigned long long)sz, lim, hits);
+    }
+}
+
 static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n,
                       const vk_pipe_bind *b, int nb, uint32_t *dyn) {
     // 一屏最多 64 条绑定，用静态数组（mtl_exec 递归，不能用大栈帧 | see the note on gfx_state_fill）
@@ -865,6 +930,7 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 const treg_e *e = treg_of((uint32_t)tr->handle);
                 if (e) texv = vk_tex_view(&e->t);
             }
+            if (!texv && tr && tr->cbuf_slot >= 0) desc_tex_probe(st, tr);   // 编码取证（前三次）| encoding forensics (first three)
             if (!texv) {
                 // 用**自己的**计数器：早先和图"拿不到缓冲地址"共用 g_desc_blank，前 8 条被 UBO 的空白占掉，
                 // 于是贴图这条诊断在真机上一行都没打出来（查了半天）。
