@@ -27,6 +27,15 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+#if defined(__ANDROID__)
+// 安卓侧没有 mach：现场导出改读 /proc（见 thr_proc_dump）。这三个头只为它加。
+// Android has no mach: the state dump reads /proc instead (see thr_proc_dump). These three headers exist for it only.
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static pid_t and_tid(void) { return (pid_t)syscall(__NR_gettid); }
+#endif
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -44,6 +53,7 @@ typedef struct thr {
     uint64_t born_ns, exit_ns; uint32_t born_tick, exit_tick;   // 建立 / 退出的时刻与当时的游戏拍（现场导出用：作业工人是不是在卡住前退的） | Time of creation / exit and the game tick at that time (for the state dump: did the job worker exit before the stall)
     int started, exited, cancel;
     pthread_t pt; pthread_cond_t cv;
+    pid_t tid;                 // 宿主线程号（安卓侧现场导出按 /proc/self/task/<tid> 读；mach 那套在安卓上只打零） | Host thread id (the Android state dump reads /proc/self/task/<tid>; mach's version only printed zeros here)
     // 当前等待：kind 0=无 1=锁 2=条件 3=地址 4=同步对象
     // Current wait: kind 0=none 1=lock 2=condition 3=address 4=synchronization object
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
@@ -176,6 +186,9 @@ static void *thread_main(void *p) {
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     t->mport = pthread_mach_thread_np(pthread_self());
+#if defined(__ANDROID__)
+    t->tid = and_tid();   // 现场导出要用（见 thr_proc_dump）| Needed by the state dump (see thr_proc_dump)
+#endif
     crash_thread_init();
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
@@ -208,6 +221,9 @@ uint32_t svc_thread_main_init(void) {
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
+#if defined(__ANDROID__)
+    t->tid = and_tid();   // 现场导出要用（见 thr_proc_dump）| Needed by the state dump (see thr_proc_dump)
+#endif
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
@@ -376,6 +392,42 @@ static void thr_bt(thr_t *t) {
     }
     thread_resume(t->mport);
 }
+#if defined(__ANDROID__)
+// 安卓侧的"这个线程在干什么"：读 /proc/self/task/<tid>/ 的三样。
+//   · stat：状态字符（R 在跑 / S 睡眠 / D 不可中断等待）；
+//   · wchan：内核里的等待点符号名（futex_wait_queue_me、io_schedule …）—— "卡在哪一类等待"一眼可见；
+//   · syscall：**阻塞在系统调用里**时给出 号/参数/栈指针/PC（PC 就是判断它卡在哪个库的关键），
+//     在用户态空转时只给 "running" —— 这两种情形正是最需要分开的。
+// 为什么不用 mach 那套：`thread_get_state` / `module_of` 在安卓上不存在，原来那条路**静默打零**，
+// 于是"客体停住"时只有"最近 svc"可看（真机实测：主线程最近 svc 0x1a，却看不出它在哪个函数里空转）。
+// What a thread is doing, the Android way: three things from /proc/self/task/<tid>/.
+//   - stat: the state character (R running / S sleeping / D uninterruptible);
+//   - wchan: the kernel wait-point symbol (futex_wait_queue_me, io_schedule, ...), so "which kind of wait" is visible
+//     at a glance;
+//   - syscall: when **blocked inside a syscall**, the number, arguments, stack pointer and PC (the PC is what tells
+//     which library it is stuck in); when spinning in user code it says only "running" -- and telling those two apart
+//     is exactly what is needed.
+// Why not mach: `thread_get_state` / `module_of` do not exist on Android and that path **silently printed zeros**, so a
+// stopped guest left only "last svc" to look at (measured: the main thread's last svc was 0x1a and there was no way to
+// see which function it was spinning in).
+static void proc_thread_line(const char *tag, pid_t tid) {
+    char path[64], buf[512], state = '?', wchan[80] = "", sysc[224] = "";
+    if (tid > 0) {
+        snprintf(path, sizeof path, "/proc/self/task/%d/stat", (int)tid);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) { ssize_t n = read(fd, buf, sizeof buf - 1); close(fd); if (n > 0) { buf[n] = 0; char *rp = strrchr(buf, ')'); if (rp && rp[1] == ' ') state = rp[2]; } }
+        snprintf(path, sizeof path, "/proc/self/task/%d/wchan", (int)tid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) { ssize_t n = read(fd, wchan, sizeof wchan - 1); close(fd); if (n > 0) { wchan[n] = 0; char *nl = strchr(wchan, '\n'); if (nl) *nl = 0; } else wchan[0] = 0; }
+        snprintf(path, sizeof path, "/proc/self/task/%d/syscall", (int)tid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) { ssize_t n = read(fd, sysc, sizeof sysc - 1); close(fd); if (n > 0) { sysc[n] = 0; char *nl = strchr(sysc, '\n'); if (nl) *nl = 0; } else sysc[0] = 0; }
+    }
+    fprintf(stderr, "[dm]   %s（tid %d）：状态 %c、内核等待 %s、系统调用 %s\n", tag, (int)tid, state,
+            wchan[0] ? wchan : "（无）", sysc[0] ? sysc : "（读不到）");
+}
+#endif
+
 void svc_thread_dump(void) {
     static const char *kinds[] = {"运行/未在等", "锁", "条件变量", "地址", "同步对象"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
@@ -403,8 +455,41 @@ void svc_thread_dump(void) {
                 m ? m->name : "?", m ? t->last_lr - (uint64_t)m->base : t->last_lr);
         if (have_raw) { char hx[200]; int q = 0; for (int i = 0; i < 64; i += 4) q += snprintf(hx + q, sizeof hx - q, "%08x ", *(uint32_t *)(raw + i));
                         fprintf(stderr, "[dm]   %#x 所等对象 %#llx 起 64 字节: %s\n", t->handle, t->waddr & ~0xfull, hx); }
+#if defined(__ANDROID__)
+        { char tg[24]; snprintf(tg, sizeof tg, "%#x", t->handle); proc_thread_line(tg, t->tid); }   // 安卓：/proc 三样（状态 / 内核等待点 / 系统调用与 PC）| Android: the three /proc items (state / kernel wait point / syscall and PC)
+#else
         thr_bt(t);
+#endif
     }
+#if defined(__ANDROID__)
+    // 宿主自建线程（预取、Granny 后台、图形出图、音频、日志泵…）：不在客体线程表里，按 /proc/self/task 枚举，
+    // 每个 tid 一行（名字 / 状态 / 内核等待点 / 系统调用与 PC）。原来那段走 mach 的 task_threads，在安卓上是**空跑**，
+    // 于是一份现场里只有客体线程 —— 而"前端那条心跳也停了"恰恰要从宿主线程这一侧看。
+    // Host-created threads (prefetch, Granny background, graphics present, audio, the log pump, ...): not in the guest
+    // thread table, so they come from /proc/self/task, one line per tid (name / state / kernel wait point / syscall and
+    // PC). The old block went through mach's task_threads and did **nothing** on Android, so a dump held guest threads
+    // only -- while "the front end's heartbeat stopped too" is exactly a host-thread question.
+    {
+        DIR *d = opendir("/proc/self/task"); int printed = 0;
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL && printed < 48) {
+                int tid = atoi(de->d_name);
+                if (tid <= 0) continue;
+                int guest = 0; for (thr_t *t = g_all; t; t = t->all) if (t->tid == tid) { guest = 1; break; }
+                if (guest) continue;   // 客体线程已经按句柄逐条报过 | guest threads were already reported one by one, by handle
+                char path[64], comm[64] = "", tg[96];
+                snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
+                int fd = open(path, O_RDONLY);
+                if (fd >= 0) { ssize_t n = read(fd, comm, sizeof comm - 1); close(fd); if (n > 0) { comm[n] = 0; char *nl = strchr(comm, '\n'); if (nl) *nl = 0; } }
+                snprintf(tg, sizeof tg, "宿主线程「%s」", comm);
+                proc_thread_line(tg, (pid_t)tid);
+                printed++;
+            }
+            closedir(d);
+        }
+    }
+#else
     // 宿主自建线程（预取、Granny 后台、图形出图、音频等）：不在客体线程表里，按 mach 线程枚举，dladdr 符号化前 12 帧
     // Threads created by the host itself (prefetch, Granny background, graphics present, audio, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
     thread_act_array_t ths; mach_msg_type_number_t nth = 0;
@@ -433,6 +518,7 @@ void svc_thread_dump(void) {
         }
         vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
     }
+#endif
 }
 
 int svc_thread(int num, uint64_t *regs) {

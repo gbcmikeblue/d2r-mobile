@@ -67,7 +67,17 @@ static void *watchdog_main(void *arg) {
             LOG("【红】看门狗：第 %llu 秒起无进展，卡在 拍 %u / 阶段 %s", (unsigned long long)sec,
                 atomic_load(&g_watch_tick), g_watch_stage[idx]);
             if (g_dump_hook) g_dump_hook();
-            if (g_wait_dump) g_wait_dump();   // 图形侧所有阻塞等待点的状态（nvn_mtl.m 初始化时注册） | State of all blocking wait points on the graphics side (registered when nvn_mtl.m initializes)
+            if (g_wait_dump) g_wait_dump();   // 图形侧所有阻塞等待点的状态（nvn_mtl.m / nvn_vk.c 初始化时注册） | State of all blocking wait points on the graphics side (registered when nvn_mtl.m / nvn_vk.c initializes)
+            // 退出前给日志一点时间：安卓那边宿主 stderr 是**管道**，落盘由另一条线程（app 的日志泵）做，
+            // 而 _exit 不会等它 —— 实测转储的**尾巴**被整段切掉（"等待点"那行正好在尾巴上）。
+            // 苹果侧走不到这里（TARGET_OS_OSX 那次 sample 已经等过一秒），所以这只是安卓的坑。
+            // Give the log a moment before exiting: on Android the host's stderr is a **pipe** and writing it to the
+            // file is done by another thread (the app's log pump), which _exit does not wait for -- measured as the
+            // **tail** of the dump being cut off entirely (the "wait points" line sits exactly at the tail). Apple
+            // never reaches this (its TARGET_OS_OSX sample already waited a second), so this is an Android-only trap.
+#if !TARGET_OS_OSX
+            usleep(400000);
+#endif
 #if TARGET_OS_OSX
             { const char *d = getenv("DM_WATCH_SAMPLE");   // Mac 诊断：卡住时对自己采样 1 秒，线程栈写到该路径 | Mac diagnostics: when stuck, sample itself for 1 second and write the thread stacks to this path
               if (d) { char c[1200]; snprintf(c, sizeof c, "/usr/bin/sample %d 1 -f '%s' >/dev/null 2>&1", (int)getpid(), d); if (system(c)) LOG("看门狗：采样失败"); else LOG("看门狗：线程栈已写 %s", d); } }

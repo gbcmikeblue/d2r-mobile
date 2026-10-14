@@ -30,6 +30,22 @@ VkInstance vk_instance(void);
 VkDevice vk_dev(void);
 VkQueue vk_queue(void);
 uint32_t vk_queue_family(void);
+
+// 队列的外部同步。Vulkan 要求 vkQueueSubmit / vkQueueWaitIdle / vkQueuePresentKHR / vkAcquireNextImageKHR
+// 对**同一个 VkQueue** 由调用方串行化，而这里天然是两个线程在用同一条队列：客体在后台线程提交（回放层），
+// 前端在主线程上屏与读回。少了这把锁，驱动内部会偶发互锁，真机上看到的三种形态其实是同一件事——
+// 查看器一开就崩（主线程读回撞客体提交）、前端启动约 3 秒后不再刷新、客体跑到第 70 次出图后停住。
+// 用法：只在"提交/等待队列空闲/取图像/上屏"这几处成对加锁，别把长时间的计算或等待放进临界区。
+// External synchronisation for the queue. Vulkan requires the caller to serialise vkQueueSubmit /
+// vkQueueWaitIdle / vkQueuePresentKHR / vkAcquireNextImageKHR on **one VkQueue**, and here two threads use the same
+// queue by construction: the guest submits on a worker thread (the replay layer) while the front end presents and
+// reads back on the main thread. Without this lock the driver deadlocks intermittently, and the three shapes seen on
+// the device are really one thing: the viewer crashing the moment it is turned on (main-thread readback colliding
+// with a guest submit), the front end stopping about 3 s after start, and the guest stopping after present 70.
+// Usage: take it around submitting, waiting for the queue to go idle, acquiring an image and presenting, and never
+// around long computations or waits.
+void vk_queue_lock(void);
+void vk_queue_unlock(void);
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void);
 
 // 在满足 need_bits 的类型里找属性最贴近 want 的一个；找不到返回 UINT32_MAX。

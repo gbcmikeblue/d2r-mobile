@@ -380,8 +380,13 @@ static int one_begin(void) {
 static int one_end(void) {
     if (vkEndCommandBuffer(g_cb) != VK_SUCCESS) return 0;
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_cb };
-    if (vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
+    // 提交与"等队列空闲"是一件事（一次性命令缓冲的语义），整段拿队列锁（见 vk_device.h）
+    // The submit and the queue-idle wait are one thing for a one-off command buffer, so the whole span takes the
+    // queue lock (see vk_device.h)
+    vk_queue_lock();
+    if (vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) { vk_queue_unlock(); return 0; }
     VkResult r = vkQueueWaitIdle(vk_queue());
+    vk_queue_unlock();
     if (r != VK_SUCCESS) { LOG("【红】上传命令等待失败 VkResult %d", (int)r); return 0; }
     return 1;
 }
@@ -803,7 +808,9 @@ int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch,
     // 拷之前先把队列排空：要读的是 GPU 已经写完的画面（与苹果侧截图前那次 mtl_finish_gpu 同一个意思）
     // Drain the queue before copying: the point is to read a picture the GPU has finished (the same meaning as the
     // mtl_finish_gpu before Apple's screenshot)
+    vk_queue_lock();
     vkQueueWaitIdle(vk_queue());
+    vk_queue_unlock();
     int ok = 0;
     if (one_begin()) {
         VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -931,7 +938,9 @@ int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a) {
         if (!said++) LOG("【黄】对照实验：序号 %llu 是深度/模板贴图，vkCmdClearColorImage 用不得，跳过", (unsigned long long)serial);
         return 0;
     }
+    vk_queue_lock();
     vkQueueWaitIdle(vk_queue());
+    vk_queue_unlock();
     int ok = 0;
     if (one_begin()) {
         VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,

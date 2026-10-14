@@ -20,6 +20,7 @@
 #include <android/native_window.h>   // ANativeWindow（surface 的窗口类型）| ANativeWindow, the surface's window type
 #include "vk_device.h"
 #include "dm.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,6 +45,14 @@ VkInstance vk_instance(void) { return g_inst; }
 VkDevice vk_dev(void) { return g_dev; }
 VkQueue vk_queue(void) { return g_queue; }
 uint32_t vk_queue_family(void) { return g_qfi; }
+
+// 队列的外部同步（说明见 vk_device.h）：一把进程内的锁，提交 / 等队列空闲 / 取图像 / 上屏都走它。
+// 做成普通互斥量即可：临界区里只有一次驱动调用，不在里面做别的活。
+// The queue's external synchronisation (see vk_device.h): one process-wide lock taken by submit / queue-idle waits /
+// image acquisition / present. A plain mutex is enough -- the critical section holds a single driver call and nothing else.
+static pthread_mutex_t g_qmu = PTHREAD_MUTEX_INITIALIZER;
+void vk_queue_lock(void) { pthread_mutex_lock(&g_qmu); }
+void vk_queue_unlock(void) { pthread_mutex_unlock(&g_qmu); }
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void) { return &g_mem; }
 uint32_t vk_zero_copy_type(void) { return g_zero_copy; }
 

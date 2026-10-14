@@ -946,3 +946,67 @@ RGBA/BGRA, `RGBA16F`, `RGBA16_UNORM`, `RGBA32F`, `B10G11R11_UFLOAT` -- the numbe
 not guessed); every screenshot reports **mean/min/max luminance** (so "white" and "black" are numbers in the log); caching
 the staging buffer took each readback from about 0.45 s to negligible; and a scan only covers 256x256 and up (a picture
 cannot be a 16x24 sprite, and every read waits on the queue once).
+
+### M3 step 3: from "not one pixel lands" to "it really draws into the target" -- seven traps (2026-10-14)
+
+This round took apart "the draws go out yet the targets read all zero". Two **no-code** control experiments first pinned
+the scope down: `DM_GFX_PROBE=<serial>` (clear one target to a known blue, then read it back) read a **luminance of 152.0**,
+exactly the mean of (0, 201, 255) that the clear colour (0, 0.6, 1.0) gamma-maps to, so **the readback chain is sound and
+"all zero" is real**; `DM_NO_DEPTH_TEST=1` stayed all zero, so the depth test is not the gate. Then, one by one:
+
+| # | Symptom (device readings) | Root cause | Fix | Verified by |
+|---|---|---|---|---|
+| 1 | 348k draws, all-zero targets, zero errors | **The Android side had no NVN default state**: the shadow is zero-initialised while `gfx_state_fill` reads it unconditionally, so the **write mask is 0 (not one channel written)** and the depth range is `[0,0]`. The game may rely on NVN's defaults, which is exactly why Apple wrote `state_reset()` | Add `state_defaults()` (item for item with `nvn_mtl.m:2306-2314`), applied at the **first `mtl_exec`** (the same place Apple uses); `OP_VIEWPORTS` no longer reads the `v[4]/v[5]` that were never recorded, near/far come only from `SetDepthRange` (default `[0,1]`) | Serial 27 went from **0 to 255** (it has content now) |
+| 2 | Whole runs of "1 target ... **not issued**" in the log | **A pass only opened on a clear**: the machinery at the head of the file says a pass opens at the first clear **or draw**, but only `CLEAR_COLOR`/`CLEAR_DS` did, so in streams shaped `SET_RT -> barrier -> draws` the draws were dropped wholesale | Call `pass_begin()` from the draw path, and re-supply the dynamic viewport/scissor when a pass opens (`VIEWPORTS`/`SCISSOR` arrived while it was closed) | Dropped draws **48% -> 31%** |
+| 3 | `binding N (uniform buffer): no buffer address (address 0, slot resolution N): writing a blank` | **The constant slot is not the number res.json hands over.** The rule (same source Apple uses, `reflect()` in `dm/gfx/tools/dmsh_build.py`): a name like `fp_c3` means NVN constant slot = **that number minus 3**; a `1` in a name is the special `c1` bank and a `2` the driver bank, neither a plain UBO; no `cbuf` entry at all means Ryujinx's `support_buffer`. Checked against the real SPIR-V names: `fp_c3` -> slot 0, `fp_c13` -> slot 10, while the game binds **0, 3 and 10** (slot bitmap `0x409`) -- we looked up 1/3/13 and only 3 collided by luck | `desc_buf_range` now follows the rule; two 64 KB **special constant segments** are built (`support_buffer` with `render_scale = 1`, since 0 would make the shader scale by 0; `c1`/driver bank start all zero -- the real `c1` data lives in the control segment, see "what is left") | UBO blanks **gone**; per-stage bind counts 6/6/3 -> **1094/3367/695** |
+| 4 | The viewer crashes the moment it is on (in the driver, `vk_tex_view`), the front end stops refreshing at about 3 s, the guest stops mid-run | **Two threads share one VkQueue with no external synchronisation.** Vulkan requires `vkQueueSubmit` / `vkQueueWaitIdle` / `vkAcquireNextImageKHR` / `vkQueuePresentKHR` to be serialised by the caller on one queue, while here the guest submits on a worker thread and the front end presents and reads back on the main thread. The three shapes are one thing | `vk_device.c` gains `vk_queue_lock/unlock`, taken around submitting, queue-idle waits, image acquisition and present | see below (this one is not fully pinned down yet) |
+| 5 | After fixing #4, **both sides stopped together** (the wait-point dump showed the guest "recording, pass open" and the front end's one-second heartbeat gone) | **Image acquisition must not hold the queue lock for long**: with the screen off, or the compositor busy, a swapchain can have no image available for a long time, and while that holds the lock every guest submit piles up behind it | `vkAcquireNextImageKHR` now gets a **100 ms timeout**; on timeout the frame is dropped and the next one retries | to be re-checked with a longer run |
+
+**Two traps in the instruments and documents themselves** (worth remembering, or the next stall will have no scene again):
+
+6. **The Android side never registered a "wait-point dump".** Apple registers `mtl_wait_state_dump` during device
+   initialisation (`nvn_mtl.m:275`) and Android did not, so when the guest stopped the log held nothing but heartbeats and
+   "where is it stuck" was unanswerable. `nvn_vk.c` now has one of the same name and meaning: in-flight slots and the fence
+   value each holds, which slot is recording, whether a pass is open, and the submit / present counts. **Its first use read
+   out "the guest is stuck recording with a pass open".**
+7. **The watchdog is off by default, and the tail of its dump is lost to `_exit`.** Without `DM_WATCH_STALL` it does not
+   look at all (the product default, see `crash.c:314-325`); and when it does fire it prints the whole scene and then
+   `_exit`s, while on Android the host's stderr is a **pipe** written to the file by another thread (the app's log pump) --
+   measured as the **tail of the dump being cut off entirely** (the "wait points" line sits exactly there). Fix: `crash.c`
+   gives the log 400 ms before exiting (Android branch only).
+
+8. **On Android there is wait state but no PC / backtrace.** In the same dump the thread lines (what each thread waits on and
+   where its last svc came from) are good, but the `pc=... x19=...` register line and the backtrace that follow are **all
+   zero** -- because `thr_bt` (`hle_thread.c`) uses mach's `thread_suspend` / `thread_get_state` / `module_of`, which Android
+   does not have, and it does not report the failure, so it silently prints zeros. Reading "the guest is running guest code"
+   now rests on two fields only: `last svc` and `lr=module+offset`.
+   **Fixed**: `hle_thread.c` gained an Android branch (`proc_thread_line`) that reports three things per guest thread from
+   `/proc/self/task/<tid>/` -- the state character from `stat` (R running / S sleeping / D uninterruptible), the kernel
+   wait-point symbol from `wchan` (`futex_wait_queue`, `__arm64_sys_nanosleep`, `pipe_read`, ...), and the **number,
+   arguments, stack pointer and PC** from `syscall` (present only while blocked inside a syscall; a pure user-space spin
+   reports just `running`). **Those are exactly the two cases that need telling apart.** Host-created threads are listed as
+   well (the old block went through mach's `task_threads` and did nothing here, so a dump held guest threads only).
+
+**It classified "the guest stopped" immediately (real device, 2026-10-14)**: stopped at `CharacterCreate:Hover:Barbarian` --
+
+| Thread | Reading | Meaning |
+|---|---|---|
+| guest main thread 0x1001 | **state R, `syscall running`** | **a pure user-space spin**, in no syscall or wait |
+| other guest threads | `S` in `futex_wait_queue` / `__arm64_sys_nanosleep` | all asleep (normally idle) |
+| our side (wait points) | no pass open, nothing recording, 1/8 slots in flight | the replay layer is idle and owes nobody |
+| process main thread / log pump | `S` in `do_epoll_wait`, `R` in `pipe_read` | Android's main thread and the log pump, both waiting normally |
+
+In other words this is **not "stuck in the driver or a lock"** (that would be S + futex) but **the game itself spinning in user
+space, waiting for a job that never completes** -- the same shape as the state documented in Apple's comment (the main thread
+spinning in the job pool's "help while waiting", see the `thr_bt` note in `nvn_mtl.m`). Getting its PC is the next step:
+Android has no ptrace permission, so the way in is **signal sampling** (send `SIGPROF` to the thread, read the pc out of the
+`ucontext` in the handler, symbolize module + offset).
+
+**A hypothesis that was disproved (worth recording so it is not walked again)**: when the device stopped at
+`CharacterCreate:Hover:Barbarian`, it looked like the guest was **loading game data and stuck on disk I/O**. Two checks were
+run: (1) `DM_WATCH_STALL=0` (watchdog records but does not kill) over a long run -- the counters **did not recover**, so it is
+a real stop and not slowness; (2) the harder one: after the stop **even the front end's one-second heartbeat was gone** (70+
+seconds of silence) -- a guest waiting on I/O would not stop the front end. The scene is: the main guest thread with
+`last svc 0x1a` (ArbitrateLock), `waiting: running/not waiting`, in-flight slots 1/8, **no pass open**, no crash. In other
+words **both threads stopped together inside some driver or lock wait**, and the next step is to give Android the PC /
+backtrace instrument before going further in.

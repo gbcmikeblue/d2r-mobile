@@ -154,9 +154,11 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
 }
 
 // 队列上全部命令完成：安卓这边交出队列权（Vulkan 的等价物就是等队列空闲）。
-// Everything on the queue has completed: on Android this is simply waiting for the queue to go idle.
-void mtl_drain(void) { if (vk_dev()) vkQueueWaitIdle(vk_queue()); }
-void mtl_finish(void) { if (vk_dev()) vkQueueWaitIdle(vk_queue()); }
+// 等队列空闲也要外部同步（见 vk_device.h）：这个调用随时可能从前端线程发出来。
+// Everything on the queue has completed: on Android this is simply waiting for the queue to go idle. That wait needs
+// the external synchronisation too (see vk_device.h), since it can come from the front-end thread at any moment.
+void mtl_drain(void) { if (vk_dev()) { vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
+void mtl_finish(void) { if (vk_dev()) { vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
 
 // 统计出参：waits 类的计数还没做（提交落地后才有），池子数是现成的事实。
 // Statistics out-parameters: the waits counters do not exist yet (they arrive with submission), the pool
@@ -271,6 +273,46 @@ typedef struct {
 // 模板掩码的默认值：NVN / GL 的默认是全通，苹果侧同样按 0xff 起步（nvn_mtl.m 的状态复位）
 // Stencil mask defaults: NVN / GL default to all-ones, and the Apple side starts at 0xff too (its state reset)
 static rstate_t g_rs = { .st_vmask = { 0xff, 0xff }, .st_wmask = { 0xff, 0xff } };
+
+// NVN 的默认状态：逐项与苹果侧的 state_reset（nvn_mtl.m「绘制状态」一节，能跑的那份实现）对齐，
+// 在第一次 mtl_exec 时生效——苹果侧也正是这么做的，见其 mtl_exec 开头那句 state_reset()。
+// 为什么必须显式给：gfx_state_fill 是**无条件**读这份影子的，零初始化于是把"游戏没设过的状态"变成
+// "写掩码 0（一个通道都不写）"与"深度范围 [0,0]"，接下来绘制就会静默地一个像素都不落——真机上
+// "34 万次绘制、目标读出全零、零报错"正是这个样子。NVN 对这些状态有默认值，游戏有权不设。
+// NVN's default state, item for item with the Apple side's state_reset (the "draw state" section of the working
+// implementation in nvn_mtl.m), applied at the first mtl_exec -- which is exactly where Apple does it too (the
+// state_reset() at the head of its mtl_exec). Why it must be explicit: gfx_state_fill reads this shadow
+// **unconditionally**, so zero-initialisation turns "a state the game never set" into "write mask 0 (not one
+// channel written)" and "depth range [0,0]", after which the draws land nothing at all, silently -- which is what
+// "348k draws, all-zero targets, zero errors" looks like on the device. NVN gives these states defaults and the
+// game may rely on them.
+static void state_defaults(void) {
+    // 混合：默认关（blend_have 不置位就是关，与苹果侧 color.blend_en = 0 同一回事），系数按 NVN 默认给全
+    // Blend: off by default (leaving blend_have clear means off, the same as Apple's color.blend_en = 0), with the
+    // factors filled in per NVN's defaults
+    blend_st bl = { 0, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO,
+                    NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD };
+    for (uint64_t i = 0; i < 8; i++) { bl.target = i; g_rs.blend[i] = bl; }
+    color_st co = { 0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS };
+    memcpy(g_rs.st_bytes[1], &co, sizeof co);
+    // 写掩码：NVN 默认全开。这一条是"一个像素都不落"的头号成因——零初始化的掩码 0 会让每一次绘制都写不出东西
+    // Write mask: all channels on by NVN's default. This one is the chief cause of "not a pixel lands": a
+    // zero-initialised mask of 0 makes every draw write nothing
+    chmask_st cm = { 0xffffffffu };
+    memcpy(g_rs.st_bytes[2], &cm, sizeof cm);
+    poly_st po = { NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0 };
+    memcpy(g_rs.st_bytes[4], &po, sizeof po);
+    ds_st ds = { 0, 1, NVN_DEPTH_FUNC_LESS, 0, NVN_STENCIL_FUNC_ALWAYS, NVN_STENCIL_FUNC_ALWAYS,
+                 NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP,
+                 NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP };
+    memcpy(g_rs.st_bytes[5], &ds, sizeof ds);
+    // 深度范围：NVN 的 SetViewports 只带 x/y/宽/高（四个 float），近远另有 SetDepthRange，默认 [0,1]。
+    // 这里必须置成"已有值"：否则 OP_VIEWPORTS 会去读载荷里那两个从来没被填过的字（读到的是 [0,0]）。
+    // Depth range: NVN's SetViewports carries only x/y/width/height (four floats) while near/far come from
+    // SetDepthRange and default to [0,1]. This has to be marked as set here: otherwise OP_VIEWPORTS reads the two
+    // words in its payload that are never filled in (and gets [0,0]).
+    g_rs.drange[0] = 0.0f; g_rs.drange[1] = 1.0f; g_rs.drange_have = 1;
+}
 static _Atomic uint64_t g_pass_n, g_clear_n, g_draw_skip, g_shadow_n;
 
 // 绘制按"有没有渲染目标"分开计数 + 最近 32 个 op 的流水 + 最近一次 SET_RT。
@@ -737,10 +779,36 @@ static int inflight_take(void) {   // 取一个空闲槽：没有就等（单一
     }
 }
 
+// 看门狗（无进展）时调用：把图形侧所有阻塞等待点的状态写进日志——谁在等谁一眼可见。
+// 与苹果侧同名同义（nvn_mtl.m 的 mtl_wait_state_dump）；安卓侧此前**没有注册**，所以"客体停住"时
+// 日志里只有心跳，看不出它卡在哪（这正是第一次遇到时抓不到现场的原因）。
+// Called by the watchdog (no progress): writes the state of every blocking wait point on the graphics side into the
+// log so who waits for whom is visible at a glance. Same name and meaning as Apple's (mtl_wait_state_dump in
+// nvn_mtl.m); the Android side **never registered** one, which is why "the guest stopped" left only heartbeats in the
+// log with no sign of where it stopped (and why the first encounter had no scene at all).
+void mtl_wait_state_dump(void) {
+    int taken = 0;
+    char slots[256]; int o = 0;
+    for (int i = 0; i < MAX_INFLIGHT; i++) {
+        if (g_inf[i].pending) taken++;
+        o += snprintf(slots + o, sizeof slots - o, "%s%llu", i ? " " : "",
+                      (unsigned long long)(g_inf[i].pending ? g_inf[i].value : 0));
+    }
+    LOG("[vk] 等待点：已提交到栅栏 %llu、在飞槽 %d/%d（各槽的栅栏值 %s）、正在录制的槽 %d、通道开着 %d、"
+        "提交 %llu 次、出图 %llu 次、绘制计数 %llu（有目标 %llu / 无目标 %llu）",
+        (unsigned long long)g_fence, taken, MAX_INFLIGHT, slots, g_cur_slot, g_rs.open ? 1 : 0,
+        (unsigned long long)atomic_load(&g_sub_total), (unsigned long long)atomic_load(&g_present_n),
+        (unsigned long long)atomic_load(&g_draw_skip),
+        (unsigned long long)atomic_load(&g_draw_ncN), (unsigned long long)atomic_load(&g_draw_nc0));
+}
+
 static int vk_sub_ready(void) {
     vk_device_init();
     if (vk_dev() == VK_NULL_HANDLE) return 0;
     if (!g_inf[0].fence) {
+        // 注册"等待点转储"（与苹果侧在设备初始化时注册同一件事）
+        // Register the wait-point dump (the same thing Apple registers during device initialisation)
+        { void crash_set_wait_dump(void (*fn)(void)); void mtl_wait_state_dump(void); crash_set_wait_dump(mtl_wait_state_dump); }
         VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk_queue_family() };
         VkCommandPool pool = VK_NULL_HANDLE;
@@ -833,7 +901,12 @@ uint64_t mtl_sub_commit(void) {
     VkResult r = vkResetFences(vk_dev(), 1, &in->fence);
     if (r != VK_SUCCESS) { LOG("【红】重置栅栏失败 VkResult %d", (int)r); return g_fence; }
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &in->cb };
+    // 客体线程的提交与前端线程的上屏/读回共用同一条队列，提交这一步必须串行化（见 vk_device.h）
+    // The guest thread's submits and the front end's present and readbacks share one queue, so this submit has to be
+    // serialised (see vk_device.h)
+    vk_queue_lock();
     r = vkQueueSubmit(vk_queue(), 1, &si, in->fence);
+    vk_queue_unlock();
     if (r != VK_SUCCESS) { LOG("【红】提交失败 VkResult %d", (int)r); return g_fence; }
     in->pending = 1;
     in->value = ++g_fence;
@@ -1079,6 +1152,12 @@ static VkSampler samp_of_id(uint32_t sid) {
 static VkDescriptorPool g_dpool[MAX_INFLIGHT][DESC_POOLS];
 static uint8_t g_dpool_n[MAX_INFLIGHT];
 static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_skip;
+// 按**阶段**给 BIND_UBO 计数（含"地址为 0"的那些）：问的是"游戏到底往哪个阶段绑过常量"，
+// 因为写空白的现场只能看出"这个槽没有地址"，看不出"是绑到了别的阶段、还是根本没绑"。
+// Count BIND_UBO by **stage** (including the ones whose address is 0): the question is "which stage did the game bind
+// constants for at all", because a blank's situation shows only "this slot has no address" and not whether it was
+// bound under another stage or never bound.
+static _Atomic uint64_t g_ubo_binds[6], g_ubo_zero[6], g_ubo_out;
 
 static void desc_slot_reset(int slot) {
     for (int k = 0; k < DESC_POOLS; k++)
@@ -1143,17 +1222,77 @@ static const vk_shader *desc_stage_of(const vk_shader *const *sh, int n, uint32_
     return NULL;
 }
 
+// ---------- 特殊常量段：support_buffer / c1 / 驱动段 ----------
+// 这三类都不是"游戏绑的内存"，而是回放层自己供给着色器的（苹果侧同样自己造：support_buf / zero_bank）。
+// support_buffer 的布局与取值照 Ryujinx 的 SupportBuffer（见 nvn_mtl.m 的 support_buf）：render_scale 必须为 1，
+// 否则着色器按 0 去缩放，屏幕上会一个像素都不落。
+// ---------- Special constant segments: support_buffer, c1 and the driver bank ----------
+// None of these three is memory the game binds; the replay layer supplies them to the shader itself (Apple builds its
+// own too: support_buf / zero_bank). The layout and values of support_buffer follow Ryujinx's SupportBuffer (see
+// support_buf in nvn_mtl.m): render_scale must be 1, or the shader scales by 0 and not a pixel lands.
+#define BANK_BYTES (64u << 10)
+#define SUPPORT_RENDER_SCALE_OFF 192   // MSL 布局实测（与苹果侧注释同源）：render_scale float4[73]，取 .x | measured MSL layout (same source as Apple's note): render_scale float4[73], take .x
+static VkBuffer g_bank[2];             // 0 = support_buffer、1 = 全零（c1 与驱动段）| 0 = support_buffer, 1 = all zero (c1 and the driver bank)
+static VkBuffer bank_get(int which) {
+    if (g_bank[which]) return g_bank[which];
+    vk_device_init();
+    if (vk_dev() == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = BANK_BYTES,
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer b = VK_NULL_HANDLE;
+    if (vkCreateBuffer(vk_dev(), &bci, NULL, &b) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(vk_dev(), b, &mr);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    if (vkAllocateMemory(vk_dev(), &mai, NULL, &m) != VK_SUCCESS || vkBindBufferMemory(vk_dev(), b, m, 0) != VK_SUCCESS) {
+        if (m) vkFreeMemory(vk_dev(), m, NULL);
+        vkDestroyBuffer(vk_dev(), b, NULL);
+        LOG("【红】特殊常量段建不出来（哪一段 %d）", which);
+        return VK_NULL_HANDLE;
+    }
+    void *p = NULL;
+    if (vkMapMemory(vk_dev(), m, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
+        memset(p, 0, BANK_BYTES);
+        if (!which) for (int i = 0; i < 73; i++) *(float *)((uint8_t *)p + SUPPORT_RENDER_SCALE_OFF + 16 * i) = 1.0f;
+        vkUnmapMemory(vk_dev(), m);
+    }
+    g_bank[which] = b;
+    LOG("[vk] 特殊常量段 %s 就绪（%u 字节）：%s", which ? "c1 / 驱动段" : "support_buffer", (unsigned)BANK_BYTES,
+        which ? "c1 的真实数据在控制段里，暂以全零代替" : "render_scale = 1");
+    return b;
+}
+
 // 缓冲类绑定的地址与长度：UBO 直接来自 c 槽，SSBO 先看有没有直接绑（游戏用 BindStorageBuffer），
 // 否则按 res.json 的讲法从 c[cb_slot] 的 cb_offset 处读那个地址。
+// host_buf 非空时表示用宿主自己的缓冲（上面的特殊常量段），此时 addr/size 无意义。
 // Address and length of a buffer binding: a UBO comes straight from its c slot, an SSBO first tries a direct
-// binding (the game uses BindStorageBuffer) and otherwise reads the address at c[cb_slot] + cb_offset, as res.json says.
-static int desc_buf_range(const vk_shader *sh, const vk_pipe_bind *b, uint64_t *addr, uint64_t *size) {
+// binding (the game uses BindStorageBuffer) and otherwise reads the address at c[cb_slot] + cb_offset, as res.json
+// says. A non-NULL host_buf means the host's own buffer is used (the special segments above) and addr/size mean nothing.
+static int desc_buf_range(const vk_shader *sh, const vk_pipe_bind *b, uint64_t *addr, uint64_t *size, VkBuffer *host_buf) {
     int stg = sh->stage >= 0 && sh->stage < 6 ? sh->stage : 0;
+    if (host_buf) *host_buf = VK_NULL_HANDLE;
     if (b->kind == VK_SPV_UBO) {
+        // res.json 的槽号是**名字里的号**（名字形如 fp_c3 / fp_c13），NVN 的常量槽是它减 3；名字里的 1 是特殊段
+        // c1、2 是驱动段，都不是"游戏绑的 UBO"；一条 cbuf 都没有 = Ryujinx 的 support_buffer。规则与苹果侧同源：
+        // dm/gfx/tools/dmsh_build.py 的 reflect()。
+        // res.json's slot is the **number in the name** (names like fp_c3 / fp_c13) and the NVN constant slot is that
+        // minus 3; a 1 in a name is the special c1 bank and a 2 the driver bank, neither of them a UBO the game binds;
+        // no cbuf entry at all means Ryujinx's support_buffer. The rule comes from where Apple gets it: reflect() in
+        // dm/gfx/tools/dmsh_build.py.
         int slot = desc_cbuf_slot(sh, b->binding);
-        if (slot < 0 || slot >= 16) return 0;
-        *addr = g_rs.ubo[stg][slot].addr;
-        *size = g_rs.ubo[stg][slot].size;
+        if (slot < 0 || slot == 2 || slot == 1) {
+            if (!host_buf) return 0;
+            *host_buf = bank_get(slot == 2 ? 1 : (slot == 1 ? 1 : 0));
+            if (!*host_buf) return 0;
+            *addr = 0; *size = BANK_BYTES;
+            return 1;
+        }
+        int nvn = slot - 3;   // 名字里的号 → NVN 常量槽 | the number in the name -> the NVN constant slot
+        if (nvn < 0 || nvn >= 16) return 0;
+        *addr = g_rs.ubo[stg][nvn].addr;
+        *size = g_rs.ubo[stg][nvn].size;
         return *addr != 0;
     }
     const vk_sbuf_ref *r = desc_sbuf_ref(sh, b->binding);
@@ -1280,15 +1419,40 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
         if (b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
             uint64_t a = 0, sz = 0;
             void *buf = NULL; uint64_t off = 0;
-            if (!desc_buf_range(st, &b[i], &a, &sz) || !mtl_addr(a, sz, &buf, &off)) {
+            VkBuffer hb = VK_NULL_HANDLE;
+            if (!desc_buf_range(st, &b[i], &a, &sz, &hb) || (!hb && !mtl_addr(a, sz, &buf, &off))) {
                 // 空白回退：游戏没绑这一段（NVN 自己读 0），或地址不在任何池里
                 // Blank fallback: the game bound no such range (NVN reads 0 itself) or the address is in no pool
-                if (atomic_fetch_add(&g_desc_blank, 1) < 5)
-                    LOG("【黄】binding %u（%s）拿不到缓冲地址（地址 %llx、槽解析 %d）：写空白",
-                        b[i].binding, vk_spv_kind_name(b[i].kind), (unsigned long long)a, desc_cbuf_slot(st, b[i].binding));
+                if (atomic_fetch_add(&g_desc_blank, 1) < 5) {
+                    // 取证：这条绑定由哪个阶段的着色器声明、那个槽在**各阶段**分别是什么值、各阶段总共绑过多少条 UBO。
+                    // 判读法：某另一阶段有值 = 阶段没对上；哪一阶段都没有 = 游戏没绑（或它给的编号不是槽号）。
+                    // Forensics: which stage's shader declares this binding, what that slot holds in **each** stage, and
+                    // how many UBOs each stage has been bound in total. Reading: a value under another stage means the
+                    // stages do not line up; nothing under any stage means the game never bound it (or its index is
+                    // not the slot).
+                    int sd = desc_cbuf_slot(st, b[i].binding);
+                    uint64_t pa[6] = { 0, 0, 0, 0, 0, 0 };
+                    if (sd >= 0 && sd < 16) for (int g2 = 0; g2 < 6; g2++) pa[g2] = g_rs.ubo[g2][sd].addr;
+                    LOG("【黄】binding %u（%s）拿不到缓冲地址（地址 %llx、槽解析 %d、声明者阶段 %d）：写空白；同一槽各阶段 %llx/%llx/%llx/%llx/%llx/%llx；已绑上的槽位图（按阶段）%#x/%#x/%#x/%#x/%#x/%#x；BIND_UBO 各阶段计数 %llu/%llu/%llu/%llu/%llu/%llu（地址 0 的 %llu/%llu/%llu/%llu/%llu/%llu）",
+                        b[i].binding, vk_spv_kind_name(b[i].kind), (unsigned long long)a, sd, st->stage,
+                        (unsigned long long)pa[0], (unsigned long long)pa[1], (unsigned long long)pa[2],
+                        (unsigned long long)pa[3], (unsigned long long)pa[4], (unsigned long long)pa[5],
+                        (unsigned)g_rs.ubo_have[0], (unsigned)g_rs.ubo_have[1], (unsigned)g_rs.ubo_have[2],
+                        (unsigned)g_rs.ubo_have[3], (unsigned)g_rs.ubo_have[4], (unsigned)g_rs.ubo_have[5],
+                        (unsigned long long)atomic_load(&g_ubo_binds[0]), (unsigned long long)atomic_load(&g_ubo_binds[1]),
+                        (unsigned long long)atomic_load(&g_ubo_binds[2]), (unsigned long long)atomic_load(&g_ubo_binds[3]),
+                        (unsigned long long)atomic_load(&g_ubo_binds[4]), (unsigned long long)atomic_load(&g_ubo_binds[5]),
+                        (unsigned long long)atomic_load(&g_ubo_zero[0]), (unsigned long long)atomic_load(&g_ubo_zero[1]),
+                        (unsigned long long)atomic_load(&g_ubo_zero[2]), (unsigned long long)atomic_load(&g_ubo_zero[3]),
+                        (unsigned long long)atomic_load(&g_ubo_zero[4]), (unsigned long long)atomic_load(&g_ubo_zero[5]));
+                }
                 VkBuffer dum = vk_pipe_dummy_buffer();
                 if (!dum) return -1;
                 bi[nw] = (VkDescriptorBufferInfo){ dum, 0, VK_WHOLE_SIZE };
+            } else if (hb) {
+                // 特殊常量段：宿主自己的缓冲，没有动态偏移
+                // A special constant segment: the host's own buffer, with no dynamic offset
+                bi[nw] = (VkDescriptorBufferInfo){ hb, 0, VK_WHOLE_SIZE };
             } else {
                 // 动态偏移之和必须落在 minUniform/StorageBufferOffsetAlignment 的整数倍上，而规范保证这个
                 // 界限不超过 256，所以按 256 对齐一定成立；客体自己的缓冲地址本该对齐，没对齐就记一次。
@@ -1414,12 +1578,11 @@ static void pass_begin(void) {
     for (int i = 0; i < g_rs.ncolor && i < 8; i++) {
         const tex_t *t = g_rs.color[i];
         if (!t) continue;
-        // 渲染目标这一路暂时用底视图：SET_RT 的 view 目前没存进影子状态（p_set_rt 里有 cview/has_cview，
-        // 回放层还没接），接上之后这里要把它们传下去——限了 mip 的 view 当附件时尺寸也不同，要一并处理。
-        // The render-target path uses the base view for now: SET_RT's views are not stored in the shadow state yet
-        // (p_set_rt carries cview/has_cview and the replay layer does not wire it up), and once they are, this must
-        // pass them down -- an attachment whose view limits the mip range also has a different size, which has to be
-        // handled along with it.
+        // 渲染目标用 SET_RT 载荷里带来的那个 view（影子状态存的 cview）：限定了 mip 的 view 才是游戏真正要画
+        // 的那一层，拿底视图当附件会画到第 0 级上去。附件尺寸也随之不同，见下面按 base_level 右移那两行。
+        // The render target uses the view carried in the SET_RT payload (the cview kept in the shadow state): a view
+        // that limits the mip range is the level the game really draws into, and using the base view as the attachment
+        // would draw into level 0. The attachment size shifts along with it (see the two base_level lines below).
         VkImageView iv = vk_tex_view(t, g_rs.has_cview[i] ? &g_rs.cview[i] : NULL);
         if (!iv) {
             // 不再静默：附件建不出图像这件事曾经让"画面到不了出图纹理"藏了很久（截图才把它照出来），
@@ -1640,6 +1803,12 @@ static void gfx_state_fill(vk_gfx_state *out, int topo_prim) {
 // distribution is reported per submission and the measured frequency decides the implementation order.
 void mtl_exec(const uint8_t *p) {
     if (!p) return;
+    // 第一次进解释器时把 NVN 的默认状态铺上（与苹果侧 mtl_exec 开头那句 state_reset() 同一个位置、同一个意思）。
+    // 静态守卫同时挡住 OP_CALL 的递归。
+    // Lay down NVN's default state on the first entry into the interpreter (the same place and meaning as the
+    // state_reset() at the head of Apple's mtl_exec). The static guard also covers the recursion of OP_CALL.
+    static int inited;
+    if (!inited) { inited = 1; state_defaults(); }
     for (;;) {
         op_hdr h;
         memcpy(&h, p, sizeof h);
@@ -1728,8 +1897,13 @@ void mtl_exec(const uint8_t *p) {
             for (int i = 0; i < g_rs.nvp; i++) {
                 g_rs.vp[i].x = v->v[i][0]; g_rs.vp[i].y = v->v[i][1];
                 g_rs.vp[i].width = v->v[i][2]; g_rs.vp[i].height = v->v[i][3];
-                g_rs.vp[i].minDepth = g_rs.drange_have ? g_rs.drange[0] : v->v[i][4];
-                g_rs.vp[i].maxDepth = g_rs.drange_have ? g_rs.drange[1] : v->v[i][5];
+                // 近远只来自 SetDepthRange（默认 [0,1]，见 state_defaults）：这条载荷的 v[4]/v[5] 从来没被
+                // 录进来（NVN 的 SetViewports 只带四个 float），读它们只会得到 [0,0]。
+                // near/far come only from SetDepthRange (defaulting to [0,1], see state_defaults): v[4]/v[5] in
+                // this payload are never recorded (NVN's SetViewports carries four floats), and reading them only
+                // yields [0,0].
+                g_rs.vp[i].minDepth = g_rs.drange[0];
+                g_rs.vp[i].maxDepth = g_rs.drange[1];
             }
             if (g_rs.open) vkCmdSetViewport(g_inf[g_cur_slot].cb, 0, (uint32_t)g_rs.nvp, g_rs.vp);
             break; }
@@ -1813,6 +1987,16 @@ void mtl_exec(const uint8_t *p) {
         case OP_BIND_UBO: case OP_BIND_SSBO: {
             const p_bind_buf *b = (const p_bind_buf *)a;
             int stg = b->stage, idx = b->index;
+            // 按阶段计数（见 g_ubo_binds 的说明）：写空白的现场要能分清"绑到别的阶段了"和"根本没绑"。
+            // 阶段号超出 0..5 的单独计（若真有这种，也是个发现）。
+            // Count by stage (see g_ubo_binds): a blank's situation has to distinguish "bound under another stage" from
+            // "never bound". Stage numbers outside 0..5 are counted separately (if any turn up, that is a finding too).
+            if (h.op == OP_BIND_UBO) {
+                if (stg >= 0 && stg < 6) {
+                    atomic_fetch_add(&g_ubo_binds[stg], 1);
+                    if (!b->addr) atomic_fetch_add(&g_ubo_zero[stg], 1);
+                } else atomic_fetch_add(&g_ubo_out, 1);
+            }
             if (stg >= 0 && stg < 6 && idx >= 0) {
                 if (h.op == OP_BIND_UBO && idx < 16) {
                     g_rs.ubo[stg][idx].addr = b->addr; g_rs.ubo[stg][idx].size = b->size;
@@ -1909,6 +2093,21 @@ void mtl_exec(const uint8_t *p) {
                 }
             } else atomic_fetch_add(&g_draw_ncN, 1);
             VkPipeline pl = shs[0] ? vk_pipe_graphics(shs[0], shs[1], &stv) : VK_NULL_HANDLE;
+            // 通道：按本文件"渲染状态影子 + 通道机械"一节的讲法，"第一次清除**或绘制**"就该开。先前只有清除会开，
+            // 于是 `SET_RT → 屏障 → 绘制` 这类没有清除的流里通道一直是关的，绘制被成片丢掉（日志里的"未下发"）。
+            // 开通道的同时要把动态视口/裁剪补一遍：VIEWPORTS / SCISSOR 到达时通道还没开，那一次没往命令缓冲里写。
+            // Passes: the machinery described at the head of this file says a pass opens at the first clear **or
+            // draw**. Only clears used to open one, so in streams shaped `SET_RT -> barrier -> draws` the pass stayed
+            // closed and draws were dropped wholesale (the "not issued" lines in the log). Opening a pass here also
+            // has to re-supply the dynamic viewport/scissor: those were never written into the command buffer,
+            // because the pass was not open when VIEWPORTS / SCISSOR arrived.
+            if (pl && g_cur_slot >= 0 && !g_rs.open && (stv.color_count || g_rs.depth)) {
+                pass_begin();
+                if (g_rs.open) {
+                    if (g_rs.nvp) vkCmdSetViewport(g_inf[g_cur_slot].cb, 0, (uint32_t)g_rs.nvp, g_rs.vp);
+                    if (g_rs.nsc) vkCmdSetScissor(g_inf[g_cur_slot].cb, 0, 1, g_rs.sc);
+                }
+            }
             int wrote = 0;
             if (pl && g_rs.open && g_cur_slot >= 0) {
                 VkCommandBuffer cb = g_inf[g_cur_slot].cb;
