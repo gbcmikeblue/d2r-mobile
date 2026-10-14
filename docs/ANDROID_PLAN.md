@@ -637,10 +637,11 @@ at frame 50, **0 with content**). The "the viewer reads content at level 1" foun
 a **wrong pitch**, and with the pitch fixed both sides agree (part six of "M3-2m") -- **step 14's conclusion stands**;
 what changed is that the instrument is now trustworthy. What follows is ordered by value:
 
-1. **Chase the readback's concurrency crash** (part seven of "M3-2m") -- `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0` lands in
-   **our own code**, the scene being "the viewer and the scan/present reading at the **same time**" over **one resident
-   staging buffer** (`stg_get`), so the first suspects are its reuse and the edge of the queue lock. Until that is fixed
-   the "look at the picture" loop is itself unreliable.
+1. **Get uploads off `g_cb`** (part four of "M3-2n") -- the readback's concurrency crash is **fixed** ("M3-2n"), but
+   uploads still share the one-shot command buffer with readbacks; giving uploads **their own command buffer** is what
+   makes this loop clean as a whole. **Mind the lock order**: the upload path is `tex_of` holding **`g_mu`** calling in, so
+   it must not be given "the same lock as the readback" -- that is exactly the "looks like a hung game" deadlock in part
+   three of "M3-2n".
    The level-by-level scan is **already in** (part six): 33 level reads at frame 50, **0 with content**. The next round has
    to scan a **later frame** -- this device normally stalls at 55-60 presents, so the scan points have to sit inside what
    it can actually reach (50/54/57, say), or "scanned" and "never got there" cannot be told apart;
@@ -1279,6 +1280,43 @@ reuse and the edge of the queue lock. **That is the next item** -- it is no long
 **8. The lesson worth recording on its own**: `DM_NVN_SHOT_SCAN` reading level 0 alone was a **gap in the instrument**,
 not a property of the world; and the viewer's "has content" was **another** gap. Together the two gaps were enough to make
 a conclusion that does not exist look supported by two pieces of evidence.
+
+### M3-2n: the readback's concurrency crash -- fixed, and on the way a lock-order inversion that looks like a hung game (2026-10-14, device)
+
+Part seven of "M3-2m" left `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0` open (inside the readback, with the viewer and the scan
+reading **at the same time**). This round closes it, and on the way I built a deadlock myself -- both are recorded,
+because both look like "the game hung".
+
+**1. Root cause.** The readback path has two **shared and mutated** things: the resident staging buffer (`stg_get`, which
+**destroys and recreates** it when it is too small) and the one-shot command buffer (`g_cb`). And a readback is started by
+**two threads** -- present/scan on the guest thread, the viewer on the front-end thread. Only the "queue submit" stretch
+used to be locked, so "A is recording into the command buffer while B destroys and recreates the staging buffer" went
+straight into undefined behaviour: A holds a buffer that has **already been destroyed** (or a pointer never mapped), and
+that is the `+0x7a0` line.
+
+**2. The fix.** One lock (`g_one_mu`) spans "take the staging buffer -> ... -> unmap after reading" **in full**; the
+readback and the control clear both take it.
+
+**3. The trap I walked into (worth recording on its own).** I also folded **uploads** into that lock, thinking "they share
+`g_cb`, serialising them together is simplest". The result was **the whole boot coming to a stop with zero presents**, the
+watchdog reporting only `beat 0 / stage MainMenuHD:CheckUpdateLinks`, identically across three runs: it looks exactly like
+"the game hung at boot", but it is a **lock-order inversion**. The upload path is `tex_of` holding **`g_mu`** calling
+`ent_upload`, while the readback is `one_mu -> g_mu` -- together a cycle: the viewer holds `one_mu` waiting for `g_mu`
+while the guest holds `g_mu` waiting for `one_mu`.
+**The check**: with that one upload site reverted, presents **immediately** return to normal (56 frames, the usual
+`CharacterCreate:Hover:Barbarian`).
+**The lesson**: before adding a lock, list who holds what when they call in; "it looks like the game hung" can really be
+two locks waiting on each other.
+
+**4. One thing still left open (the next change).** Uploads and readbacks still **share `g_cb`** -- the upload site
+**cannot** take `one_mu` (see part 3), and really removing the sharing needs uploads to have **their own command buffer**.
+It is written down in the code (the upload block in `vk_tex.c`) and carried into "next steps".
+
+**5. Device readings** (Redmi K90 / Adreno 830, `DM_WIN_SRC=28`, `DM_WIN_LEVEL=1`, level-by-level scan at 50/54/57):
+two consecutive runs with **no `CRASH`**; the viewer read **301 / 361 times** successfully (concurrent with the guest),
+the scan did **33 level reads** each (frames 50 and 54), and presents reached **50 / 56** before falling on **this
+device's usual stall** (`CharacterCreate:Hover:Barbarian`) -- the "look at the picture" loop is usable again, and the
+stall is unrelated to it.
 
 ---
 

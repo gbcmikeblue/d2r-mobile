@@ -303,6 +303,26 @@ static ent_t *g_tab; static int g_cap, g_n;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static VkCommandPool g_pool; static VkCommandBuffer g_cb;
 
+// 读回（以及对照清除）**必须串行**：读回会被**两个线程**同时发起 —— 出图/扫描在客体线程、查看器在前端线程 ——
+// 而它们共用同一块常驻中转缓冲（`stg_get`，会销毁重建）与同一块命令缓冲（`g_cb`）。早先只锁了"队列提交"那一段，
+// 于是"一边在录命令，另一边把中转缓冲销毁重建/映射"直接踩进未定义行为：真机现场是
+// `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0`（用到了一个已经销毁或还没映射成的指针）。这把锁覆盖从
+// "拿中转缓冲"到"读完解映射"整段。
+// **上传不在里面**：调用方持着 `g_mu` 调上传，而这把锁与 `g_mu` 的顺序是 `one_mu → g_mu`，上传一拿就成环
+//（真机：启动停住、出图 0 次）。上传要脱离这条，得用自己的命令缓冲，见「M3-2n」。
+// Readbacks (and the control clear) **must be serialised**: a readback can be started by **two threads** at once --
+// present/scan on the guest thread, the viewer on the front-end thread -- and they share one resident staging buffer
+// (`stg_get`, which destroys and recreates it) and one command buffer (`g_cb`). Only the "queue submit" stretch used to
+// be locked, so "one side records commands while the other destroys/recreates/maps the staging buffer" went straight
+// into undefined behaviour: the device's scene is `CRASH sig=11 pc=vk_tex_grab_ser+0x7a0` (a pointer that had been
+// destroyed or never mapped). This lock spans "take the staging buffer" through "unmap after reading".
+// **Uploads are not in it**: the caller holds `g_mu` when it uploads, and this lock orders as `one_mu -> g_mu`, so an
+// upload taking it would form a cycle (on the device: a stall at boot, zero presents). Uploads need their own command
+// buffer to leave this path -- see "M3-2n".
+static pthread_mutex_t g_one_mu = PTHREAD_MUTEX_INITIALIZER;
+static void one_lock(void) { pthread_mutex_lock(&g_one_mu); }
+static void one_unlock(void) { pthread_mutex_unlock(&g_one_mu); }
+
 static uint64_t hsh(uint64_t k) { k *= 11400714819323198485ull; return k ^ (k >> 29); }
 
 // ---------- 窗口（交换链）贴图的登记（见 vk_tex.h 的说明）----------
@@ -486,6 +506,16 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     void *smap = NULL;
     if (vkMapMemory(vk_dev(), sm, 0, VK_WHOLE_SIZE, 0, &smap) != VK_SUCCESS) { vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
 
+    // **上传这里不能拿 `g_one_mu`**：调用方 `tex_of` 正**持着 `g_mu`** 调进来，而读回那边是 `one_mu → g_mu`
+    // （见 `vk_tex_grab_ser`）—— 两边凑起来就是锁序反转。真机现场是**启动就停住、`出图 0 次`**，看门狗只报
+    // `拍 0`，看着像"游戏卡了"，其实是两把锁互相等。要真正消掉"上传与读回共用 `g_cb`"这条，得让上传**用自己的
+    // 命令缓冲**，那是**下一处改动**（见 docs/ANDROID_PLAN 的「M3-2n」），本轮不夹带。
+    // **Uploads must not take `g_one_mu` here**: the caller `tex_of` holds **`g_mu`** when it calls in, while the
+    // readback path is `one_mu -> g_mu` (see `vk_tex_grab_ser`) -- together that is a lock-order inversion. On the
+    // device it shows as a **stall right at boot with zero presents**, the watchdog reporting only "beat 0", which
+    // looks like "the game hung" but is really two locks waiting on each other. Actually removing the `g_cb` sharing
+    // between uploads and readbacks needs uploads to have **their own command buffer**, which is the **next change**
+    // (see "M3-2n" in docs/ANDROID_PLAN) and is deliberately not carried along with this one.
     if (!one_begin()) { vkUnmapMemory(vk_dev(), sm); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
     // 拷贝前的布局转换：新建是 UNDEFINED，目标 TRANSFER_DST
     // Layout transition before the copy: newly created is UNDEFINED, the target is TRANSFER_DST
@@ -733,7 +763,9 @@ static int stg_get(VkDeviceSize need, VkBuffer *out_buf, VkDeviceMemory *out_mem
 // Read back by serial: the tool surface for screenshots and diagnostics. No tex_t is needed -- the texture layer's
 // entry already holds img/fmt/w/h/levels/lay -- and a question like "which texture did the game draw the picture into"
 // can only be asked by serial (the replay layer does not hold those textures' tex_t).
-int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
+// 函数名带 `_locked`：**调用方必须已经持有 g_one_mu**（公开入口见文件下方那个薄封装）。
+// The `_locked` suffix means **the caller must already hold g_one_mu** (the public entry is the thin wrapper below).
+static int grab_ser_locked(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
     // 读不回就得说清为什么：这一层早退的路很多，静默早退过一次（真机上表现为"截图 0x0 失败"配一条黄红都没有），
     // 所以每条早退都留一句话。
     // A failed readback has to say why: this layer has many early exits and one of them was silent (on the device that
@@ -889,6 +921,18 @@ int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch,
     return ok;   // 中转缓冲留在缓存里（见 stg_get）：下一个读回接着用 | the staging buffer stays cached (see stg_get) for the next readback
 }
 
+// 公开入口：整段读回**串行**（见 g_one_mu 的说明）。读回会被两个线程同时发起（查看器在前端线程、出图/扫描在
+// 客体线程），而它们共用同一块命令缓冲与同一块常驻中转缓冲 —— 不串行就是上面那条崩溃。
+// The public entry: the whole readback is **serialised** (see the note on g_one_mu). A readback can be started by two
+// threads at once (the viewer on the front-end thread, present/scan on the guest thread) and they share one command
+// buffer and one resident staging buffer -- not serialising them is exactly the crash described there.
+int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
+    one_lock();
+    int r = grab_ser_locked(serial, level, dst, pitch, out_w, out_h);
+    one_unlock();
+    return r;
+}
+
 // 带 tex_t 的旧入口：就是按序号那一支的薄封装（诊断分得更细一点，因为这里能报出对象与序号的关系）
 // The older tex_t entry point: a thin wrapper over the serial version (with a slightly richer diagnostic, since here
 // the relationship between the object and the serial can be reported)
@@ -951,6 +995,7 @@ int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a) {
     vkQueueWaitIdle(vk_queue());
     vk_queue_unlock();
     int ok = 0;
+    one_lock();   // 与读回 / 上传串行（见 g_one_mu）| serialised against readback / upload (see g_one_mu)
     if (one_begin()) {
         VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .oldLayout = lay, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -965,6 +1010,7 @@ int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a) {
         vkCmdClearColorImage(g_cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &rng);
         ok = one_end();
     }
+    one_unlock();
     if (ok) {
         pthread_mutex_lock(&g_mu);
         ent_t *e2 = find_slot(serial, 0);
