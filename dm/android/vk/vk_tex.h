@@ -1,0 +1,53 @@
+// NVN 贴图 → VkImage（安卓回放层）。
+// NVN textures -> VkImage (the Android replay layer).
+//
+// 三件事决定了这一层的形状：
+//   ① **按 `t->serial` 建表，不能用指针当键**：游戏会按值拷贝 NVNtexture 对象（nvn_obj.h 里 tex_t 的注释
+//      就是这么写的，Metal 侧同样按序号查表），指针会失效；
+//   ② **池内存是真值，VkImage 是派生**：客体的贴图数据在池里是 Tegra X1 块线性布局，GPU 要的是驱动的
+//      optimal 布局，所以上传时要解排布（`nvn_deswizzle`，仓库既有实现，已编进安卓构建），回读时再排回去
+//      （`nvn_swizzle`）；
+//   ③ **可寻址 = 零拷贝内存**：池所在的那段本来就是 Vulkan 的零拷贝内存（见 vk_region.c），所以上传/回读
+//      不需要额外的中转分配。
+// Three things shape this layer:
+//   1. **Keyed by `t->serial`, never by pointer**: the game copies NVNtexture objects by value (the comment on
+//      tex_t in nvn_obj.h says as much, and the Metal side looks them up by serial too), so pointers go stale;
+//   2. **Pool memory is the truth, the VkImage is derived**: the guest's texture data sits in the pool in Tegra
+//      X1 block-linear layout while the GPU wants the driver's optimal layout, so an upload deswizzles through
+//      the repository's own `nvn_deswizzle` (already compiled into the Android build) and a readback swizzles
+//      back with `nvn_swizzle`;
+//   3. **Addressable means zero-copy memory**: the pool's range is already Vulkan zero-copy memory (see
+//      vk_region.c), so neither upload nor readback needs an extra bounce allocation.
+#pragma once
+#include <stdint.h>
+#include <vulkan/vulkan.h>
+#include "nvn_obj.h"
+
+// NVN 格式 → VkFormat：0 = 没有对应（调用方报红一次即可）。压缩格式按未压缩的 Vulkan 格式给出，
+// 上传时是否解压由调用方决定（安卓这边先直接按压缩格式上传，BC 解压留到需要时）。
+// NVN format -> VkFormat: 0 means no counterpart (the caller should report a failure once). Compressed formats
+// map to their compressed Vulkan format; whether to decompress on upload is the caller's call (Android uploads
+// in compressed form for now, with BC decompression left until it is needed).
+int vk_fmt_to_vk(int nvn_fmt, VkFormat *out);
+
+// 取（必要时建 + 上传）这张贴图的 VkImage / 视图；失败返回 VK_NULL_HANDLE。
+// Get (creating and uploading if needed) this texture's VkImage / view; VK_NULL_HANDLE on failure.
+VkImage vk_tex_image(const tex_t *t);
+VkImageView vk_tex_view(const tex_t *t);
+
+// 池内容被 CPU 改过（脏页跟踪的结论）：下次取用之前重传。释放时调 vk_tex_drop。
+// The pool content was changed on the CPU (per the dirty-page tracking): re-upload before the next use. Call
+// vk_tex_drop when the texture is released.
+void vk_tex_invalidate(uint64_t serial);
+void vk_tex_drop(uint64_t serial);
+
+// CPU 读贴图（NVN ReadTexels）：与 Metal 侧同签名。这里走"池内存是真值"的直读路径（解排布直读），
+// 还没考虑 GPU 写出过的贴图——那一类要等回读通了再从 VkImage 取（见 docs/ANDROID_PLAN 的 M2 进度）。
+// CPU texture read (NVN ReadTexels), same signature as the Metal side. This takes the "pool memory is the truth"
+// direct path (deswizzle straight out) and does not yet cover textures the GPU has written -- those need the
+// readback path through the VkImage (see M2's progress in docs/ANDROID_PLAN).
+void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
+
+// 诊断读数：建了多少张、上传多少张/多少字节、CPU 直读多少次、没有对应格式的次数
+// Diagnostic counters: images created, uploads and bytes, direct CPU reads, and format misses
+void vk_tex_stats(uint64_t *created, uint64_t *uploads, uint64_t *bytes, uint64_t *reads, uint64_t *fmt_miss);

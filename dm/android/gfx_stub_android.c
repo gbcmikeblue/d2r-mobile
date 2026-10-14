@@ -67,9 +67,6 @@ void mtl_tex_release(tex_t *t) { (void)t; }
 void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
-void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
-    (void)t; (void)level; (void)layer0; (void)r; (void)dst; (void)row; (void)img;
-}
 
 // ---- 外推与冻结的渲染侧握手 | Render-side handshake for extrapolation and freezing ----
 
