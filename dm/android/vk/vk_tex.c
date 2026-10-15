@@ -13,6 +13,7 @@
 #include "dm.h"
 #include <math.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -450,26 +451,46 @@ static ent_t *find_slot(uint64_t serial, int create) {
 // doing so inverts the order, which on the device is "**a stall at boot with zero presents**" (part three of "M3-2n").
 // With two command buffers there is no buffer sharing left to reason about, and the only thing that still needs
 // serialising -- the queue submit -- has the queue lock already.
+// M3-2x：这两条"没走通 / 上传失败"的日志原来**不带是哪一步**，于是"设备丢失先丢的是谁"只能猜 ——
+// 真机现场（`ab-A r2`）里，读回的「命令缓冲那一套没走通」排在成批「贴图上传失败」与「提交失败 VkResult -4」**之前**，
+// 而这三条都没带返回码。现在每一步都把自己的名字写进这个静态串（VkResult 那几处连返回码一起），外层日志打出来。
+// 只当诊断用：读回（`g_one_mu`）与上传（`g_mu`）各写各的，静态串可能被对方盖掉 —— 够用，不值得为它加锁。
+// M3-2x: these two "did not go through / upload failed" messages never said **which step** failed, so "who is dropped
+// first on device loss" could only be guessed -- in the device scene (`ab-A r2`) the readback's "command buffer did not
+// go through" comes **before** the batch of "texture upload failed" and before "submit failed VkResult -4", and none of
+// the three carried a result code. Every step now writes its own name into this static string (the VkResult ones
+// include the code) and the outer message prints it. Diagnostics only: the readback (`g_one_mu`) and the upload
+// (`g_mu`) each write their own, so the other may overwrite it -- good enough, not worth a lock here.
+static char g_step_fail[96];
+static void step_fail(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt); vsnprintf(g_step_fail, sizeof g_step_fail, fmt, ap); va_end(ap);
+}
 static int one_begin_on(VkCommandBuffer *slot) {
     vk_device_init();
-    if (vk_dev() == VK_NULL_HANDLE) return 0;
+    if (vk_dev() == VK_NULL_HANDLE) { step_fail("设备还没起来"); return 0; }
     if (!g_pool) {
         VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk_queue_family() };
-        if (vkCreateCommandPool(vk_dev(), &pci, NULL, &g_pool) != VK_SUCCESS) return 0;
+        VkResult pr = vkCreateCommandPool(vk_dev(), &pci, NULL, &g_pool);
+        if (pr != VK_SUCCESS) { step_fail("vkCreateCommandPool 返回 %d", (int)pr); return 0; }
     }
     if (!*slot) {
         VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = g_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-        if (vkAllocateCommandBuffers(vk_dev(), &ai, slot) != VK_SUCCESS) { *slot = VK_NULL_HANDLE; return 0; }
+        VkResult ar = vkAllocateCommandBuffers(vk_dev(), &ai, slot);
+        if (ar != VK_SUCCESS) { *slot = VK_NULL_HANDLE; step_fail("vkAllocateCommandBuffers 返回 %d", (int)ar); return 0; }
     }
-    if (vkResetCommandBuffer(*slot, 0) != VK_SUCCESS) return 0;
+    { VkResult rr = vkResetCommandBuffer(*slot, 0);
+      if (rr != VK_SUCCESS) { step_fail("vkResetCommandBuffer 返回 %d", (int)rr); return 0; } }
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    return vkBeginCommandBuffer(*slot, &bi) == VK_SUCCESS;
+    { VkResult br = vkBeginCommandBuffer(*slot, &bi);
+      if (br != VK_SUCCESS) { step_fail("vkBeginCommandBuffer 返回 %d", (int)br); return 0; } }
+    return 1;
 }
 static int one_end_on(VkCommandBuffer cb) {
-    if (vkEndCommandBuffer(cb) != VK_SUCCESS) return 0;
+    { VkResult er = vkEndCommandBuffer(cb);
+      if (er != VK_SUCCESS) { step_fail("vkEndCommandBuffer 返回 %d", (int)er); return 0; } }
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
     // 提交与"等队列空闲"是一件事（一次性命令缓冲的语义），整段拿队列锁（见 vk_device.h）
     // The submit and the queue-idle wait are one thing for a one-off command buffer, so the whole span takes the
@@ -479,7 +500,7 @@ static int one_end_on(VkCommandBuffer cb) {
     dm_waitled_enter("vk：一次性提交（读回 / 对照）");
     VkResult sr = vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE);
     dm_waitled_leave();
-    if (sr != VK_SUCCESS) { vk_queue_unlock(); return 0; }
+    if (sr != VK_SUCCESS) { step_fail("vkQueueSubmit 返回 %d", (int)sr); vk_queue_unlock(); return 0; }
     // M3-2w：读回 / 对照走的就是这条"一次性提交 + 等空闲"，而它**可能跑在客体线程上**
     // （「M3-2u」的采样 PC：`vk_tex_view ← mtl_exec ← dm_gfx_suspend`）—— 所以它是"轮询式等待"的头号嫌疑之一，记账。
     // M3-2w: readback / control clear go through this "one-off submit + wait idle", and it **can run on a guest thread**
@@ -489,7 +510,7 @@ static int one_end_on(VkCommandBuffer cb) {
     VkResult r = vkQueueWaitIdle(vk_queue());
     dm_waitled_leave();
     vk_queue_unlock();
-    if (r != VK_SUCCESS) { LOG("【红】一次性提交等待失败 VkResult %d", (int)r); return 0; }
+    if (r != VK_SUCCESS) { step_fail("vkQueueWaitIdle 返回 %d", (int)r); LOG("【红】一次性提交等待失败 VkResult %d", (int)r); return 0; }
     return 1;
 }
 static int one_begin(void) { return one_begin_on(&g_cb); }        // 读回 / 对照清除 | readback / control clear
@@ -584,7 +605,7 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
         uint32_t w = e->w >> l, h = e->h >> l; if (!w) w = 1; if (!h) h = 1;
         total += (VkDeviceSize)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * e->layers * (e->d > 1 ? e->d : 1);
     }
-    if (!total) return 0;
+    if (!total) { step_fail("算出来的上传字节数是 0"); return 0; }
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = total,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
     VkBuffer stg = VK_NULL_HANDLE;
@@ -594,15 +615,18 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     // device it is exactly what accompanies the hundreds of 「贴图上传失败」 lines; `vkAllocateMemory` / `vkMapMemory` can
     // both wait inside the driver (allocator / non-coherent mapping).
     dm_waitled_enter("vk：上传：建中转缓冲 + 分配 + 映射");
-    if (vkCreateBuffer(vk_dev(), &bci, NULL, &stg) != VK_SUCCESS) { dm_waitled_leave(); return 0; }
+    { VkResult cr = vkCreateBuffer(vk_dev(), &bci, NULL, &stg);
+      if (cr != VK_SUCCESS) { step_fail("上传：vkCreateBuffer 返回 %d", (int)cr); dm_waitled_leave(); return 0; } }
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk_dev(), stg, &mr);
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
         .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
     VkDeviceMemory sm = VK_NULL_HANDLE;
-    if (vkAllocateMemory(vk_dev(), &mai, NULL, &sm) != VK_SUCCESS) { dm_waitled_leave(); vkDestroyBuffer(vk_dev(), stg, NULL); return 0; }
+    { VkResult ar = vkAllocateMemory(vk_dev(), &mai, NULL, &sm);
+      if (ar != VK_SUCCESS) { step_fail("上传：vkAllocateMemory 返回 %d", (int)ar); dm_waitled_leave(); vkDestroyBuffer(vk_dev(), stg, NULL); return 0; } }
     vkBindBufferMemory(vk_dev(), stg, sm, 0);
     void *smap = NULL;
-    if (vkMapMemory(vk_dev(), sm, 0, VK_WHOLE_SIZE, 0, &smap) != VK_SUCCESS) { dm_waitled_leave(); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
+    { VkResult mp = vkMapMemory(vk_dev(), sm, 0, VK_WHOLE_SIZE, 0, &smap);
+      if (mp != VK_SUCCESS) { step_fail("上传：vkMapMemory 返回 %d", (int)mp); dm_waitled_leave(); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; } }
     dm_waitled_leave();
 
     // **上传走自己那条命令缓冲（`g_cb_up`），也不拿 `g_one_mu`**。两件都要：调用方 `tex_of` 正**持着 `g_mu`** 调进来，
@@ -640,7 +664,7 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
             off += (VkDeviceSize)row_bytes * rows * (slices ? slices : 1);
         }
     }
-    if (!ok) { static int said; if (!said++) LOG("【红】解排布失败：格式 %#x 目标 %d（见 nvn_deswizzle.c 的限制）", t->d.format, t->d.target); }
+    if (!ok) { step_fail("解排布失败（格式 %#x 目标 %d）", t->d.format, t->d.target); static int said; if (!said++) LOG("【红】解排布失败：格式 %#x 目标 %d（见 nvn_deswizzle.c 的限制）", t->d.format, t->d.target); }
     VkImageMemoryBarrier b1 = b0;
     b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1012,7 +1036,12 @@ static int grab_ser_locked(uint64_t serial, unsigned level, uint8_t *dst, size_t
         } else { ok = 0; LOG("【红】读回：中转缓冲映射不出（尺寸 %ux%u、%llu 字节）", w, h, (unsigned long long)((VkDeviceSize)w * h * bpp)); }
     } else {
         static int said;
-        if (!said++) LOG("【红】读回：命令缓冲那一套没走通（格式 %d 尺寸 %ux%u）", (int)fmt, w, h);
+        // M3-2x：前 5 次都打（原来只打第一次）—— "设备丢失先丢的是谁"要的是**第一次真的失败**，
+        // 而第一次失败可能是别的原因，把后面那次盖掉。句子里补上"哪一步 + VkResult"。
+        // M3-2x: log the first 5 (it used to be the first only). "Who is dropped first on device loss" wants the first
+        // **real** failure, and a benign first failure could hide it. The message now carries the step and the result.
+        if (said++ < 5) LOG("【红】读回：命令缓冲那一套没走通（格式 %d 尺寸 %ux%u，在「%s」）", (int)fmt, w, h,
+                            g_step_fail[0] ? g_step_fail : "?");
     }
     // 拷完图像停在 TRANSFER_SRC：把布局记准，下一次转换才知道从哪来
     // The image stays in TRANSFER_SRC after the copy: record that layout so the next transition knows where from
@@ -1245,7 +1274,8 @@ static VkImage tex_of(const tex_t *t, VkImageView *view, VkImageAspectFlags *asp
         if (!e->img) { if (!ent_build(t, e)) { e->serial = 0; g_n--; pthread_mutex_unlock(&g_mu); return VK_NULL_HANDLE; } }
         VkImageAspectFlags a = e->depth_like ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (e->dsa ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
         if (t->mem) {
-            if (!ent_upload(t, e, a)) LOG("【红】贴图上传失败 serial=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
+            if (!ent_upload(t, e, a)) LOG("【红】贴图上传失败 serial=%llu 格式 %#x（在「%s」）", (unsigned long long)t->serial, t->d.format,
+                                          g_step_fail[0] ? g_step_fail : "?");
         } else {
             // 窗口贴图：池里没有真值（本来就没有池），内容只来自 GPU，所以进图就是"GPU 写过"那一档
             // A window texture: the pool holds no truth (there is no pool) and the content only ever comes from the
