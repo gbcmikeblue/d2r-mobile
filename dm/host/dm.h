@@ -77,7 +77,36 @@ void crash_watch_progress(uint32_t tick, const char *stage);
 void crash_watch_frame(void);
 void crash_watch_pregame_done(void);
 uint64_t crash_watch_progress_count(void);
+const char *crash_watch_stage(void);   // 看门狗记的当前阶段（M3-2w：屏上那行可读数字用它） | the current stage the watchdog recorded (M3-2w: the on-screen readout uses it)
 void crash_dump_now(const char *why);   // 按需导出现场（线程 + 图形等待点），不退出 | Dump state on demand (threads + graphics wait points), without exiting
+// M3-2w：宿主侧"等待站点"账本（实现在 crash.c：它必须能被任何链接组合取到，图形单测只链 crash.c）——
+// 把我们在**客体线程上**做的 usleep / nanosleep 轮询都记一笔进出；
+// 转储里列出"当前打开的站点"。开关 DM_WAITLED=0 整个关掉（缺省开，代价是两三次 clock_gettime）。
+// M3-2w: the host-side "wait sites" ledger (implemented in diag.c) -- every usleep / nanosleep poll we do **on a guest
+// thread** records an enter/leave pair, and a dump lists "the sites currently open". DM_WAITLED=0 turns it off (on by
+// default; it costs a couple of clock_gettime calls).
+void dm_waitled_enter(const char *site);
+void dm_waitled_leave(void);
+void dm_waitled_dump(void);
+// 同一本账的第二个用途（M3-2w）：**对驱动的调用**也记一笔，站点名就是"vk：调用名"。
+// 为什么需要它：「M3-2w」把"我们自己写的等待"全记上之后，停住现场里**主线程一条都不在账上** ⇒ 它的 nanosleep 只能来自
+// **驱动内部**（libvulkan 自己 usleep/nanosleep 轮询，pc 落在 libc 的 usleep，回溯在这一层失真 —— 「M3-2v」的
+// `mtl_wait+0x214` 就是失真产物：反汇编显示那是"早已滑出在飞窗口 → 直接 return 1"这条**不等待**分支的返回地址）。
+// 所以要问的是"**哪个 vk 调用**里在等"：在每个调用点前后各写一行（不写宏 —— 这些调用大多要判返回值，
+// 宏当不了表达式）：
+//     dm_waitled_enter("vk：提交命令缓冲");
+//     r = vkQueueSubmit(...);
+//     dm_waitled_leave();
+// The ledger's second use (M3-2w): **calls into the driver** record an entry too, with "vk：<call>" as the site name.
+// Why it is needed: once every wait we wrote ourselves is on the books, the stalled scene shows **not one guest main
+// thread entry** ⇒ its nanosleep can only come from **inside the driver** (libvulkan polls with usleep/nanosleep, the pc
+// lands in libc's usleep and the backtrace is distorted at that layer -- "M3-2v"'s `mtl_wait+0x214` is exactly such an
+// artefact: disassembly shows it is the return of the **no-wait** branch "already out of the in-flight window -> return
+// 1"). So the question becomes "which vk call is it waiting in": write one line before and after each call site (no
+// macro -- most of these calls need their return value checked, and a statement macro cannot be an expression):
+//     dm_waitled_enter("vk：submit command buffer");
+//     r = vkQueueSubmit(...);
+//     dm_waitled_leave();
 // 诊断开关：main 启动时从环境变量读一次（getenv 要拿 libc 全局环境锁，进热路径会让全部客体线程排队）
 // Diagnostic switches: read once from environment variables when main starts (getenv takes the libc global environment lock, and on a hot path it would make all guest threads queue up)
 extern uint64_t g_t0_ns;   // 宿主启动时刻（now_ns），日志相对时间用 | Host start time (now_ns), used for relative times in the log

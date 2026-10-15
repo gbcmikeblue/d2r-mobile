@@ -379,7 +379,15 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     { void dm_world_pump(void); dm_world_pump(); }   // 点世界目标 = 交互（dm_world.c） | tapping a world target = interact (dm_world.c)
     dm_ui_mouse_pump();   // 界面鼠标消息（原生点击）在取手柄处发：主线程、每帧一条 | UI mouse messages (native clicks) are sent at the controller read: main thread, one per frame
     { void dm_aim_cone_pump(void); dm_aim_cone_pump(); }   // 手指方向选目标：右摇杆归零时恢复（hle_private_aim.c） | target selection by finger direction: restored when the right stick returns to zero (hle_private_aim.c)
-    if (atomic_load(&g_stall_due) && atomic_exchange(&g_stall_due, 0)) usleep((useconds_t)g_stall_ms * 1000);   // DM_TEST_HID_STALL_MS
+    // M3-2w：DM_TEST_HID_STALL_MS 这条注入也走账本（它就在客体线程上），这样"账本能点名"本身是可验的：
+    // 设了它的那一轮，转储里必须出现这个名字。
+    // M3-2w: the DM_TEST_HID_STALL_MS injection goes through the ledger too (it sits on a guest thread), which makes
+    // "the ledger can name it" verifiable: a run with it set must show this name in the dump.
+    if (atomic_load(&g_stall_due) && atomic_exchange(&g_stall_due, 0)) {
+        dm_waitled_enter("DM_TEST_HID_STALL_MS：手柄读取处注入的停顿");
+        usleep((useconds_t)g_stall_ms * 1000);
+        dm_waitled_leave();
+    }
     uint64_t read_start_ns = g_receipt_file ? now_ns() : 0; // 覆盖整个多原子字段读取区间 | covers the whole read interval of the multi-atomic fields
     memset(s, 0, sizeof *s);
     s->sampling = ++g_sampling;

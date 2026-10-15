@@ -285,7 +285,14 @@ static VkResult make_compute(const vk_shader *cs, VkPipelineLayout lay, VkPipeli
     // Through the pipeline cache shared by graphics and compute (see the note in vk_device.c); pipeline creation needs
     // external serialisation, hence the lock pair
     vk_dev_pcache_lock();
+    // M3-2w：建管线是"驱动内部编译"的经典长调用（驱动常在里面 usleep 轮询编译线程），而且它**跑在客体线程上** ——
+    // 卡在界面切换（换一批渲染状态就要新管线）时，这里必须能被账本点名。
+    // M3-2w: pipeline creation is the classic long "the driver compiles inside" call (drivers often poll a compile thread
+    // with usleep) and it **runs on guest threads** -- when a scene change (which needs new pipelines for a new set of
+    // render states) hangs, the ledger has to be able to name this. 
+    dm_waitled_enter("vk：建计算管线（驱动内部编译）");
     VkResult r = vkCreateComputePipelines(vk_dev(), vk_dev_pcache(), 1, &ci, NULL, out);
+    dm_waitled_leave();
     vk_dev_pcache_unlock();
     return r;
 }
@@ -666,7 +673,9 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
     // 同计算管线：走共用的管线缓存（建管线要外部串行化，套一对锁）
     // Same as the compute path: through the shared pipeline cache (creation needs external serialisation, hence the lock)
     vk_dev_pcache_lock();
+    dm_waitled_enter("vk：建图形管线（驱动内部编译）");   // M3-2w：同计算管线那条说明 | M3-2w: same note as the compute path
     VkResult r = vkCreateGraphicsPipelines(vk_dev(), vk_dev_pcache(), 1, &ci, NULL, &p);
+    dm_waitled_leave();
     vk_dev_pcache_unlock();
     if (r != VK_SUCCESS) {
         g_n_fail++;

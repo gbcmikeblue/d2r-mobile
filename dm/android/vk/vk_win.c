@@ -201,11 +201,19 @@ int vk_win_present_rgba(const uint8_t *rgba, uint32_t w, uint32_t h) {
     if (!staging_ensure(w, h)) { LOG("【红】窗口：中转那两样建不出来（%ux%u）", w, h); return 0; }
 
     void *p = NULL;
-    if (vkMapMemory(vk_dev(), g_smem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return 0;
+    dm_waitled_enter("vk：映射上屏中转缓冲（前端线程）");
+    VkResult wmr = vkMapMemory(vk_dev(), g_smem, 0, VK_WHOLE_SIZE, 0, &p);
+    dm_waitled_leave();
+    if (wmr != VK_SUCCESS) return 0;
     memcpy(p, rgba, (size_t)w * h * 4);
     vkUnmapMemory(vk_dev(), g_smem);
 
+    // M3-2w：上屏前等上一帧的栅栏（无上限）—— 前端线程上的一处宿主等待，记账（驱动内部同样是 1 毫秒一睡轮询）。
+    // M3-2w: waiting for the previous frame's fence (no timeout) before presenting -- a host wait on the front-end thread,
+    // recorded here (the driver polls inside with a 1 ms sleep too).
+    dm_waitled_enter("上屏：等上一帧的栅栏（无上限，前端线程）");
     vkWaitForFences(vk_dev(), 1, &g_fence, VK_TRUE, UINT64_MAX);
+    dm_waitled_leave();
     // 前端走**自己的那条队列**（能呈现的族上的第二条，见 vk_device.h）：这样取图/上屏不必与客体的提交争一把锁。
     // 只有退回同一条队列时才加锁 —— 实测共用一条时两边会互相堵死（客体在队列调用里等驱动仍持锁 → 前端卡在取锁上）。
     // The front end uses **its own queue** (the second one on the presenting family, see vk_device.h), so acquiring and
@@ -219,7 +227,9 @@ int vk_win_present_rgba(const uint8_t *rgba, uint32_t w, uint32_t h) {
     // 取图像**给超时**：屏幕关掉 / 合成器忙的时候交换链可能长时间没有可用图像；共用队列时那段时间还会把客体堵住。
     // Acquire **with a timeout**: with the screen off, or the compositor busy, the swapchain can have no image available
     // for a long time, and when the queue is shared that also blocks the guest.
+    dm_waitled_enter("上屏：取交换链图像（100 毫秒超时，前端线程）");
     VkResult r = vkAcquireNextImageKHR(vk_dev(), g_sc, 100000000ull, g_acq, VK_NULL_HANDLE, &idx);   // 100 ms
+    dm_waitled_leave();
     // 交换链过期（窗口尺寸变了之类）：拆掉重建，这一帧就算了，下一帧自然重来
     // Out-of-date swapchain (the window was resized and such): tear down and rebuild; this frame is skipped and the next
     // one simply retries
@@ -277,10 +287,18 @@ int vk_win_present_rgba(const uint8_t *rgba, uint32_t w, uint32_t h) {
         .pWaitDstStageMask = &wait, .commandBufferCount = 1, .pCommandBuffers = &g_cb,
         .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rdy };
     vkResetFences(vk_dev(), 1, &g_fence);
-    if (vkQueueSubmit(q, 1, &si, g_fence) != VK_SUCCESS) { if (lock) vk_queue_unlock(); return 0; }
+    // M3-2w：上屏这条路的提交与呈现也记账 —— `vkQueuePresentKHR` 是"等合成器/等 vsync"的经典位置（前端线程）。
+    // M3-2w: the present path's submit and present are recorded too -- `vkQueuePresentKHR` is the classic "wait for the
+    // compositor / vsync" spot (front-end thread).
+    dm_waitled_enter("vk：上屏提交（前端线程）");
+    VkResult wsr = vkQueueSubmit(q, 1, &si, g_fence);
+    dm_waitled_leave();
+    if (wsr != VK_SUCCESS) { if (lock) vk_queue_unlock(); return 0; }
     VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
         .pWaitSemaphores = &g_rdy, .swapchainCount = 1, .pSwapchains = &g_sc, .pImageIndices = &idx };
+    dm_waitled_enter("vk：上屏呈现 vkQueuePresentKHR（前端线程）");
     VkResult pr = vkQueuePresentKHR(q, &pi);
+    dm_waitled_leave();
     if (lock) vk_queue_unlock();   // 共用队列时：取图像 → 提交 → 上屏整段都在锁里 | when shared: acquire -> submit -> present is one critical section
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) sc_destroy();
     return 1;

@@ -48,6 +48,11 @@ int vk_diag_line(char *buf, size_t cap);
 // The host's on-demand state dump (crash.c): what each thread waits on plus the graphics wait points, **without
 // exiting**. Declared locally for the same reason as the two above.
 void crash_dump_now(const char *why);
+// M3-2w：给屏上那行数字用的两个宿主读数（同样就地声明）：引擎拍、以及看门狗记的当前阶段。
+// M3-2w: the two host readings behind the on-screen line (declared locally as well): the engine tick and the stage the
+// watchdog last recorded.
+uint32_t dm_cur_tick(void);   // 服务端拍（diag.c；不在局内返回 0） | the server tick (diag.c; 0 when not in a run)
+const char *crash_watch_stage(void);
 
 // 宿主那套的环境准备与 dm_main 的交接（dm/android/main_android.c）：**与 APK 必须完全一致**，所以那边只留一个实现，
 // 这里直接调它，而不是把环境准备抄一遍（抄一遍就会漂）。
@@ -133,6 +138,12 @@ static int g_guest_started;             // 游戏只起一次（TERM_WINDOW/INIT
 static uint8_t *g_img;                  // 主机内存里的一帧（RGBA8）| one frame in host memory (RGBA8)
 static int g_perm_files;                // "所有文件访问"是否已授予 | whether all files access is granted
 static int32_t g_btn_x, g_btn_y, g_btn_w, g_btn_h;   // 申请按钮（**图像坐标**）| the request button, in image coordinates
+// M3-2w：屏幕上那两个"给用户用"的口子的状态（详细说明见 hud_overlay 那一段）——数字行、点角落取现场。
+// M3-2w: the state of the two user-facing on-screen affordances (details in the hud_overlay section) -- the readout
+// line and the corner tap that takes a state dump.
+static int g_hud_text, g_hud_tap;
+static volatile int g_tap_dump;   // 点角落 → 交给下一跳心跳（volatile 够用：写一次读一次）| corner tap -> next heartbeat (volatile is enough: one write, one read)
+static struct { double t; uint64_t present; unsigned tick; char stage[28]; uint64_t vok, vskip; } g_hud;
 
 static double now_s(void) {
     struct timespec ts;
@@ -360,11 +371,23 @@ static void perm_tick(double t) {
 // (presenting is fit-and-centre, so there are black bars in between).
 static int32_t on_input(struct android_app *app, AInputEvent *ev) {
     (void)app;
-    if (g_perm_files) return 0;
     if (AInputEvent_getType(ev) != AINPUT_EVENT_TYPE_MOTION) return 0;
     if ((AMotionEvent_getAction(ev) & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_DOWN) return 0;
     int ix = 0, iy = 0;
     if (!vk_win_window_to_src(AMotionEvent_getX(ev, 0), AMotionEvent_getY(ev, 0), IMG_W, IMG_H, &ix, &iy)) return 0;
+    // M3-2w：点屏幕**左下角** = 取一份现场，和 `dump.trigger` 是同一件事（DM_HUD_TAP=1 才开，缺省关）。
+    // 为什么要有它：adb 掉线、或者画面已经冻住的时候，用户自己按一下就能留现场，不必等电脑接上；
+    // 为什么在权限判断**之前**：授权之后触摸仍然要能用它。为什么放左下角：那一块在游戏里通常没有可点的界面。
+    // M3-2w: tapping the **bottom-left corner** takes a state dump -- the same thing dump.trigger does (only with
+    // DM_HUD_TAP=1, off by default). Why: when adb is gone or the picture has already frozen, the user can leave a
+    // scene behind with one tap instead of waiting for a computer. Why before the permission check: it must keep
+    // working after the permission is granted. Why the bottom left: that corner usually has no tappable UI in the game.
+    if (g_hud_tap && ix < IMG_W / 5 && iy > IMG_H * 4 / 5) {
+        LOGI("点按左下角（图像坐标 %d,%d）：取一份现场", ix, iy);
+        g_tap_dump = 1;   // 交给下一跳心跳去做（转储要几秒，别堵住输入线程）| handed to the next heartbeat (a dump takes seconds; do not block the input thread)
+        return 1;
+    }
+    if (g_perm_files) return 0;
     if (ix < g_btn_x || ix >= g_btn_x + g_btn_w || iy < g_btn_y || iy >= g_btn_y + g_btn_h) return 0;
     LOGI("点了授权按钮（图像坐标 %d,%d）", ix, iy);
     perm_open_settings();
@@ -396,6 +419,76 @@ static uint64_t g_hb_present;   // 上次心跳时的出图次数 | present coun
 static int g_hb_stall_s;        // 连续多少秒没有新出图 | consecutive seconds without a new present
 static int g_hb_blink = 1;      // 每次出图翻转 | flipped on every present
 
+// ---------- M3-2w：屏上那行可读数字（缺省关，DM_HUD_TEXT=1 开）----------
+// 方块只说得清"在跑 / 卡住"，说不清"卡在哪一步"。这一行把眼下最要紧的五个数摆上屏：T+秒、出图（F）、拍（P）、
+// 阶段（S）、查看器读成/跳过（V）。**自带 5×7 点阵字模**：安卓的系统字体不在 app 里，为了几个数去拖一个字体文件
+// 不值当。冻住时**定格**：连续 8 秒没有新出图就不再更新这份快照（屏上留的就是冻住那一刻的数），并转成红字。
+// 为什么缺省关：它在**前端线程**里逐像素画，量帧耗时的时候不该混进来。
+// 另一个取现场的口：`DM_HUD_TAP=1` 时点屏幕**左下角** = 取一份现场（见 on_input），adb 掉线或画面冻住时用户自己就能取。
+// ---------- M3-2w: the on-screen readout line (off by default, DM_HUD_TEXT=1 turns it on) ----------
+// The squares say "running / stuck" but not "stuck at which step". This line puts the five numbers that matter up on
+// screen: T+seconds, presents (F), tick (P), stage (S), viewer read/skipped (V). It carries its **own 5x7 bitmap font**
+// (Android's system fonts are not inside the app, and dragging one in for a few numbers is not worth it). When it
+// freezes it **holds**: after 8 seconds with no new present the snapshot stops updating (the screen keeps the numbers
+// from the moment it froze) and turns red. Off by default because it paints pixel by pixel **on the front-end thread**,
+// which must not be mixed into frame-budget measurements. The other way to take a state dump: with `DM_HUD_TAP=1`, tap
+// the **bottom-left corner** (see on_input), so the user can take one when adb is gone or the picture has frozen.
+// （两个开关与那份快照的状态声明在文件上部，靠近按钮坐标 —— on_input 也要用它们。）
+// (The two switches and the snapshot are declared near the top with the button geometry -- on_input needs them too.)
+// 5×7 点阵字模：每字符 7 行、每行低 5 位（bit4 = 最左）。只做 HUD 那一行用得到的字符（0-9、A-Z、+ - : . / = 与空格），
+// 小写按大写画 —— **不是**字库，别当字体用。
+// 5x7 bitmap font: 7 rows per glyph, low 5 bits each (bit4 = leftmost). Only what the HUD line needs (0-9, A-Z,
+// + - : . / = and space), with lowercase drawn as uppercase -- **not** a font, do not use it as one.
+static const struct { char c; uint8_t g[7]; } g_hud_glyphs[] = {
+    {'0', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}}, {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}}, {'3', {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E}},
+    {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}}, {'5', {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}},
+    {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}}, {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}}, {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+    {'A', {0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11}}, {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
+    {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}}, {'D', {0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C}},
+    {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}}, {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+    {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}}, {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}}, {'J', {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C}},
+    {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}}, {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+    {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}}, {'N', {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11}},
+    {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}}, {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'Q', {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}}, {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+    {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}}, {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}}, {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}},
+    {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11}}, {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}},
+    {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}}, {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
+    {'+', {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00}}, {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+    {':', {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}}, {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06}},
+    {'/', {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10}}, {'=', {0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00}},
+    {'%', {0x11, 0x02, 0x02, 0x04, 0x08, 0x08, 0x11}},
+};
+static const uint8_t *hud_glyph(char c) {
+    static const uint8_t blank[7] = { 0, 0, 0, 0, 0, 0, 0 };
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    for (unsigned i = 0; i < sizeof g_hud_glyphs / sizeof g_hud_glyphs[0]; i++)
+        if (g_hud_glyphs[i].c == c) return g_hud_glyphs[i].g;
+    return blank;
+}
+// 画一行字：每个亮像素画成 sc×sc 的方块，字符间留一列。越界自动裁掉（不写出去）。
+// Draw one line of text: every lit pixel becomes an sc x sc square, one column between glyphs. Out-of-range pixels are
+// dropped (nothing written outside the buffer).
+static void hud_text(uint8_t *b, uint32_t w, uint32_t h, int x, int y, int sc, const char *s, uint8_t r, uint8_t g, uint8_t bl) {
+    for (; *s; s++) {
+        const uint8_t *gl = hud_glyph(*s);
+        for (int row = 0; row < 7; row++) for (int col = 0; col < 5; col++) {
+            if (!(gl[row] & (1u << (4 - col)))) continue;
+            for (int dy = 0; dy < sc; dy++) for (int dx = 0; dx < sc; dx++) {
+                int px = x + col * sc + dx, py = y + row * sc + dy;
+                if (px < 0 || py < 0 || px >= (int)w || py >= (int)h) continue;
+                uint8_t *p = b + ((size_t)py * w + (unsigned)px) * 4;
+                p[0] = r; p[1] = g; p[2] = bl; p[3] = 255;
+            }
+        }
+        x += 6 * sc;
+    }
+}
+
 static void hud_overlay(uint8_t *b, uint32_t w, uint32_t h) {
     if (!b || w < 64 || h < 96) return;
     uint32_t s = w / 22;
@@ -411,6 +504,22 @@ static void hud_overlay(uint8_t *b, uint32_t w, uint32_t h) {
         p1[0] = p1[1] = p1[2] = hb; p1[3] = 255;
         uint8_t *p2 = b + ((size_t)(y0 + s * 2 + y) * w + x0 + x) * 4;
         p2[0] = st[0]; p2[1] = st[1]; p2[2] = st[2]; p2[3] = 255;
+    }
+    // M3-2w：那一行可读数字（缺省关）—— 左上角，与右下角的方块、屏幕下方那个按钮都不打架。
+    // M3-2w: the readout line (off by default) -- top left, clear of the squares at bottom right and the button near
+    // the bottom of the screen.
+    if (g_hud_text) {
+        char line[160];
+        snprintf(line, sizeof line, "T+%.0fS F=%llu P=%u S=%.20s V=%llu/%llu",
+                 g_hud.t, (unsigned long long)g_hud.present, g_hud.tick, g_hud.stage,
+                 (unsigned long long)g_hud.vok, (unsigned long long)g_hud.vskip);
+        int sc = (int)(w / 800);   // 1600 宽 → 2（一行约 600 像素）| 1600 wide -> 2 (a line is about 600 px)
+        if (sc < 1) sc = 1;
+        if (sc > 3) sc = 3;
+        uint8_t r = 250, g = 250, bl = 250;
+        if (g_hb_stall_s >= 8) { r = 255; g = 60; bl = 60; }        // 冻住：定格 + 红字 | frozen: held, and red
+        else if (g_hb_stall_s) { r = 250; g = 210; bl = 60; }
+        hud_text(b, w, h, (int)(w / 64), (int)(h / 64), sc, line, r, g, bl);
     }
 }
 
@@ -647,6 +756,15 @@ void android_main(struct android_app *app) {
     g_src_lv = lv ? (unsigned)strtoul(lv, NULL, 10) : 0;
     LOGI("贴图查看器的源序号 %llu、第 %u 级（DM_WIN_SRC / DM_WIN_LEVEL 可改，序号 0 = 关）",
          (unsigned long long)g_src_ser, g_src_lv);
+    // M3-2w：给用户用的那两个口子，**缺省都关**（独立开关，不抢主线）：屏上一行可读数字、点左下角取现场。
+    // M3-2w: the two user-facing affordances, **both off by default** (separate switches, they do not take over the main
+    // line): the on-screen readout line and the bottom-left tap that takes a state dump.
+    { const char *a = getenv("DM_HUD_TEXT"), *b = getenv("DM_HUD_TAP");
+      g_hud_text = a ? atoi(a) != 0 : 0;
+      g_hud_tap = b ? atoi(b) != 0 : 0;
+      if (g_hud_text || g_hud_tap)
+          LOGI("HUD：数字行 %d、点左下角取现场 %d（DM_HUD_TEXT / DM_HUD_TAP，缺省都关；量帧预算时别开）",
+               g_hud_text, g_hud_tap); }
     // 按钮：画面 70% 宽、9% 高，横居中、贴底部 12% 处（**图像坐标**，触摸会换算到这里）
     // The button: 70% of the width and 9% of the height, centred, 12% up from the bottom (in **image** coordinates; a
     // touch is mapped into that space)
@@ -690,6 +808,17 @@ void android_main(struct android_app *app) {
                 vk_diag_line(dl, sizeof dl);
                 if (p == g_hb_present) g_hb_stall_s++;
                 else { g_hb_stall_s = 0; g_hb_present = p; }
+                // M3-2w：屏上那行数字的快照（**冻住时不再更新 = 定格**，屏上留的就是冻住那一刻的数）。
+                // 阶段串可能很长（`CharacterCreate:Hover:Barbarian`），HUD 那行只放得下前 20 个字符，截断即可。
+                // M3-2w: the snapshot behind the on-screen line (**not updated while frozen = held**, so the screen keeps
+                // the numbers from the moment it froze). The stage string can be long (CharacterCreate:Hover:Barbarian)
+                // and the HUD line only fits 20 characters, so it is truncated there.
+                if (g_hud_text && g_hb_stall_s < 8) {
+                    const char *stg = crash_watch_stage();
+                    g_hud.t = now; g_hud.present = p; g_hud.tick = dm_cur_tick();
+                    snprintf(g_hud.stage, sizeof g_hud.stage, "%s", stg ? stg : "?");
+                    g_hud.vok = g_view_ok; g_hud.vskip = g_view_skip;
+                }
                 LOGI("心跳：%s；查看器 读成 %llu、跳过 %llu；%s", dl, (unsigned long long)g_view_ok,
                      (unsigned long long)g_view_skip, g_hb_stall_s ? "出图没有推进" : "出图在推进");
                 if (g_hb_stall_s == 8)
@@ -705,6 +834,12 @@ void android_main(struct android_app *app) {
                 // keeps running. Create the file again for another dump.
                 { static const char *tp = "/sdcard/Android/data/ai.d2rm.dm/files/dump.trigger";
                   if (access(tp, F_OK) == 0) { remove(tp); crash_dump_now("按需触发 dump.trigger"); } }
+                // M3-2w：屏幕左下角那一下是**同一个口**（见 on_input）——adb 掉线或画面冻住时，用户自己按一下就有现场。
+                // 放在这里而不是 on_input 里：转储要几秒，别堵住输入线程。
+                // M3-2w: the bottom-left tap is **the same port** (see on_input) -- when adb is gone or the picture has
+                // frozen, one tap from the user leaves a scene behind. Handled here rather than inside on_input: a dump
+                // takes seconds and must not block the input thread.
+                if (g_hud_tap && g_tap_dump) { g_tap_dump = 0; crash_dump_now("点按屏幕左下角（HUD 取现场口）"); }
             }
         }
         if (vk_win_live()) {

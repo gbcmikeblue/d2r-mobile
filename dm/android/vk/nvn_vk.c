@@ -163,8 +163,13 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
 // 等队列空闲也要外部同步（见 vk_device.h）：这个调用随时可能从前端线程发出来。
 // Everything on the queue has completed: on Android this is simply waiting for the queue to go idle. That wait needs
 // the external synchronisation too (see vk_device.h), since it can come from the front-end thread at any moment.
-void mtl_drain(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（drain）"); vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
-void mtl_finish(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（finish）"); vk_queue_lock(); vkQueueWaitIdle(vk_queue()); vk_queue_unlock(); } }
+// M3-2w：这两处也走账本 —— 它们是客体线程上"等驱动把队列里的活做完"，而驱动内部正是 1 毫秒一睡的轮询
+// （「M3-2v」抓到的宿主链 `nanosleep ← usleep ← …` 就是这个形状）。站点名分开 drain / finish，读转储时不混。
+// M3-2w: these two go through the ledger as well -- they are "a guest thread waiting for the driver to finish the queue",
+// and the driver polls inside with a 1 ms sleep (exactly the shape of the host chain `nanosleep <- usleep <- ...` that
+// "M3-2v" caught). The site names split drain / finish so a dump is not ambiguous.
+void mtl_drain(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（drain）"); vk_queue_lock(); dm_waitled_enter("mtl_drain：等队列空闲（客体线程上等驱动）"); vkQueueWaitIdle(vk_queue()); dm_waitled_leave(); vk_queue_unlock(); } }
+void mtl_finish(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（finish）"); vk_queue_lock(); dm_waitled_enter("mtl_finish：等队列空闲（客体线程上等驱动）"); vkQueueWaitIdle(vk_queue()); dm_waitled_leave(); vk_queue_unlock(); } }
 
 // 统计出参：waits 类的计数还没做（提交落地后才有），池子数是现成的事实。
 // Statistics out-parameters: the waits counters do not exist yet (they arrive with submission), the pool
@@ -830,7 +835,9 @@ static int inflight_take(void) {   // 取一个空闲槽：没有就等（单一
         for (int i = 0; i < MAX_INFLIGHT; i++) {
             uint64_t t0 = now_ns();
             atomic_store(&g_led_fence_wait, 1); g_led_fence_slot = i; g_led_fence_since = t0;
+            dm_waitled_enter("inflight_take：槽池满，等最老那个槽的栅栏");
             VkResult wr = vkWaitForFences(vk_dev(), 1, &g_inf[i].fence, VK_TRUE, 1000000000ull);
+            dm_waitled_leave();
             atomic_store(&g_led_fence_wait, 0);
             if (now_ns() - t0 > 300000000ull)
                 LOG("[vk] 等栅栏：槽 %d 等了 %llu 毫秒（返回 %d，槽的栅栏值 %llu，已提交到栅栏 %llu）", i,
@@ -990,7 +997,12 @@ uint64_t mtl_sub_commit(void) {
     // serialised (see vk_device.h)
     vk_queue_note("客体：提交命令缓冲");
     vk_queue_lock();
+    // M3-2w：这是客体线程**每帧**的提交，也是"等驱动"的头号调用点（驱动内部 poll），进账本。
+    // M3-2w: the guest thread's **per-frame** submit, and the number one "waiting for the driver" call (the driver polls
+    // inside), so it goes on the books. (Written out by hand rather than through VKW: the return value is used below.)
+    dm_waitled_enter("vk：提交命令缓冲");
     r = vkQueueSubmit(vk_queue(), 1, &si, in->fence);
+    dm_waitled_leave();
     vk_queue_unlock();
     if (r != VK_SUCCESS) { LOG("【红】提交失败 VkResult %d", (int)r); return g_fence; }
     in->pending = 1;
@@ -1097,12 +1109,20 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
         if (g_inf[i].pending && g_inf[i].value == fence) {
             uint64_t t0 = now_ns();
             atomic_store(&g_led_fence_wait, 1); g_led_fence_slot = i; g_led_fence_since = t0;
+            // M3-2w：站点名把 timeout 的两种情形分开 —— `nvnSyncWait` 第一次调用是 `mtl_wait(fence, 0)`（本意"看一眼"），
+            // 而 timeout_ns = 0 会回落到 1 秒（下一行），所以这两者在账本里必须是两个名字，否则"是谁在等"又糊了。
+            // M3-2w: the site name splits the two timeout shapes -- `nvnSyncWait` first calls `mtl_wait(fence, 0)` (meant
+            // as "just look") while timeout_ns = 0 falls back to 1 s (next line), so the ledger must name them apart or
+            // "who is waiting" blurs again.
+            dm_waitled_enter(timeout_ns ? "mtl_wait：客体等围栏（带超时）" : "mtl_wait：客体等围栏（timeout=0，落到 1 秒）");
             VkResult r = vkWaitForFences(vk_dev(), 1, &g_inf[i].fence, VK_TRUE, timeout_ns ? timeout_ns : 1000000000ull);
+            dm_waitled_leave();
             atomic_store(&g_led_fence_wait, 0);
             if (now_ns() - t0 > 300000000ull)
-                LOG("[vk] 客体等栅栏：槽 %d（栅栏值 %llu，已提交到 %llu）等了 %llu 毫秒、返回 %d（槽状态 %d）", i,
+                LOG("[vk] 客体等栅栏：槽 %d（栅栏值 %llu，已提交到 %llu）等了 %llu 毫秒、返回 %d（槽状态 %d、客体给的超时 %llu 毫秒）", i,
                     (unsigned long long)g_inf[i].value, (unsigned long long)g_fence,
-                    (unsigned long long)((now_ns() - t0) / 1000000), (int)r, (int)vkGetFenceStatus(vk_dev(), g_inf[i].fence));
+                    (unsigned long long)((now_ns() - t0) / 1000000), (int)r, (int)vkGetFenceStatus(vk_dev(), g_inf[i].fence),
+                    (unsigned long long)(timeout_ns / 1000000));
             inflight_reap();
             return r == VK_SUCCESS;
         }
@@ -1288,7 +1308,10 @@ static VkDescriptorPool desc_pool_at(int slot, int idx) {
     VkDescriptorPoolCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = DESC_POOL_SETS, .poolSizeCount = 5, .pPoolSizes = ps };
     VkDescriptorPool p = VK_NULL_HANDLE;
-    if (vkCreateDescriptorPool(vk_dev(), &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    dm_waitled_enter("vk：建描述符池");
+    VkResult dpres = vkCreateDescriptorPool(vk_dev(), &ci, NULL, &p);
+    dm_waitled_leave();
+    if (dpres != VK_SUCCESS) return VK_NULL_HANDLE;
     if (g_dpool_n[slot] < idx + 1) g_dpool_n[slot] = (uint8_t)(idx + 1);
     return (g_dpool[slot][idx] = p);
 }
@@ -1300,7 +1323,10 @@ static VkDescriptorSet desc_alloc(int slot, VkDescriptorSetLayout lay) {
         VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool = p, .descriptorSetCount = 1, .pSetLayouts = &lay };
         VkDescriptorSet s = VK_NULL_HANDLE;
-        if (vkAllocateDescriptorSets(vk_dev(), &ai, &s) == VK_SUCCESS) return s;
+        dm_waitled_enter("vk：分配描述符集");
+        VkResult das = vkAllocateDescriptorSets(vk_dev(), &ai, &s);
+        dm_waitled_leave();
+        if (das == VK_SUCCESS) return s;
     }
     return VK_NULL_HANDLE;
 }
@@ -1808,7 +1834,7 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
         }
         wr[nw - 1] = w;   // nw 已经加过，所以回填的是刚写的那条 | nw was already incremented, so this fills in the entry just written
     }
-    if (nw) vkUpdateDescriptorSets(vk_dev(), (uint32_t)nw, wr, 0, NULL);
+    if (nw) { dm_waitled_enter("vk：更新描述符集（每帧）"); vkUpdateDescriptorSets(vk_dev(), (uint32_t)nw, wr, 0, NULL); dm_waitled_leave(); }
     return nd;
 }
 

@@ -33,6 +33,10 @@ static uint64_t watch_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 uint64_t crash_watch_progress_count(void) { return atomic_load(&g_watch_count); }
+// 当前阶段字符串（M3-2w：屏上那行可读数字要把「卡在哪个界面」写出来，见 dm/android/apk/main_apk.c 的 HUD）。
+// The current stage string (M3-2w: the on-screen readout prints which screen we are on; see the HUD in
+// dm/android/apk/main_apk.c).
+const char *crash_watch_stage(void) { return g_watch_stage[atomic_load(&g_watch_stage_idx)]; }
 void crash_watch_progress(uint32_t tick, const char *stage) {
     int next = 1 - atomic_load(&g_watch_stage_idx);
     if (stage && *stage) snprintf(g_watch_stage[next], sizeof g_watch_stage[next], "%s", stage);
@@ -92,6 +96,15 @@ static void *watchdog_main(void *arg) {
 void crash_off(const char *tag, uint64_t a) {   // diag.c 也用 | Also used by diag.c
 #define off crash_off
 
+    // M3-2w：先剥掉可能的 PAC 高位 —— Android arm64 的返回地址带指针签名，带签名位的地址 `dladdr` 一律失败，
+    // 于是在回溯里显示成"一串看起来像垃圾的裸地址"（`0x24c6fca47ce57c` 这种形状，实测）。用户空间地址只用低 48 位，
+    // 所以剥掉高 16 位对正常地址没有副作用，却能把这一批帧救回来 —— 「M3-2v」那个说不通的 `mtl_wait+0x214` 就属于这批。
+    // M3-2w: strip the possible PAC high bits first -- Android arm64 return addresses carry pointer signatures, and an
+    // address with signature bits always fails `dladdr`, showing up in a backtrace as "a bare address that looks like
+    // garbage" (measured in the shape `0x24c6fca47ce57c`). User-space addresses use only the low 48 bits, so clearing
+    // the top 16 harms nothing for a normal address and rescues this whole batch of frames -- including "M3-2v"'s
+    // unexplainable `mtl_wait+0x214`.
+    a &= 0x0000ffffffffffffull;
     module_t *m = module_of((void *)a);
     Dl_info di;
     if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
@@ -158,9 +171,171 @@ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // and only once; the always-on DM_SAMPLE sampler lands on an svc on Android (see the measurements in diag.c) and cannot
 // replace it.
 void crash_set_stall_sample(void (*fn)(void)) { g_stall_sample = fn; }
+// ---------- M3-2w：宿主侧"等待站点"账本（谁在等什么，一次点名）----------
+// 「M3-2v」把"停住"缩到"客体主线程卡在宿主侧一次 nanosleep / usleep 轮询里"，宿主链是
+//   `nanosleep ← usleep ← … ← nvnSyncWait（hle_nvn.c）← mtl_wait ← 客体 main+0x1743a0c`
+// 但链上属于我们的等待点有好几处（`mtl_wait` 的 timeout 分支、`inflight_take` 等槽、`nvnSyncWait`、
+// `SleepThread` 的睡眠循环、等「读取画面已撤」的循环…），光看回溯分不出**是哪一处**。这里给它们一本统一的账本：
+//   ① 每个站点进入 / 离开各记一笔（站点名 + 进入时刻），超过 300 毫秒立刻打一行日志 —— 真卡死时 leave 永远不会
+//      执行，日志尾巴就是唯一的线索；
+//   ② 转储（看门狗 / dump.trigger）里列出所有线程"当前打开的站点"与已经等了多久 —— 一次就能点名。
+// 为什么**放在本文件**：它必须能被**任何**链接组合取到（gfx 的单测只链 crash.c + 图形层，见 dm/gfx/tests/Makefile），
+// 而本文件本来就自带时间源（watch_now_ns）且不依赖诊断模块 —— 这与"crash.c 只管信号处理、单测只链本文件"的
+// 既有约束一致。
+// 为什么**不加锁**：它自己在**客体线程上**被调用，加锁等于把一个新的等待引进被测路径（「M3-2n」的锁序反转就是这么来的）。
+// 所以每个线程一个按 tid 散列的固定槽、用原子占位；读者最坏看到"站点名是旧的"，不会崩、不会等。
+// 只记前 WLED_DEPTH 层嵌套，更深的层只计数（站点名照旧是常量字符串，不在热路径上分配）。
+// ---------- M3-2w: the host-side "wait sites" ledger (who waits where, named in one round) ----------
+// "M3-2v" narrowed the stall to "the guest main thread stuck in a host-side nanosleep / usleep poll" with the host
+// chain `nanosleep <- usleep <- ... <- nvnSyncWait (hle_nvn.c) <- mtl_wait <- guest main+0x1743a0c`, but several of the
+// waits on that chain are ours (the timeout branch of `mtl_wait`, `inflight_take` waiting for a slot, `nvnSyncWait`, the
+// `SleepThread` sleep loop, the "loading screen dismissed" loop ...) and the backtrace alone cannot say **which**.
+// So they share one ledger: every site records an enter/leave pair (site name + entry time) and
+//   (1) logs a line past 300 ms -- when it really hangs, the leave never runs and the log tail is the only clue;
+//   (2) the dump (watchdog / dump.trigger) lists the sites every thread currently has open and how long it has waited,
+//       which names it in one round.
+// Why **in this file**: it has to be reachable from **every** link combination (the gfx unit tests link only crash.c
+// plus the graphics layer, see dm/gfx/tests/Makefile), and this file already carries its own time source
+// (watch_now_ns) with no dependency on the diagnostics module -- consistent with the existing constraint that
+// "crash.c only handles signals and the unit tests link only this file".
+// Why **no lock**: this runs **on guest threads**, and adding a lock would introduce a new wait into the very path
+// being measured (that is how the lock-order inversion of "M3-2n" happened). Each thread gets a fixed slot keyed by
+// tid, claimed atomically; the worst a reader sees is a stale site name -- no hang, no crash.
+// Only the first WLED_DEPTH nesting levels are recorded; deeper ones are merely counted (site names are constant
+// strings, so nothing is allocated on the hot path).
+#define WLED_SLOTS 64
+#define WLED_DEPTH 6
+#define WLED_LOG_MS 300
+typedef struct {
+    _Atomic int tid;                 // 0 = 空闲槽 | 0 = free slot
+    int depth;                       // 打开了几层（可能大于 WLED_DEPTH）| how many levels are open (may exceed WLED_DEPTH)
+    struct { const char *site; uint64_t since; } st[WLED_DEPTH];
+    uint64_t last_ms; const char *last_site;   // 最近一次"等完"的读数 | the most recent completed wait
+    uint64_t last_at;                          // 那次"等完"的时刻（"它是多久以前的事"本身就是线索）| when that wait completed ("how long ago" is itself a clue)
+    // 自检用：这个槽第一次被占用时的客体线程句柄（宿主线程为 0）与累计进入次数。
+    // 为什么需要：转储里"某个线程不在账上"必须能分清两种情况 —— ① 它压根没走过这些站点；② 账本把它漏了。
+    // 没有这两项就只能猜（而"账本漏了"恰恰会让一次点名得出相反的结论）。
+    // Self-check: the guest thread handle at first use (0 for host threads) and the cumulative entry count. Why: "a
+    // thread is not on the books" must be distinguishable between (1) it never walked these sites and (2) the ledger
+    // dropped it -- without these two, that can only be guessed (and a dropped entry would flip a naming conclusion).
+    _Atomic int handle;
+    uint64_t n_enter;
+} wled_t;
+static wled_t g_wled[WLED_SLOTS];
+static int g_wled_on = -1;
+static int wled_on(void) {
+    if (g_wled_on < 0) { const char *e = getenv("DM_WAITLED"); g_wled_on = !(e && *e && atoi(e) == 0); }
+    return g_wled_on;
+}
+#if defined(__ANDROID__)
+static int wled_tid(void) { return (int)pthread_gettid_np(pthread_self()); }
+#else
+static int wled_tid(void) { return (int)(uintptr_t)pthread_self(); }   // 苹果：pthread_t 本身就是标识 | Apple: the pthread_t itself is the identity
+#endif
+static wled_t *wled_slot(void) {
+    int tid = wled_tid();
+    unsigned base = ((unsigned)tid * 2654435761u) % WLED_SLOTS;
+    for (unsigned k = 0; k < WLED_SLOTS; k++) {
+        wled_t *s = &g_wled[(base + k) % WLED_SLOTS];
+        if (atomic_load_explicit(&s->tid, memory_order_relaxed) == tid) return s;
+    }
+    for (unsigned k = 0; k < WLED_SLOTS; k++) {
+        wled_t *s = &g_wled[(base + k) % WLED_SLOTS];
+        int expect = 0;
+        if (atomic_compare_exchange_strong(&s->tid, &expect, tid)) {
+            s->depth = 0; s->last_ms = 0; s->last_site = NULL; s->n_enter = 0;
+            for (int i = 0; i < WLED_DEPTH; i++) s->st[i].site = NULL;
+            return s;
+        }
+    }
+    return NULL;   // 槽用满（64 条线程同时等在站点上）：宁可不记也不等 | all slots busy (64 threads waiting at once): better to skip than to wait
+}
+// 进入一个"可能久等"的站点。site 必须是常量字符串（或至少活得比等待长）—— 账本只存指针，不拷贝。
+// Enter a site that may wait long. `site` must be a constant string (or at least outlive the wait): the ledger stores
+// the pointer, it does not copy.
+void dm_waitled_enter(const char *site) {
+    if (!wled_on()) return;
+    wled_t *s = wled_slot(); if (!s) return;
+    uint32_t thr_cur_handle(void);   // 客体线程句柄（hle_thread.c；宿主线程为 0）| guest thread handle (hle_thread.c; 0 for host threads)
+    if (!s->n_enter) atomic_store(&s->handle, (int)thr_cur_handle());
+    s->n_enter++;
+    int d = s->depth;
+    if (d < WLED_DEPTH) { s->st[d].site = site; s->st[d].since = watch_now_ns(); }
+    s->depth = d + 1;
+}
+// 离开（同线程严格 LIFO 配对）。超过 300 毫秒打一行：不看转储也能从日志尾巴读出"谁等了多久"。
+// Leave (strict LIFO pairing within a thread). Past 300 ms it logs a line, so the log tail alone shows who waited how
+// long even without a dump.
+void dm_waitled_leave(void) {
+    if (!wled_on()) return;
+    wled_t *s = wled_slot(); if (!s) return;
+    int d = s->depth - 1;
+    if (d < 0) { s->depth = 0; return; }
+    s->depth = d;
+    if (d < WLED_DEPTH && s->st[d].site) {
+        uint64_t el = watch_now_ns() - s->st[d].since;
+        s->last_ms = el / 1000000; s->last_site = s->st[d].site; s->last_at = watch_now_ns();
+        if (el > (uint64_t)WLED_LOG_MS * 1000000ull) {
+            if (d > 0 && s->st[d - 1].site)
+                LOG("等待站点：%s 等了 %llu 毫秒（外层站点 %s）", s->st[d].site, (unsigned long long)(el / 1000000), s->st[d - 1].site);
+            else LOG("等待站点：%s 等了 %llu 毫秒", s->st[d].site, (unsigned long long)(el / 1000000));
+        }
+        s->st[d].site = NULL;
+    }
+}
+// 停住 / 按需转储时调：列出所有线程"当前打开的站点"（自外向内）与已等多久。真卡死的那条线程一定在这里面。
+// Called on a stall / on-demand dump: lists the sites every thread has open right now (outermost first) and how long it
+// has been waiting. The thread that really is stuck is guaranteed to be in here.
+void dm_waitled_dump(void) {
+    if (!wled_on()) { LOG("  等待站点：关（DM_WAITLED=0）"); return; }
+    uint64_t now = watch_now_ns();
+    int n = 0, used = 0;
+    for (int i = 0; i < WLED_SLOTS; i++) {
+        wled_t *s = &g_wled[i];
+        int tid = atomic_load_explicit(&s->tid, memory_order_relaxed);
+        if (!tid) continue;
+        used++;
+        if (s->depth <= 0) continue;
+        n++;
+        char nest[512]; int o = 0; nest[0] = 0;
+        for (int d = 0; d < WLED_DEPTH && d < s->depth; d++)
+            if (s->st[d].site) o += snprintf(nest + o, sizeof nest - o, "%s%s", d ? " > " : "", s->st[d].site);
+        LOG("  等待站点：tid %d（客体线程 %#x）已等 %llu 毫秒、%d 层：%s", tid, atomic_load(&s->handle),
+            (unsigned long long)((now - s->st[0].since) / 1000000), s->depth, o ? nest : "?");
+        if (s->last_site && s->last_ms >= WLED_LOG_MS)
+            LOG("  等待站点：tid %d 上一次等完的是「%s」，等了 %llu 毫秒", tid, s->last_site, (unsigned long long)s->last_ms);
+    }
+    if (!n) LOG("  等待站点：没有线程停在记账的等待里（不在这些站点上等，或它们都是短等）");
+    // 自检：账本用过几个槽、各自是谁、进来过几次。**"某个线程不在上面"必须能与"账本漏了它"分开** ——
+    // 否则一次点名会把"没走这些站点"误读成"不在等待里"。
+    // Self-check: how many slots were ever used, by whom, and how many entries each. "A thread is not listed" must be
+    // distinguishable from "the ledger dropped it", or a naming round misreads "never walked these sites" as "not
+    // waiting at all".
+    LOG("  等待站点：账本用过的槽 %d/%d（DM_WAITLED=0 关）", used, WLED_SLOTS);
+    int shown = 0;
+    for (int i = 0; i < WLED_SLOTS && shown < 24; i++) {
+        wled_t *s = &g_wled[i];
+        int tid = atomic_load_explicit(&s->tid, memory_order_relaxed);
+        if (!tid || !s->n_enter) continue;
+        shown++;
+        // 顺便给出"最后等完的是哪个站点"：某条线程"现在 0 层"时，**它上一次是从哪里出来的**就是下一条线索
+        //（例如"刚从提交里出来就没再进过任何站点"与"一直在 SleepThread 上"是两种完全不同的处境）。
+        // Also give the site it last completed a wait in: when a thread sits at "0 levels", **where it last came out of**
+        // is the next clue (e.g. "just came out of a submit and has not entered anything since" and "has been on
+        // SleepThread all along" are two very different situations).
+        char tail[192] = "";
+        if (s->last_site)
+            snprintf(tail, sizeof tail, "，最后等完的是「%s」（%llu 毫秒的等，结束于 %llu 毫秒前）", s->last_site,
+                     (unsigned long long)s->last_ms, (unsigned long long)((now - s->last_at) / 1000000));
+        LOG("  等待站点：账本槽 tid %d = 客体线程 %#x，累计进过 %llu 次（现在 %d 层%s）", tid,
+            atomic_load(&s->handle), (unsigned long long)s->n_enter, s->depth, tail);
+    }
+    if (used > shown) LOG("  等待站点：账本还有 %d 个槽未列出", used - shown);
+}
+
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
-void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_stall_sample) g_stall_sample(); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_stall_sample) g_stall_sample(); dm_waitled_dump(); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
 // 崩在客体地址上时，把 /proc/self/maps 里覆盖该地址的那一行打出来。
 // 理由：安卓没有 ESR 的读写位（见 dm_uctx.h），光看寄存器分不清「这一页根本没映射」还是「这一页被写保护」——
 // 两者的修法完全不同（前者是宿主没铺到那页，后者是脏页跟踪的缺页钩子没接住），所以现场必须带上这一行。

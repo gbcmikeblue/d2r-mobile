@@ -986,8 +986,18 @@ int svc_thread(int num, uint64_t *regs) {
                                                (unsigned long long)(ns / 1000000), (unsigned long long)me->last_lr); } }
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
+            // M3-2w：这也是"宿主侧落在客体线程上的轮询式等待"（1 毫秒一轮看客体时钟），记账 —— 转储里"谁在等"从头到尾就齐了。
+            // M3-2w: this is another "host-side polling wait landing on a guest thread" (a 1 ms look at the guest clock
+            // each round), so it is recorded; the dump's "who is waiting" is then complete end to end.
+            dm_waitled_enter("SleepThread：客体长睡（det-clock 轮询式，1 毫秒一轮）");
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-        } else if (ns > 0) { struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, 0); }
+            dm_waitled_leave();
+        } else if (ns > 0) {
+            struct timespec ts = {ns / 1000000000, ns % 1000000000};
+            dm_waitled_enter("SleepThread：客体睡眠（一次 nanosleep）");
+            nanosleep(&ts, 0);
+            dm_waitled_leave();
+        }
         else {   // 让出（0 / -1 / -2）。主线程的让出次数与耗时记账：游戏渲染任务图「等全部做完」是纯轮询 + 让出（main+0x15ee898），量它占一帧多少 | Yield (0 / -1 / -2). Count and time of the main thread's yields are recorded: the game's render task graph "wait for everything to finish" is pure polling + yield (main+0x15ee898); measure how much of a frame it takes
             thr_t *me = pthread_getspecific(g_keythr);
             if (me && me->handle == 0x1001) { uint64_t y0 = now_ns(); sched_yield(); g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }

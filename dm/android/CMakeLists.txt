@@ -154,7 +154,11 @@ target_include_directories(vk_shader_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} $
 # library (handing the reading of "which type is this binding number, which stage owns it" to the driver) and a
 # compute pipeline for every compute shader (needing no render state, which makes this the only place the chain can
 # be closed before the shadow state is complete).
-add_executable(vk_pipe_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_spv.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c)
+# vk_waitled_stub.c：vk_pipe.c 里有"等待站点账本"的调用，而账本的真身在宿主（crash.c）—— 探针不链宿主，
+# 所以给它一份空实现（见该文件里的说明）。
+# vk_waitled_stub.c: vk_pipe.c calls the "wait-site ledger", whose home is the host (crash.c); probes do not link the
+# host, so they get empty definitions (see the note in that file).
+add_executable(vk_pipe_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe_probe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_pipe.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_spv.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_waitled_stub.c)
 target_link_libraries(vk_pipe_probe PRIVATE vulkan)
 target_link_options(vk_pipe_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk_pipe_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DM}/host ${COMPAT})

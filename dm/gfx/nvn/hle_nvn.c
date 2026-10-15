@@ -381,7 +381,15 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     if (mtl_wait(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    return mtl_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    // M3-2w：真正会久等的是**第二次**调用（客体给了超时）—— 它包一层"等待站点"，转储里与里面的 mtl_wait 形成嵌套，
+    // 于是"是不是这一处"一句话就能读出来（客体超时原样交给 mtl_wait ⇒ 超大超时 = 睡到天荒地老）。
+    // M3-2w: the one that can wait long is the **second** call (the guest passes a timeout) -- it wraps a "wait site",
+    // nested with the mtl_wait inside, so "is this the one" reads off in one line (the guest timeout is handed to
+    // mtl_wait unchanged, so a huge timeout means a sleep until the end of time).
+    dm_waitled_enter("nvnSyncWait：客体等围栏（客体的超时原样交给 mtl_wait）");
+    int w = mtl_wait(o->fence, timeout);
+    dm_waitled_leave();
+    return w ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
@@ -763,7 +771,20 @@ static _Atomic uint64_t g_nvn_ns;   // 本帧在提交 / 出图里花的宿主�
 static pthread_mutex_t g_susp_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_susp_cv = PTHREAD_COND_INITIALIZER;
 static int g_susp, g_inflight_api;
-static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pthread_cond_wait(&g_susp_cv, &g_susp_mu); g_inflight_api++; pthread_mutex_unlock(&g_susp_mu); }
+// M3-2w：这条也记一笔 —— 它同样是"宿主侧、落在客体线程上的等待"（「M3-2u」的采样 PC 就落在 `dm_gfx_suspend` 那条链上），
+// 只是等的是条件变量而不是 usleep；账本里与前面几处一起看，才不会漏掉这一类。
+// M3-2w: this one is recorded too -- it is equally "a host-side wait landing on a guest thread" (the sample PC of
+// "M3-2u" landed on a `dm_gfx_suspend` chain), it just waits on a condition variable instead of usleep; keeping it in
+// the same ledger is what keeps that kind from being missed.
+static void gfx_enter(void) {
+    pthread_mutex_lock(&g_susp_mu);
+    if (g_susp) {
+        dm_waitled_enter("gfx_enter：图形挂起中，等 dm_gfx_suspend(0)");
+        while (g_susp) pthread_cond_wait(&g_susp_cv, &g_susp_mu);
+        dm_waitled_leave();
+    }
+    g_inflight_api++; pthread_mutex_unlock(&g_susp_mu);
+}
 static void gfx_leave(void) { pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
 void dm_gfx_suspend(int on) {
     pthread_mutex_lock(&g_susp_mu);
@@ -775,6 +796,13 @@ void dm_gfx_suspend(int on) {
 }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
+    // M3-2w：**客体在宿主里的最外层入口之一**（每帧一次：跑命令流 + 提交）。整段记账，于是"主线程到底在不在
+    // 命令流里"这个问题在转储里一眼可读 —— 账本自检已经证明主线程进过 1749 次却"0 层"，那就必须把这一层也摆上。
+    // M3-2w: one of the **outermost host entry points for the guest** (once per frame: walk the command stream, then
+    // submit). The whole span is recorded, so the dump answers at a glance whether the main thread is inside the command
+    // stream -- the ledger's self-check already showed it entered 1749 times yet sits at "0 levels", so this layer has to
+    // be on the books too.
+    dm_waitled_enter("客体：排队提交命令（nvnQueueSubmitCommands：跑命令流 + 提交）");
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     ((queue_t *)q)->submits++;
     mtl_sub_begin();
@@ -788,6 +816,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     atomic_fetch_add(&g_cum_sub_cyc, y1 - y0); atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0); atomic_fetch_add(&g_cum_sub_wall_ns, dw);
     atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
+    dm_waitled_leave();
     gfx_leave();
 }
 
@@ -872,6 +901,12 @@ uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
+    // M3-2w：取交换链贴图这条路上有**宿主自己的等待**（`sleep_until_ns` 随显示节拍等，见下面那段注释；安卓上它落到
+    // `mach_wait_until` → `nanosleep`），所以整段记账 —— 客体线程上"等在 vsync 上"从此也看得见。
+    // M3-2w: acquiring a swapchain texture carries **a wait of our own** (`sleep_until_ns` paced by the display link, see
+    // the note below; on Android it lands on `mach_wait_until` -> `nanosleep`), so the whole span is recorded -- "waiting
+    // on vsync" on a guest thread becomes visible from here on.
+    dm_waitled_enter("nvnWindowAcquireTexture：取交换链贴图（vsync 等待在这里）");
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // 垂直同步阻塞在这里（真机 NVN：交换链里的贴图都在等显示时，等下一张被释放），不在出图里——游戏常持锁调出图
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
@@ -894,6 +929,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    dm_waitled_leave();   // M3-2w：上面这整段（随显示节拍等的 vsync 等待）都在账上 | M3-2w: this whole span (the vsync wait paced by the display link) is on the books
     if (s) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }   // 交换链贴图在此前的提交完成后可用 | The swapchain texture becomes available once the commits before this point have completed
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1117,8 +1153,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
       if (!gate && g_nvn_loadscreen_up && g_nvn_loadscreen_up()) { gate = 1; int ms = mtl_warm_wait(15000); if (ms) LOG("[nvn] 进局读取画面等管线预热 %d ms", ms); } }
     present_cfg(o);
     gfx_enter();
+    dm_waitled_enter("客体：出图（nvnQueuePresentTexture：入队到出图线程）");   // M3-2w：同提交那条（客体在宿主里的最外层入口）| M3-2w: same as the submit path (an outermost host entry for the guest)
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop);   // 只入队，立即返回 | enqueue only, return immediately
+    dm_waitled_leave();
     gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);

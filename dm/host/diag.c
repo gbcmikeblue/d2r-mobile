@@ -539,6 +539,91 @@ static int and_spinning_tids(pid_t *out, int max) {
 #endif
 static _Atomic unsigned g_sample_skip;   // 因"不在用户态"而跳过采样的次数 | how many samples were skipped for "not in user mode"
 
+// M3-2w：这个地址落在某个模块的**可执行段**里吗？
+// 为什么需要它：栈上"看着像代码地址"的数据指针多得很（实测一条 4 KB 的栈能挑出十几个 `g_inf` / `desc_write`
+// 之类的 .bss 地址，正好把真正要看的那几帧淹掉），所以按段权限过滤，只留返回地址。
+// 为什么读 `/proc/self/maps` 而不用 `dl_iterate_phdr`：`<link.h>` 里的 `Elf64_Sym` / `Elf64_Dyn` / `Elf64_Rela`
+// typedef 与 dm.h 里那份**重名**，一 include 就撞（实测：typedef redefinition 编译不过）。maps 是同一份信息的
+// 现成文本，且 dump 时读一次就够（不进口热路径）。
+// M3-2w: does this address fall inside some module's **executable segment**? Why: stacks are full of data pointers that
+// "look like" code addresses (measured: a 4 KB stack yields a dozen .bss addresses such as `g_inf` / `desc_write`, exactly
+// drowning the few frames that matter), so the filter is by segment permission and only return addresses survive.
+// Why read `/proc/self/maps` instead of `dl_iterate_phdr`: `<link.h>`'s `Elf64_Sym` / `Elf64_Dyn` / `Elf64_Rela` typedefs
+// are **the same names** as dm.h's and collide on include (measured: typedef redefinition, the build stops). maps is the
+// same information as ready-made text, and one read per dump is enough (this is never on a hot path).
+static struct { uint64_t lo, hi; } g_execseg[64];
+static int g_nexec;
+static void maps_load_exec(void) {
+    g_nexec = 0;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f) && g_nexec < 64) {
+        unsigned long long lo = 0, hi = 0; char perm[8] = "";
+        if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perm) != 3) continue;
+        if (perm[2] == 'x') { g_execseg[g_nexec].lo = lo; g_execseg[g_nexec].hi = hi; g_nexec++; }
+    }
+    fclose(f);
+}
+static int addr_is_exec(uint64_t a) {
+    for (int i = 0; i < g_nexec; i++) if (a >= g_execseg[i].lo && a < g_execseg[i].hi) return 1;
+    return 0;
+}
+// 把一段栈里**落在可执行段**的值（= 返回地址，顺序由内到外）逐个符号化打出来。
+// Symbolise every value of a stack stretch that falls in an **executable segment** (return addresses, innermost first).
+static void dump_stack_words(const char *who, const uint64_t *w, int n) {
+    maps_load_exec();
+    fprintf(stderr, "[dm] 栈上的返回地址 %s：", who);
+    int shown = 0;
+    for (int k = 0; k < n && shown < 20; k++) {
+        uint64_t v = w[k] & 0x0000ffffffffffffull;   // 剥 PAC（同 crash_off）| strip PAC (same as crash_off)
+        if (!v || !addr_is_exec(v)) continue;
+        off("", v); shown++;
+    }
+    fprintf(stderr, "（%d 个）\n", shown);
+}
+
+// ---------- M3-2w：栈扫描（从 sp 起找返回地址）----------
+// 「M3-2v」的宿主链是**帧指针链**给的，而它在驱动的帧上会失真（读栈上的旧值），那个说不通的 `mtl_wait+0x214`
+// 就是这么来的；在信号处理器里改用 `_Unwind_Backtrace` 又**把被采样线程卡住**（试过，见 on_sample 里的说明）。
+// 剩下的、最实在的一招是**直接读栈**：`/proc/self/task/<tid>/syscall` 给出该线程的 sp 与 pc，
+// 再从 sp 起读一段栈（用 `/proc/self/task/<tid>/mem`，它**不会**让读的人段错误），把里面"落在某个模块里"的
+// 值逐个符号化 —— 返回地址就在栈上，**不依赖帧指针、不依赖 unwind 表、不动被采样线程**。
+// ---------- M3-2w: stack scan (find return addresses from sp) ----------
+// "M3-2v"'s host chain came from the **frame-pointer chain**, which is distorted on driver frames (it reads stale stack
+// values) -- that is where the unexplainable `mtl_wait+0x214` came from; switching to `_Unwind_Backtrace` inside the
+// signal handler **stuck the sampled thread** instead (tried, see the note in on_sample). What is left, and the most
+// honest of the lot, is **reading the stack directly**: `/proc/self/task/<tid>/syscall` gives that thread's sp and pc,
+// then a stretch of stack is read from sp with `/proc/self/task/<tid>/mem` (which **cannot** fault the reader), and every
+// value that lands inside some module is symbolised -- return addresses sit right there on the stack, with **no frame
+// pointer, no unwind tables, and no touching of the sampled thread**.
+static uint64_t thread_sp(pid_t tid) {
+    char p[64], b[256];
+    snprintf(p, sizeof p, "/proc/self/task/%d/syscall", (int)tid);
+    if (and_rd(p, b, sizeof b)) return 0;
+    // 格式：nr arg0..arg5 sp pc（前七个是十进制 nr + 十六进制参数，sp / pc 是十六进制）
+    // Format: nr arg0..arg5 sp pc (decimal nr, hex args, hex sp / pc); "running" has no fields at all
+    unsigned long long a[8];
+    if (sscanf(b, "%*s %llx %llx %llx %llx %llx %llx %llx %llx",
+               &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6], &a[7]) != 8) return 0;
+    return a[6];   // 第 7 个十六进制字段 = sp | the 7th hex field is sp
+}
+static void stack_scan(pid_t tid) {
+    uint64_t sp = thread_sp(tid);
+    if (!sp) return;
+    char p[64];
+    snprintf(p, sizeof p, "/proc/self/task/%d/mem", (int)tid);
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return;
+    uint64_t buf[512];   // 4096 字节，且天然 8 字节对齐 | 4096 bytes, naturally 8-byte aligned
+    ssize_t got = pread(fd, buf, sizeof buf, (off_t)sp);
+    close(fd);
+    if (got <= 0) return;
+    { char who[64]; snprintf(who, sizeof who, "tid=%d（sp=%#llx，sp 起 %d 字节）", (int)tid, (unsigned long long)sp, (int)got);
+      dump_stack_words(who, buf, (int)(got / 8)); }
+}
+
+
 // ---------- 采样 DM_SAMPLE=毫秒：定时打断调用 crash_sample_self() 的那个线程（客体主线程），打印 pc 与回溯 ----------
 // ---------- Sampling DM_SAMPLE=milliseconds: periodically interrupt the thread that called crash_sample_self() (the guest main thread) and print pc and backtrace ----------
 static pthread_t g_sample_pt;
@@ -547,7 +632,22 @@ static pthread_t g_sample_pt;
 // Do only async-signal-safe things in the signal handler: copy pc / lr / the frame pointer chain into a lock-free ring buffer; symbolization and printing are done by the sampling thread
 // (it once called fprintf directly in the handler: if the interrupted thread happened to hold the stderr lock, the handler deadlocked on itself and the guest main thread hung)
 #define SRING 1024
-static struct { uint64_t t, pc, lr, bt[16]; int n; uint32_t h; } g_sring[SRING];
+// M3-2w：采样时**连栈一起拷走**（raw[]），这是这一轮"点名"的关键一步。
+// 为什么不是帧链也不是 unwind：① x29 帧链在**驱动的帧**上会失真（驱动可能不维护 x29，链就读到栈上的旧值 ——
+// 「M3-2v」那个 `mtl_wait+0x214` 就是这种残留：反汇编显示它是"早已滑出在飞窗口 → 直接 return 1"这条**不等待**
+// 分支的返回地址，绝不可能是在等的地方）；② 在信号处理器里调 `_Unwind_Backtrace` 会**把被采样的线程卡住**
+//（实测：那一轮"新增样本 0"，处理函数没回来）。而**读自己的栈**两样都不占：sp 一定在已映射的栈里，
+// 一次 memcpy 拿到 2 KB，之后在 dump 里慢慢分析（配合 addr_is_exec 只留返回地址）。
+// M3-2w: the sample now takes the **stack** along (raw[]), and that is the key step of this round's naming.
+// Why neither the frame chain nor unwinding: (1) the x29 chain is distorted **on driver frames** (the driver may not
+// maintain x29, so it reads stale stack values -- "M3-2v"'s `mtl_wait+0x214` is such a leftover: disassembly shows it is
+// the return address of the **no-wait** branch "out of the in-flight window -> return 1", which can never be a place that
+// waits); (2) calling `_Unwind_Backtrace` in the handler **sticks the sampled thread** (measured: that round reported
+// "0 new samples", the handler never returned). Reading one's own stack has neither problem: sp is always inside a
+// mapped stack, one memcpy grabs 2 KB, and the analysis happens later in the dump (with addr_is_exec keeping only
+// return addresses).
+#define WLED_RAW 2048
+static struct { uint64_t t, pc, lr, sp, bt[16], raw[WLED_RAW / 8]; int n; uint32_t h; } g_sring[SRING];
 static _Atomic unsigned g_shead;
 static void on_sample(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si; ucontext_t *uc = uc_;
@@ -555,6 +655,8 @@ static void on_sample(int sig, siginfo_t *si, void *uc_) {
     extern uint64_t now_ns(void);
     uint32_t thr_cur_handle(void);
     g_sring[i].h = thr_cur_handle(); g_sring[i].t = now_ns(); g_sring[i].pc = DM_UC_PC(uc); g_sring[i].lr = DM_UC_LR(uc);
+    g_sring[i].sp = DM_UC_SP(uc);
+    memcpy(g_sring[i].raw, (const void *)g_sring[i].sp, sizeof g_sring[i].raw);   // 自己的栈一定映射着 | our own stack is mapped for sure
     uint64_t fp = DM_UC_FP(uc); int n = 0;
     // 帧链用安全读：被打断的函数可能把 x29 当普通寄存器用（直接解引用曾段错误）
     // The frame chain uses safe reads: the interrupted function may be using x29 as an ordinary register (a direct dereference once segfaulted)
@@ -594,6 +696,8 @@ static void *sampler(void *p) {
             extern uint64_t g_t0_ns;
             fprintf(stderr, "[dm] SAMPLE #%u [%.3fs] thr=%#x", printed + 1, (g_sring[i].t - g_t0_ns) / 1e9, g_sring[i].h); off("pc", g_sring[i].pc); off("lr", g_sring[i].lr);
             fprintf(stderr, "\n[dm] bt:"); for (int k = 0; k < g_sring[i].n; k++) off("", g_sring[i].bt[k]); fputc('\n', stderr);
+            { char who[64]; snprintf(who, sizeof who, "thr=%#x sp=%#llx", g_sring[i].h, (unsigned long long)g_sring[i].sp);
+              dump_stack_words(who, g_sring[i].raw, WLED_RAW / 8); }
         }
     }
 }
@@ -615,6 +719,8 @@ static void sample_print_from(unsigned from, unsigned to, const char *tag) {
         fprintf(stderr, "[dm] %s #%u [%.3fs] thr=%#x", tag, h + 1, (g_sring[i].t - g_t0_ns) / 1e9, g_sring[i].h);
         off("pc", g_sring[i].pc); off("lr", g_sring[i].lr);
         fprintf(stderr, "\n[dm] bt:"); for (int k = 0; k < g_sring[i].n; k++) off("", g_sring[i].bt[k]); fputc('\n', stderr);
+        { char who[64]; snprintf(who, sizeof who, "thr=%#x sp=%#llx", g_sring[i].h, (unsigned long long)g_sring[i].sp);
+          dump_stack_words(who, g_sring[i].raw, WLED_RAW / 8); }
     }
 }
 static void sample_handler_install(void) {   // 只在真要采样时装一次 | installed once, only when sampling is really used
@@ -635,6 +741,19 @@ void crash_sample_stall(void) {
     sample_handler_install();
 #if defined(__ANDROID__)
     pid_t t[8]; int n = and_spinning_tids(t, 8);
+    // M3-2w：**先扫栈、再发采样信号**。顺序很要紧：信号一打进去，那条线程的 `/proc/.../syscall` 就变成 `running`
+    //（没有 sp 字段）—— 于是"我们最想看的那条（主线程）"恰好读不到 sp（实测：第一次跑，八条里七条有栈、主线程缺席）。
+    // M3-2w: **stack scan first, sample signal second.** The order matters: as soon as the signal lands, that thread's
+    // `/proc/.../syscall` turns into `running` (no sp field) -- so the one we most want (the main thread) is exactly the
+    // one whose sp cannot be read (measured: on the first run seven of eight had stacks and the main thread was missing).
+    for (int i = 0; i < n; i++) stack_scan(t[i]);
+    // M3-2w：**主线程无论当时在什么状态都扫一遍**。它是"停住"的主角，而它在"睡一下 → 看一眼"之间来回
+    //（实测有一轮它恰好不满足空转判据，八条里把它漏掉了 —— 那一轮最要紧的栈就没了）。
+    // M3-2w: the **main thread is scanned whatever state it is in**. It is the protagonist of the stall and alternates
+    // between "sleep a little" and "take a look" (measured: one round it happened to fail the spinning criterion and was
+    // missed among the eight -- and that round lost the stack that mattered most).
+    { int thr_find_by_name(const char *name, pthread_t *out); pthread_t mt;
+      if (thr_find_by_name("主线程", &mt)) stack_scan(pthread_gettid_np(mt)); }
     unsigned before = atomic_load(&g_shead);
     for (int i = 0; i < n; i++) {
         if (syscall(__NR_tgkill, getpid(), t[i], SIGUSR2)) fprintf(stderr, "[dm] 卡住采样：给 tid %d 发信号失败\n", (int)t[i]);
@@ -1928,14 +2047,18 @@ struct shotui_wait_arg { int index; char label[96]; };
 static void *shotui_wait_loadscreen(void *arg) {
     struct shotui_wait_arg *a = arg; uint64_t start = now_ns();
     uint64_t not_before = start + (uint64_t)g_loadscreen_delay_ms * 1000000ull;
+    // M3-2w：宿主自己的这条等待也记账（`usleep(10000)`、15 秒上限）—— 转储里与客体那几条并排看，"谁在等什么"不缺角。
+    // M3-2w: the host's own wait here is recorded too (`usleep(10000)`, 15 s cap), so the dump's "who waits where" has no
+    // missing corner when read next to the guest-side entries.
+    dm_waitled_enter("等「读取画面已撤」（usleep 10 毫秒一轮，15 秒上限）");
     for (;;) {
         pthread_mutex_lock(&g_shotgate_mu); int closed = !g_loadscreen_open && !g_loadscreen_unload_pending; pthread_mutex_unlock(&g_shotgate_mu);
         if (closed && now_ns() >= not_before) {
             LOG("SHOT 前置：读取画面已撤 拍 %s 等待 %llu ms", a->label, (unsigned long long)((now_ns() - start) / 1000000));
             { module_t *mm = main_mod(); if (mm) LOG("SHOT 时原版手柄光标 (%d,%d)（0,0 = 该界面没有自由光标，走焦点导航）", *(int32_t *)(mm->base + 0x2d128f8), *(int32_t *)(mm->base + 0x2d128fc)); }
-            dm_gfx_shot_at(g_shotui[a->index].off, g_shotui[a->index].path); free(a); return NULL;
+            dm_gfx_shot_at(g_shotui[a->index].off, g_shotui[a->index].path); dm_waitled_leave(); free(a); return NULL;
         }
-        if (now_ns() - start >= 15ull * 1000000000ull) { LOG("读取画面未撤（等待 15 秒）"); free(a); return NULL; }
+        if (now_ns() - start >= 15ull * 1000000000ull) { LOG("读取画面未撤（等待 15 秒）"); dm_waitled_leave(); free(a); return NULL; }
         usleep(10000);
     }
 }

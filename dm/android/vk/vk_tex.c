@@ -263,7 +263,10 @@ VkSampler vk_samp_of(const samp_t *s) {
                 static int said; if (!said++) LOG("【黄】设备不支持各向异性过滤：采样器按 1x 建");
             }
             VkSampler sv = VK_NULL_HANDLE;
-            if (vkCreateSampler(vk_dev(), &ci, NULL, &sv) != VK_SUCCESS) {
+            dm_waitled_enter("vk：建采样器 VkSampler（客体线程上按需建）");
+            VkResult smr = vkCreateSampler(vk_dev(), &ci, NULL, &sv);
+            dm_waitled_leave();
+            if (smr != VK_SUCCESS) {
                 LOG("【红】建采样器失败（minf=%u magf=%u 环绕 %u/%u/%u 比较 %u）", p.minf, p.magf, p.ws, p.wt, p.wr, p.cmp_mode);
                 return VK_NULL_HANDLE;
             }
@@ -473,8 +476,18 @@ static int one_end_on(VkCommandBuffer cb) {
     // queue lock (see vk_device.h)
     vk_queue_note("一次性提交 + 等空闲");
     vk_queue_lock();
-    if (vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) { vk_queue_unlock(); return 0; }
+    dm_waitled_enter("vk：一次性提交（读回 / 对照）");
+    VkResult sr = vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE);
+    dm_waitled_leave();
+    if (sr != VK_SUCCESS) { vk_queue_unlock(); return 0; }
+    // M3-2w：读回 / 对照走的就是这条"一次性提交 + 等空闲"，而它**可能跑在客体线程上**
+    // （「M3-2u」的采样 PC：`vk_tex_view ← mtl_exec ← dm_gfx_suspend`）—— 所以它是"轮询式等待"的头号嫌疑之一，记账。
+    // M3-2w: readback / control clear go through this "one-off submit + wait idle", and it **can run on a guest thread**
+    // ("M3-2u" sample PC: `vk_tex_view <- mtl_exec <- dm_gfx_suspend`), which makes it a prime suspect for the "polling
+    // wait" -- so it is recorded.
+    dm_waitled_enter("一次性提交等空闲（读回 / 对照，等驱动，可能跑在客体线程上）");
     VkResult r = vkQueueWaitIdle(vk_queue());
+    dm_waitled_leave();
     vk_queue_unlock();
     if (r != VK_SUCCESS) { LOG("【红】一次性提交等待失败 VkResult %d", (int)r); return 0; }
     return 1;
@@ -525,7 +538,15 @@ static int ent_build(const tex_t *t, ent_t *e) {
         .format = e->fmt, .extent = { e->w, e->h, e->d }, .mipLevels = e->levels, .arrayLayers = e->layers,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = use,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
-    if (vkCreateImage(vk_dev(), &ci, NULL, &e->img) != VK_SUCCESS) { LOG("【红】建 VkImage 失败 %ux%ux%u 格式 %d", e->w, e->h, e->d, (int)e->fmt); e->img = VK_NULL_HANDLE; return 0; }
+    // M3-2w：建贴图/视图这几步也记账 —— 它们**跑在客体线程上**（命令流里第一次用到就建），而且真机上
+    // "建不出来 / 上传失败"正是停住那一轮同时出现的东西；驱动在这些调用里等内存/等内部线程时，账本要能点名。
+    // M3-2w: creating the image/view is recorded too -- it **runs on a guest thread** (built the first time the command
+    // stream touches it), and on the device "cannot build / upload failed" is exactly what shows up in the stalled run;
+    // if the driver waits for memory or an internal thread inside these calls, the ledger has to name it.
+    dm_waitled_enter("vk：建 VkImage（贴图）");
+    VkResult ires = vkCreateImage(vk_dev(), &ci, NULL, &e->img);
+    dm_waitled_leave();
+    if (ires != VK_SUCCESS) { LOG("【红】建 VkImage 失败 %ux%ux%u 格式 %d", e->w, e->h, e->d, (int)e->fmt); e->img = VK_NULL_HANDLE; return 0; }
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(vk_dev(), e->img, &mr);
     // 优先要「设备本地 + 宿主可见 + 一致」：零拷贝内存（与内存池同一种），方便回读与调试
     // Prefer device-local + host-visible + coherent, the zero-copy type shared with the memory pools, which
@@ -533,7 +554,10 @@ static int ent_build(const tex_t *t, ent_t *e) {
     uint32_t mi = vk_memory_type(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits);
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mi };
-    if (vkAllocateMemory(vk_dev(), &mai, NULL, &e->mem) != VK_SUCCESS) { LOG("【红】贴图内存分配失败 %llu 字节", (unsigned long long)mr.size); return 0; }
+    dm_waitled_enter("vk：贴图内存分配");
+    VkResult mres = vkAllocateMemory(vk_dev(), &mai, NULL, &e->mem);
+    dm_waitled_leave();
+    if (mres != VK_SUCCESS) { LOG("【红】贴图内存分配失败 %llu 字节", (unsigned long long)mr.size); return 0; }
     if (vkBindImageMemory(vk_dev(), e->img, e->mem, 0) != VK_SUCCESS) { LOG("【红】贴图内存绑定失败"); return 0; }
     VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = e->img,
         .viewType = type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D :
@@ -542,7 +566,10 @@ static int ent_build(const tex_t *t, ent_t *e) {
                      (type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D)),
         .format = e->fmt, .subresourceRange = { e->depth_like ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, e->levels, 0, e->layers } };
     if (e->depth_like) { vi.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT; if (!e->dsa) vi.subresourceRange.aspectMask &= ~(VkImageAspectFlags)VK_IMAGE_ASPECT_STENCIL_BIT; }
-    if (vkCreateImageView(vk_dev(), &vi, NULL, &e->view) != VK_SUCCESS) { LOG("【红】建 VkImageView 失败"); return 0; }
+    dm_waitled_enter("vk：建 VkImageView（贴图视图）");
+    VkResult vres = vkCreateImageView(vk_dev(), &vi, NULL, &e->view);
+    dm_waitled_leave();
+    if (vres != VK_SUCCESS) { LOG("【红】建 VkImageView 失败"); return 0; }
     atomic_fetch_add(&g_created, 1);
     return 1;
 }
@@ -561,15 +588,22 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = total,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
     VkBuffer stg = VK_NULL_HANDLE;
-    if (vkCreateBuffer(vk_dev(), &bci, NULL, &stg) != VK_SUCCESS) return 0;
+    // M3-2w：上传的"建中转缓冲 + 分配 + 映射"也记账 —— 这一段**每次上传都新建对象**，而真机上它正好伴生
+    // 上百条「贴图上传失败」；`vkAllocateMemory` / `vkMapMemory` 在驱动里都可能久等（分配器 / 非一致映射）。
+    // M3-2w: the upload's "create staging buffer + allocate + map" is recorded too -- this runs **per upload** and on the
+    // device it is exactly what accompanies the hundreds of 「贴图上传失败」 lines; `vkAllocateMemory` / `vkMapMemory` can
+    // both wait inside the driver (allocator / non-coherent mapping).
+    dm_waitled_enter("vk：上传：建中转缓冲 + 分配 + 映射");
+    if (vkCreateBuffer(vk_dev(), &bci, NULL, &stg) != VK_SUCCESS) { dm_waitled_leave(); return 0; }
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk_dev(), stg, &mr);
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
         .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
     VkDeviceMemory sm = VK_NULL_HANDLE;
-    if (vkAllocateMemory(vk_dev(), &mai, NULL, &sm) != VK_SUCCESS) { vkDestroyBuffer(vk_dev(), stg, NULL); return 0; }
+    if (vkAllocateMemory(vk_dev(), &mai, NULL, &sm) != VK_SUCCESS) { dm_waitled_leave(); vkDestroyBuffer(vk_dev(), stg, NULL); return 0; }
     vkBindBufferMemory(vk_dev(), stg, sm, 0);
     void *smap = NULL;
-    if (vkMapMemory(vk_dev(), sm, 0, VK_WHOLE_SIZE, 0, &smap) != VK_SUCCESS) { vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
+    if (vkMapMemory(vk_dev(), sm, 0, VK_WHOLE_SIZE, 0, &smap) != VK_SUCCESS) { dm_waitled_leave(); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
+    dm_waitled_leave();
 
     // **上传走自己那条命令缓冲（`g_cb_up`），也不拿 `g_one_mu`**。两件都要：调用方 `tex_of` 正**持着 `g_mu`** 调进来，
     // 而读回那边是 `one_mu → g_mu` —— 上传若去拿读回那把锁就是锁序反转，真机表现是"**启动就停住、出图 0 次**"
@@ -913,7 +947,9 @@ static int grab_ser_locked(uint64_t serial, unsigned level, uint8_t *dst, size_t
     // mtl_finish_gpu before Apple's screenshot)
     vk_queue_note("读回：等队列空闲");
     vk_queue_lock();
+    dm_waitled_enter("读回：等队列空闲（等驱动做完在飞提交）");
     vkQueueWaitIdle(vk_queue());
+    dm_waitled_leave();
     vk_queue_unlock();
     int ok = 0;
     if (one_begin()) {
@@ -932,7 +968,10 @@ static int grab_ser_locked(uint64_t serial, unsigned level, uint8_t *dst, size_t
     }
     if (ok) {
         void *p = NULL;
-        if (vkMapMemory(vk_dev(), mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
+        dm_waitled_enter("vk：映射中转缓冲（读回）");
+        VkResult mrp = vkMapMemory(vk_dev(), mem, 0, VK_WHOLE_SIZE, 0, &p);
+        dm_waitled_leave();
+        if (mrp == VK_SUCCESS) {
             const uint8_t *s = (const uint8_t *)p;
             float peak = 0.0f;
             for (uint32_t y = 0; y < h; y++) {
@@ -1057,7 +1096,9 @@ int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a) {
     }
     vk_queue_note("对照实验：等队列空闲");
     vk_queue_lock();
+    dm_waitled_enter("对照实验：等队列空闲（等驱动）");
     vkQueueWaitIdle(vk_queue());
+    dm_waitled_leave();
     vk_queue_unlock();
     int ok = 0;
     one_lock("对照清除（等队列空闲 + 转布局）");   // 与读回 / 上传串行（见 g_one_mu）| serialised against readback / upload (see g_one_mu)
@@ -1167,7 +1208,10 @@ static VkImageView view_for(ent_t *e, const view_t *v) {
         else vi.subresourceRange.aspectMask &= ~(VkImageAspectFlags)VK_IMAGE_ASPECT_STENCIL_BIT;
     }
     VkImageView iv = VK_NULL_HANDLE;
-    if (vkCreateImageView(vk_dev(), &vi, NULL, &iv) != VK_SUCCESS) {
+    dm_waitled_enter("vk：建子视图 VkImageView（view 重解释）");
+    VkResult ivr = vkCreateImageView(vk_dev(), &vi, NULL, &iv);
+    dm_waitled_leave();
+    if (ivr != VK_SUCCESS) {
         static int said;
         if (!said++) LOG("【红】建子视图失败（serial=%llu、格式 %d、viewType %d、级别 %u+%u、层 %u+%u）",
                          (unsigned long long)e->serial, (int)fmt, (int)vt, base, nl, lb, ln);
@@ -1299,7 +1343,9 @@ VkBufferView vk_tex_bufview(const tex_t *t) {
         VkBufferViewCreateInfo bvi = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
             .buffer = (VkBuffer)pbuf, .format = fmt, .offset = poff, .range = (uint64_t)bpb * elems };
         VkBufferView v = VK_NULL_HANDLE;
+        dm_waitled_enter("vk：建缓冲区贴图视图 VkBufferView");
         VkResult r = vkCreateBufferView(vk_dev(), &bvi, NULL, &v);
+        dm_waitled_leave();
         if (r != VK_SUCCESS) {
             // 最常见的两种原因是池缓冲没带 UNIFORM_TEXEL_BUFFER 用法位、或 range 超了 maxTexelBufferElements
             // The two usual causes are a pool buffer without the UNIFORM_TEXEL_BUFFER usage bit, or a range beyond
@@ -1335,12 +1381,19 @@ void vk_tex_drop(uint64_t serial) {
     pthread_mutex_lock(&g_mu);
     ent_t *e = find_slot(serial, 0);
     if (e) {
+        // M3-2w：拆贴图这一串（销毁视图/图像 + 释放内存）也记账 —— 驱动的**延迟销毁 / 内存回收**是少数会在
+        // "看起来只是 CPU 操作"的调用里等 GPU 的地方（内存吃紧时 vkFreeMemory 会等），而它跑在客体线程上。
+        // M3-2w: tearing a texture down (destroy views/image + free memory) is recorded too -- the driver's **deferred
+        // destroy / memory reclamation** is one of the few places that waits for the GPU inside what looks like a pure
+        // CPU call (vkFreeMemory waits when memory is tight), and it runs on guest threads.
+        dm_waitled_enter("vk：拆贴图（销毁视图/图像 + 释放内存）");
         for (int i = 0; i < ENT_VIEWS; i++)
             if (e->vw[i].used && e->vw[i].iv) { vkDestroyImageView(vk_dev(), e->vw[i].iv, NULL); e->vw[i].used = 0; e->vw[i].iv = VK_NULL_HANDLE; }
         if (e->view) vkDestroyImageView(vk_dev(), e->view, NULL);
         if (e->bv) vkDestroyBufferView(vk_dev(), e->bv, NULL);
         if (e->img) vkDestroyImage(vk_dev(), e->img, NULL);
         if (e->mem) vkFreeMemory(vk_dev(), e->mem, NULL);
+        dm_waitled_leave();
         e->img = VK_NULL_HANDLE; e->view = VK_NULL_HANDLE; e->bv = VK_NULL_HANDLE; e->mem = VK_NULL_HANDLE;
         e->serial = 0;   // 开放寻址的删除：直接清键，查找会在下一个空位停住（同键后又插入时会重建表）| clearing the key is enough for open addressing here; lookups stop at the next empty slot
         g_n--;
