@@ -180,7 +180,7 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
-> **这一节会过期。** 记于 2026-10-15（基线提交 `7a6a5a1`，M3-2v；本轮的实质工作是「M3-2w」）；
+> **这一节会过期。** 记于 2026-10-15（基线提交 `7c63a14`，M3-2x；前一轮「M3-2w」）；
 > 进度细节与结论以 [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 的「七、下一步」与「八、进度记录」为准。
 
 ### 现在停在哪
@@ -374,6 +374,13 @@ adb 要经 `run-as` 才看得到（`adb shell run-as ai.d2rm.dm ls -l files`）�
   `lr=ioctl+0xa0` 其实同一个地址 —— `dladdr` 能命名 `ioctl`、命不了 libc 里的 syscall 桩）。
 - **读 `/proc/<pid>/maps` 数一数有几段可执行段**（同上）：这台机上 460 段里绝大多数是系统 odex 与 vendor 库，
   而"我们自己的"（`libdm.so`）与驱动排得很前 —— **过滤类仪器的上限必须按真机量级设**，不能按"我们认识的那几个模块"设。
+- **机器上已有 `ANDROID_HOME` / `JAVA_HOME` 时，`toolchain.cmd` 会听话地用它们**（这是设计：第二节那条"优先级"），
+  于是"装了一套能用的工具链却编不过"会很容易发生：这台机器的 `ANDROID_HOME` 指向一个**没有 NDK / CMake / CMake-ninja
+  的 SDK**、`JAVA_HOME` 指向 **Zulu 8**，第一条命令就停在 `[红] 缺 NDK`（真踩）。做法是**不改仓库里的任何文件**，
+  在这一次构建的环境里覆盖两个变量即可：
+  `$env:DM_SDK_ROOT='C:\Android\Sdk'`、`$env:DM_JDK='C:\Program Files\Eclipse Adoptium\jdk-21.0.12.1+1'`
+  （构建开头那两行 `[工具链] …（来自 …）` 就是它的自证）。另外本机 `cmd /c "…"` 的引号会被外层壳吞掉
+  （报"系统找不到指定的路径"），**从 PowerShell 直接 `& 'dm\android\apk\build_apk.cmd'` 就是对的**。
 - **这台机上"退到后台"等于"被杀"**：MIUI 把这个包按游戏处理（logcat `ANDR-PWR-OPT: GAMEPOWEROPT: isGame()`），
   按 HOME 之后系统直接 `libc: kill: send 9`（SIGKILL），**`TERM_WINDOW` / `DESTROY` / `atexit` 一个都跑不到**
   （两轮实测：pid 在退到后台 6 秒内消失，日志里没有 `窗口那一套已拆`）。所以"靠退出时落盘"的设计在本机不成立 ——
