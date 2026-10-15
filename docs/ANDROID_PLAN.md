@@ -654,22 +654,41 @@ a **wrong pitch**, and with the pitch fixed both sides agree (part six of "M3-2m
 what changed is that the instrument is now trustworthy. **Item 1 of section nine (persisting the pipeline cache) landed
 on 2026-10-15** ("M3-2p"): it is unrelated to the blocker, so the five items below keep their order, and the device fact
 it brought out (MIUI SIGKILLs on backgrounding, so the hooks never run) is recorded there too. What follows is ordered by
-value:
+value (reordered 2026-10-15: the finished "level-by-level scan" is ticked off, the two duplicate "device loss" items are
+merged, the blocker-independent items from section nine are moved in, and this round's constraints are noted):
 
-1. **Chase that device loss** (part two of "M3-2o" and part six of "M3-2l") -- `【红】一次性提交等待失败 VkResult -4` is
-   still **sporadic** (about once per run), followed by a hundred-plus `贴图上传失败` lines. Uploads **are already** off
-   the shared command buffer ("M3-2o") and it did not go away, so the cause lies elsewhere: the next candidate is "**who
-   loses it first**", the guest's own commands or this one one-shot submit of ours (what else was on the queue at that
-   moment, and whether the guest had already lost the device on its side).
-   The level-by-level scan is **already in** (part six): 33 level reads at frame 50, **0 with content**. The next round has
-   to scan a **later frame** -- this device normally stalls at 55-60 presents, so the scan points have to sit inside what
-   it can actually reach (50/54/57, say), or "scanned" and "never got there" cannot be told apart;
-2. **Milestone B: the guest stall** -- classify it by sampling `/proc` over several rounds (the one-shot stall sampler
-   and the wait-point dump are both in place). This device normally stalls at 55-60 presents, so the judgement has to be
-   read from "what is it doing across several samples", never against the occasional outlier run;
-3. **That sporadic `VK_ERROR_DEVICE_LOST`** (on the texture-upload path, section six of "M3-2l") deserves a look of its
-   own: who loses the device first, the guest's own commands or our one-off submit plus queue-idle wait;
-4. Docs and cleanup to wrap up (including the interface-description-table code that is no longer called).
+1. **Milestone B: the guest stall** (**first -- the main blocker**). This device normally stalls a dozen seconds in at
+   `CharacterCreate:Hover:Barbarian` (occasionally `MainMenuHD:CheckUpdateLinks`). **The judgement has to be read from
+   "what is it doing across several samples", never against the occasional outlier run**: the one-shot stall sampler and
+   the wait-point dump are both in place ("M3-2g"), so sample `/proc` over several rounds to classify it. It covers the
+   most ground: the picture is not found before the stall, and both "finding the picture" and "the device loss" are
+   suppressed by it -- so "why does it stop here" comes first.
+2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- about once per
+   run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a hundred-plus `贴图上传失败` lines.
+   Uploads **are already** off the shared command buffer ("M3-2o") and it did not go away, so the cause lies elsewhere: the
+   next candidate is "**who loses it first**", the guest's own commands or this one one-shot submit of ours. What to
+   measure: what else was on the queue at that moment, whether the queue family / device had already been lost on the
+   guest's side, and the `vkQueueSubmit` return value with its context.
+3. **Item 2 of section nine, `HOST_CACHED`** (low risk, blocker-independent, **doable whenever**) -- the 3.7 GB guest heap
+   sits on host-uncached memory, so every guest read/write goes down an uncached path (the evidence in item 2 of section
+   nine). **First verify "can type 6 export an fd via `vkGetMemoryFdKHR`"** (the probe has already shown type 4 can); only
+   if it can, run one A/B on its own (change only this one place, same scene and duration, comparing CPU time / frame rate
+   / time-to-join).
+4. **Items 4 / 5 / 6 / 7 of section nine** (decide once the frame budget is measured) -- the per-draw repeated work (70.5%
+   of the ops are pure state binding); texture uploads on a resident upload ring (same source as item 2); the hand-rolled
+   pipeline tables being small (lower priority now that the `VkPipelineCache` has landed); folding pure state into the
+   shadow (M3/M4).
+5. **Wrap-up** -- docs and cleanup (the interface-description-table code that is no longer called); the items in
+   `.work/recon/pending_rm.md` (waiting for one "execute the deletion list"); the "time to `nnMain`" A/B left open by
+   M3-2p (**only after item 1 has moved**, or the stall masks the number).
+
+**Two constraints this round brought out that apply to everything later** (recorded in "M3-2p", restated here so they are
+not forgotten):
+- **MIUI SIGKILLs on backgrounding**: `TERM_WINDOW` / `DESTROY` / `atexit` never run -- **any "persist on exit" design does
+  not work on this machine**; to persist, write **periodically in the foreground** (that is exactly how the pipeline cache
+  landed).
+- **`adb shell input keyevent` is refused** (`SecurityException: INJECT_EVENTS`) -- to background the app, start the
+  launcher explicitly: `adb shell am start -n com.miui.home/.launcher.Launcher`.
 
 ---
 

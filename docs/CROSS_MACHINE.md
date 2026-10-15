@@ -175,9 +175,9 @@ Three old rules:
 
 ## 7. Where things stand and what comes next (hand-over: start here)
 
-> **This section goes stale.** Written 2026-10-15 against commit `0033dc9` plus this round's **uncommitted** pipeline-cache
-> change; for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its "7. Next step" and
-> "8. Progress log".
+> **This section goes stale.** Written 2026-10-15 against commit `06cc706` (which carries the M3-2p pipeline cache and the
+> toolchain.cmd unification); for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its
+> "7. Next step" and "8. Progress log".
 
 ### Where it stops
 
@@ -203,15 +203,16 @@ Three old rules:
 
 ### Next steps (detail in "7. Next step" of ANDROID_PLAN)
 
-1. **Chase that device loss**: the next candidate is "**who loses it first**", the guest's own commands or this one
-   one-shot submit of ours. What to measure: what else was on the queue at that moment, whether the guest had already
-   lost the device on its side, and the `vkQueueSubmit` return value with its context.
-2. **Keep hunting the picture**: the level-by-level scan is in place but only on reachable frames; reaching a later frame
-   first needs "why does it stop here" answered (the normal thing above).
-3. **Items 1 and 2 of the "9. Optimisation list"** (persisting a `VkPipelineCache`, preferring `HOST_CACHED` for the
-   zero-copy memory type) -- unrelated to the blocker, doable whenever. **Item 1 is done** (2026-10-15, "M3-2p"); only the
-   "time to `nnMain`" A/B is left. What is actionable below is therefore **item 2** (verify "can type 6 export an fd"
-   first, then A/B it on its own).
+1. **Milestone B: the guest stall** (**first -- the main blocker**) -- classify it by sampling `/proc` over several
+   rounds (the one-shot stall sampler and the wait-point dump are both in place, "M3-2g"); the judgement reads "what is it
+   doing across several samples", never against the occasional outlier run. It covers the most ground: the picture is not
+   found before the stall.
+2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- the next
+   candidate is "**who loses it first**". What to measure: what else was on the queue at that moment, whether the device
+   had already been lost on the guest's side, and the `vkQueueSubmit` return value with its context.
+3. **Item 2 of the "9. Optimisation list"** (preferring `HOST_CACHED` for the zero-copy memory type) -- blocker-independent,
+   doable whenever: **first verify "can type 6 export an fd"**, and only if it can, run one A/B on its own. (Item 1 has
+   landed, see "M3-2p"; the "time to `nnMain`" A/B waits until item 1 has moved.)
 
 ### How to run one round (the smallest loop on a new machine)
 
