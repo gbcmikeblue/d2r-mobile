@@ -668,16 +668,14 @@ merged, the blocker-independent items from section nine are moved in, and this r
    presenting is the one with the **device loss** (`提交失败 VkResult -4` plus a hundred-plus upload failures, then
    `TERM_WINDOW` and the log ends); and at the stall the main thread's **current PC sits in our own host layer**
    (`vk_tex_view` / `vk_tex_grab_ser` / `mtl_wait`) while the graph keeps changing. Details and the three runs: "M3-2t".
-2. **Host-side read-back / queue waits** (**the real lead from item 1; "M3-2u" reproduced the stall and narrowed it to
-   this path**) -- the three arms: viewer + level-complete scan **both** on the path => presents freeze within ~20 s;
-   **either one alone** => 60-80 s clean (21.5 / 14.4 presents/s). At the stall the main thread is blocked on a
-   **host-side lock / futex** and stops issuing SVCs, the worker's lock is held by the main thread, and the read-back /
-   view building runs on the guest thread while it executes the command stream (`mtl_exec`; the sampled PC symbolises to
-   `nvnth_378` / `vk_tex_view <- mtl_exec <- dm_gfx_suspend`). Next: a **lock ledger for the read-back path**
-   (`vk_tex_grab_ser` / `grab_ser_locked` / `stg_get` / `one_begin` / `vk_queue_lock` / `vk_tex_view`: enter/exit plus the
-   holder), dumped on demand, to name **which** lock is waited on. The sporadic **device loss**
-   (`【红】提交失败 VkResult -4` plus a hundred-plus `贴图上传失败` once per run) is still open on the same path --
-   "**who loses it first**"; uploads are already off the shared command buffer ("M3-2o") and it did not go away.
+2. **Name every host wait that lands on a guest thread** (**first; "M3-2v" cleared our locks**): at the stall the
+   read-back lock has no holder and no waiter, the queue lock is free, all 8 slots are empty with every driver fence
+   ready, and no >300 ms wait was logged => it is not our locks and not the slot bookkeeping. The blocked main thread's
+   host chain is `nanosleep <- usleep <- ... <- nvnSyncWait (hle_nvn.c:383) <- mtl_wait <- guest main+0x1743a0c`, i.e. a
+   **polling wait**. Next: record enter/leave for every host site that can `usleep` / `nanosleep` on a guest thread
+   (`mtl_wait`'s timeout branch, `nvnSyncWait`, the read-screen wait loop in `diag.c`, the sleep loop in
+   `hle_thread.c`) and one run names it. The sporadic **device loss** (`【红】提交失败 VkResult -4` plus a hundred-plus
+   `贴图上传失败` once per run) stays open on the same path -- "**who loses it first**".
 3. ~~**Item 2 of section nine, `HOST_CACHED`**~~ -- **measured and ruled out (2026-10-15, "M3-2q")**: exporting an fd on
    type 6, `mmap`-ing it at a chosen address and both directions all **work** (256 MB, 512 MB and 3968 MB alike), but the
    same-device A/B shows **no measurable difference in CPU time** (under 3% within the same mode, while the run-to-run
@@ -1939,9 +1937,69 @@ record enter/exit plus the current holder at `vk_tex_grab_ser` / `grab_ser_locke
 name the edge between them that is **not** covered yet.
 
 **Reproduction recipe (use it directly next time)**: `DM_WATCH_STALL=600` + `DM_WIN_SRC=28` +
-`DM_NVN_SHOT_SCAN=50,54,57:...` + `DM_TG_SERIES=0` => presents freeze within about 20 s; watch the heartbeat's present
-count and, 15 s after it freezes, `adb shell touch .../files/dump.trigger` (the process keeps running, so a second dump
-remains possible).
+`DM_NVN_SHOT_SCAN=50,54,57:...` + `DM_TG_SERIES=0` => presents freeze within about 20 s (not guaranteed: 5 of this
+round's 7 runs froze, 2 ran clean); watch the heartbeat's present count and, 15 s after it freezes,
+`adb shell touch .../files/dump.trigger` (the process keeps running, so a second dump remains possible).
+
+---
+
+### M3-2v: the read-back lock ledger cleared us, and moved the cursor to **one polling wait on the host side** (2026-10-15, device, seven runs)
+
+"M3-2u" narrowed the stall to "the viewer and the scan reading back at the same time"; the question left was "which
+lock". The ledger is built, and the answer is **not one of ours**: all three suspects are ruled out, while the blocked
+thread sits in **a host-side `nanosleep` / `usleep` poll**.
+
+**1. The ledger** (`g_one_mu` in `dm/android/vk/vk_tex.c`, the fences in `nvn_vk.c`)
+
+- **The read-back lock `g_one_mu`**: records the holder's tid, what it is doing (phase), how long it has held it, and who
+  is outside waiting and for how long; >300 ms logs a line each way (the tail of the log alone names the edge). It is
+  exported with the "wait points" section of `mtl_wait_state_dump` (`vk_led_line()`, declared in `vk_tex.h`).
+- **The guest's fence wait**: both `inflight_take` (waiting for the oldest slot when the pool is full) and `mtl_wait`
+  (the guest waiting by NVN's own fence semantics) record whether anyone is waiting, on which slot, since when, and log
+  past 300 ms; the dump adds a line that **asks the driver directly** (`vkGetFenceStatus`): `槽的栅栏实况` (slot: fence
+  value / driver status, -1 = slot free) -- separating "the driver never finished" from "our bookkeeping is behind".
+- **The stall sampler's criterion was widened** (`dm/host/diag.c`): it used to sample only threads that are state `R`
+  **and** whose `/proc syscall` says `running`; a polling `nanosleep` is `S` in the "sleep half" and `R` in the "look
+  half" (and the two reads can even disagree), so **five dumps produced not one sample** (the scene held a bare `R`).
+  Now `syscall = nanosleep` is sampled too -- and it caught eight threads at once.
+
+**2. The three readings at the stall** (v_a2 / v_a5, same shape)
+
+```
+[vk] 等待点：已提交到栅栏 68、在飞槽 0/8（各槽的栅栏值 0 …）、队列锁 无人持有；窗口队列 自己的
+[vk] 读回锁：无人持有、没人等
+[vk] 等栅栏：没人在等
+[vk] 槽的栅栏实况（槽:栅栏值/驱动状态，-1 = 槽空闲）：0:0/-1 1:0/-1 … 7:0/-1
+```
+
+=> **not `g_one_mu`, not the queue lock, and not our slot/fence bookkeeping** (all eight slots free, every driver-side
+fence ready, and no >300 ms wait logged anywhere). The guest side is unchanged: the main thread's SVC ring is sixteen
+`SleepThread(-1)` yields, **no SVC for 20-32 s** with a call chain of the same age; the lock worker `0x1005` waits on a
+lock held by the main thread; the graph sits at "everything dispatched, not one completion bit".
+
+**3. Where the blocked thread actually is** (first host chain, thanks to the widened criterion)
+
+```
+STALLSAMPLE #1 [25.273s] thr=0x1001 pc=nanosleep+0xc lr=usleep+0x54
+bt: ... mtl_wait+0x214  <-  h_nvnSyncWait (dm/gfx/nvn/hle_nvn.c:383)  <-  guest main+0x1743a0c
+     <- main+0x85745c <- main+0x856a38 <- render code <- frame loop
+```
+
+=> **the guest main thread is inside a host-side `nanosleep` (through `usleep`) poll**, and the nearest thing on the
+chain is our own `nvnSyncWait -> mtl_wait` (the same shape appeared in r3 of "M3-2u": `mtl_wait+0x184 ... guest
+main+0x1743a0c main+0x85745c`). This is exactly the case the sampler's criterion was missing.
+
+**4. Next (narrowly: name every host wait that lands on a guest thread)**
+
+What is known now is "blocked in a host-side polling wait"; what is missing is **which one**. Next round: record an
+enter/leave for **every** host site that can `usleep` / `nanosleep` on a guest thread, with the same ledger:
+`mtl_wait`'s timeout branch, `nvnSyncWait` (`hle_nvn.c:383`, which hands the guest's timeout straight to `mtl_wait`, so
+a huge timeout means "sleep forever"), the loop in `diag.c` that waits for the read-screen to be lifted
+(`usleep(10000)`, capped at 15 s), and the sleep loop in `hle_thread.c`. One run then names it -- and only after that
+comes the question of capping / re-checking such waits in slices (**measure before changing**). One related reading to
+re-check: `mtl_wait` falls back to a 1-second wait when `timeout_ns = 0`
+(`timeout_ns ? timeout_ns : 1000000000ull`), and `nvnSyncWait`'s first call is exactly `mtl_wait(o->fence, 0)` (meant
+as "just look") -- those two need to be read together.
 
 ---
 

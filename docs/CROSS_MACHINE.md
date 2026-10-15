@@ -175,7 +175,7 @@ Three old rules:
 
 ## 7. Where things stand and what comes next (hand-over: start here)
 
-> **This section goes stale.** Written 2026-10-15 against commit `133dbfe` (M3-2t; this round's real work is "M3-2u");
+> **This section goes stale.** Written 2026-10-15 against commit `b5f4ddf` (M3-2u; this round's real work is "M3-2v");
 > for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its
 > "7. Next step" and "8. Progress log".
 
@@ -225,6 +225,15 @@ Three old rules:
   reads the same), and the signature is "counters frozen + the main thread stops issuing SVCs". **Recipe**:
   `DM_WATCH_STALL=600` + `DM_WIN_SRC=28` + `DM_NVN_SHOT_SCAN=50,54,57:...` + `DM_TG_SERIES=0`, then
   `adb shell touch .../files/dump.trigger` for an on-demand dump (no exit). Next: a lock ledger for the read-back path.
+- **The ledger is built and it cleared us (2026-10-15, "M3-2v")**: at the stall the **read-back lock has no holder and
+  no waiter, the queue lock is free, all 8 slots are empty with every driver-side fence ready, and no >300 ms wait was
+  logged** => it is not our locks and not the slot bookkeeping. The blocked main thread (its SVC ring all
+  `SleepThread(-1)`, no SVC for 20-32 s) has the host chain
+  `nanosleep <- usleep <- ... <- nvnSyncWait (hle_nvn.c:383) <- mtl_wait <- guest main+0x1743a0c` => **one polling wait on
+  the host side**. One instrument was fixed on the way: the stall sampler used to sample only "state R and /proc syscall
+  says running", which misses a polling wait in **both halves** (sleep half is `S`, look half is `R`), so five dumps
+  produced not one PC; now `syscall = nanosleep` is sampled too, and that is the only reason this chain was obtained.
+  Next: account for every host site that can `usleep` / `nanosleep` on a guest thread, so one run names it.
 - **One sporadic thing**: about once per run, `【红】提交失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a
   hundred-plus `贴图上传失败` lines. **Unrelated to command-buffer sharing** (ruled out; "M3-2o"); in t2 of "M3-2t" it was
   followed by the window being torn down and the log ending, so it is probably the same line as the stall.
@@ -235,14 +244,14 @@ Three old rules:
    bitmaps ran three times on the device and separated "armed zero bits" from "completed then cleared" -- **zero bits is
    ruled out, completed-then-cleared holds** (max to-dispatch `0x3fffff`, max completed `0x3fffff`, then cleared by the
    next arming). The machinery is sound and the blocker is not here.
-2. **A lock ledger for the read-back path** (**first**; "M3-2u" reproduced the stall and narrowed it to "viewer and scan
-   reading back at the same time") -- record enter/exit plus the current holder at `vk_tex_grab_ser` / `grab_ser_locked` /
-   `stg_get` / `one_begin` / `vk_queue_lock` / `vk_tex_view` (including the `shot_take` branch in `nvn_vk.c`) and dump it
-   on demand => it names **who waits on whom**. The known shared surface is documented in `vk_tex.c:320-404`
-   (`g_one_mu` serialising the two read-back callers, the `one_mu -> g_mu` order, uploads on `g_cb_up` without
-   `g_one_mu`); the ledger is for the edge between them that is **not** covered yet. The sporadic **device loss**
-   (`【红】提交失败 VkResult -4` plus a hundred-plus `贴图上传失败`, in t2 followed by the window being torn down) is still
-   open on the same path -- "**who loses it first**". Details in "M3-2u".
+2. **Name every host wait that lands on a guest thread** (**first**; "M3-2v" cleared our locks): at the stall the
+   read-back lock has no holder and no waiter, the queue lock is free, all 8 slots are empty with every driver fence
+   ready, and no >300 ms wait was logged => not our locks, not the slot bookkeeping. The blocked main thread's host chain
+   is `nanosleep <- usleep <- ... <- nvnSyncWait (hle_nvn.c:383) <- mtl_wait <- guest main+0x1743a0c`, i.e. a **polling
+   wait**. Next: record enter/leave for every host site that can `usleep` / `nanosleep` on a guest thread (`mtl_wait`'s
+   timeout branch, `nvnSyncWait`, `diag.c`'s read-screen wait loop, `hle_thread.c`'s sleep loop) -- one run then names
+   it. The sporadic **device loss** (`【红】提交失败 VkResult -4` plus a hundred-plus `贴图上传失败`, in t2 followed by
+   the window being torn down) stays open on the same path -- "**who loses it first**". Details in "M3-2v".
 3. ~~**Item 2 of the "9. Optimisation list"** (preferring `HOST_CACHED` for the zero-copy memory type)~~ -- **measured and
    ruled out (2026-10-15, "M3-2q")**: type 6 **can** export an fd (256 MB / 512 MB / 3968 MB all pass, `mmap` at the chosen
    address and both directions too), but it means **stepping outside the buffer's declared allowed types** (an external
@@ -352,6 +361,11 @@ dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
 - **"one slot in flight, submits four ahead of presents" in the wait-point line is not a stall signature** (same round): a
   run that never stalled reads exactly the same (1228/1224). The signature is those counters being **frozen** plus **the
   main thread no longer issuing SVCs** (the age on the call-chain line, e.g. `（32.1 秒前）`, tells you).
+- **The stall sampler's criterion must include `nanosleep` polling** (2026-10-15, "M3-2v"): accepting only "state `R`
+  **and** `/proc syscall` says `running`" misses a polling wait in **both halves** (the sleep half is `S`, the look half
+  is `R`, and the two reads can even disagree), so five dumps produced a bare `R` and not one PC. It now samples
+  `syscall = nanosleep` as well -- and that is the only reason the blocked thread's host chain (`nvnSyncWait -> mtl_wait
+  -> driver poll`) was obtained at all.
 - **MIUI refuses `adb install -r`**: it reports `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user` (the on-device
   confirmation is cancelled or the permission is off), and `install_apk.cmd` uses exactly that. Installing from the device
   side works at once: `adb push .work\apk-build\dm.apk /data/local/tmp/dm.apk` then

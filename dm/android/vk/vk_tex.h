@@ -44,6 +44,13 @@ int vk_fmt_to_vk(int nvn_fmt, VkFormat *out);
 VkImage vk_tex_image(const tex_t *t);
 VkImageView vk_tex_view(const tex_t *t, const view_t *v);
 
+// 读回路径那把锁（g_one_mu）的账本：谁持有、在做什么、已持多久，门外是谁、等了多久（定义在 vk_tex.c）。
+// 停住 / 按需转储时打出来 —— 与"等待点"那一行（mtl_wait_state_dump）一起看，就能读出"谁在等谁"。
+// The ledger of the read-back path's lock (g_one_mu): who holds it, doing what, for how long, and who is waiting
+// outside for how long (defined in vk_tex.c). Printed on a stall / on-demand dump; read it together with the
+// "wait points" line (mtl_wait_state_dump) to see who waits on whom.
+void vk_led_line(void);
+
 // 缓冲区贴图（NVN target 10 = TARGET_BUFFER）→ VkBufferView（texel buffer）。**不是** VkImage 那条路：
 // 这类贴图的存储就是内存池里的一段（width = 元素个数、格式给每元素字节），视图直接建在池缓冲上、零拷贝，
 // 描述符那一侧要写 VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER。非缓冲区贴图或建不出来时返回 VK_NULL_HANDLE。

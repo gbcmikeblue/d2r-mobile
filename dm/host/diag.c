@@ -482,17 +482,30 @@ static int and_rd(const char *path, char *buf, size_t cap) {
     buf[n] = 0; char *nl = strchr(buf, '\n'); if (nl) *nl = 0;
     return 0;
 }
-// 这个线程是否"在用户态空转"（/proc 的 syscall 报 running）。读不到返回 -1 —— **不拦**：宁可采错也不漏。
-// Whether a thread is "spinning in user mode" (/proc's syscall says running). -1 when unreadable -- **do not block**:
-// better to sample wrongly than to miss.
+// 这个线程是否"在用户态空转"。读不到返回 -1 —— **不拦**：宁可采错也不漏。两类都算：
+//   ① /proc 的 syscall 报 `running`：真的在用户态跑；
+//   ② 报 **`nanosleep`**：这是**轮询式等待**——驱动的 `vkWaitForFences`（1 毫秒一睡再看）与我们自己的睡眠循环
+//      都这么等，线程在"睡一下 → 检查 → 再睡"之间来回，`stat` 读到 `R` 的概率并不低。
+// 「M3-2v」的停住现场就是第 ② 类（主线程 stat = `R`、syscall = `101`），而旧判据把它排除在外 ⇒
+// 采样器一个都没抓到、现场里只剩一个光秃秃的 `R`；放宽之后才拿到它的**宿主 PC**（这一步是定位的关键）。
+// Whether a thread is "spinning in user mode". -1 when unreadable -- **do not block**: better to sample wrongly than to
+// miss. Two shapes count: (1) /proc's syscall says `running` (really running in user mode); (2) it says **`nanosleep`**
+// -- that is a **polling wait** (the driver's `vkWaitForFences` sleeps 1 ms, checks, sleeps again, and our own sleep
+// loops do the same), so the thread alternates between "sleep a little" and "check" and `stat` catches it in `R` fairly
+// often. The stall scene of "M3-2v" is shape (2) (the main thread: stat `R`, syscall `101`), which the old criterion
+// excluded, so the sampler caught nothing and the scene held nothing but a bare `R`; widening it is what produced that
+// thread's **host PC** -- the step the location depends on.
 static int and_in_user(pid_t tid) {
     char p[64], b[128];
     snprintf(p, sizeof p, "/proc/self/task/%d/syscall", (int)tid);
     if (and_rd(p, b, sizeof b)) return -1;
-    return !strncmp(b, "running", 7);
+    if (!strncmp(b, "running", 7)) return 1;
+    if (!strncmp(b, "101", 3)) return 1;      // nanosleep：轮询式等待 | nanosleep: a polling wait
+    return 0;
 }
-// 全部"在用户态空转"的线程（状态 R 且不在系统调用里）：卡住时值得打断的正是这一批。
-// All threads "spinning in user mode" (state R and not inside a syscall): exactly the ones worth interrupting when stalled.
+// 全部"在用户态空转"的线程（状态 R，且 syscall 报 running / nanosleep）：卡住时值得打断的正是这一批。
+// All threads "spinning in user mode" (state R and the syscall says running / nanosleep): exactly the ones worth
+// interrupting when stalled.
 static int and_spinning_tids(pid_t *out, int max) {
     DIR *d = opendir("/proc/self/task"); if (!d) return 0;
     struct dirent *de; int n = 0; char p[64], b[128];
@@ -501,9 +514,24 @@ static int and_spinning_tids(pid_t *out, int max) {
         snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid);
         if (and_rd(p, b, sizeof b)) continue;
         char *rp = strrchr(b, ')');
-        if (!rp || rp[1] != ' ' || rp[2] != 'R') continue;   // 状态 R：在跑 | state R: running
-        if (and_in_user((pid_t)tid) != 1) continue;          // 且不在系统调用里 | and not inside a syscall
-        out[n++] = (pid_t)tid;
+        int running_state = rp && rp[1] == ' ' && rp[2] == 'R';
+        int u = and_in_user((pid_t)tid);
+        // 两类都采：① 状态 R 且 syscall 报 running / nanosleep（在用户态，或在轮询式等待的"看"那半拍）；
+        // ② **只要 syscall 报 nanosleep**（轮询式等待的"睡"那半拍状态是 S，旧判据两次都漏掉它 —— 「M3-2v」实测）。
+        // 采它的价值在于回溯：即便 pc 落在 libc 的 nanosleep 里，`bt:` 沿 x29 链走出来的是**宿主调用链**
+        //（真机样本：`nanosleep+0xc ← usleep+0x54 ← … ← mtl_wait+0x184 ← 门 ← 客体 main+0x1743a0c`）。
+        // Two shapes are sampled: (1) state R with the syscall reporting running / nanosleep (in user mode, or in the
+        // "look" half of a polling wait); (2) **any thread whose syscall reports nanosleep** -- in the "sleep" half of a
+        // polling wait the state is S, and the old criterion missed it in both halves (measured, "M3-2v"). The value is
+        // the backtrace: even when the pc lands in libc's nanosleep, the `bt:` line walks the x29 chain and yields the
+        // **host** call chain (device sample: `nanosleep+0xc <- usleep+0x54 <- ... <- mtl_wait+0x184 <- gate <- guest
+        // main+0x1743a0c`).
+        if (running_state && u == 1) { out[n++] = (pid_t)tid; continue; }
+        if (u == 1) {   // and_in_user 对 nanosleep 也返回 1 | and_in_user also returns 1 for nanosleep
+            snprintf(p, sizeof p, "/proc/self/task/%d/syscall", tid);
+            char sb[128];
+            if (!and_rd(p, sb, sizeof sb) && !strncmp(sb, "101", 3)) { out[n++] = (pid_t)tid; continue; }
+        }
     }
     closedir(d);
     return n;
@@ -614,9 +642,9 @@ void crash_sample_stall(void) {
     }
     if (n) usleep(15000);
     unsigned after = atomic_load(&g_shead);
-    fprintf(stderr, "[dm] 卡住采样：在用户态空转的线程 %d 个，新增样本 %u（此前的常开采样因不在用户态跳过 %u 次）\n",
+    fprintf(stderr, "[dm] 卡住采样：在用户态空转 / nanosleep 轮询的线程 %d 个，新增样本 %u（此前的常开采样因不在用户态跳过 %u 次）\n",
             n, after - before, atomic_load(&g_sample_skip));
-    if (!n) fprintf(stderr, "[dm] 卡住采样：没有「在跑且不在系统调用里」的线程 —— 那是卡在等（内核 / 锁 / 驱动），看下面的等待点\n");
+    if (!n) fprintf(stderr, "[dm] 卡住采样：没有「在跑（含 nanosleep 轮询）」的线程 —— 那是卡在阻塞式等待（内核 / 锁 / 驱动），看下面的等待点\n");
     sample_print_from(before, after, "STALLSAMPLE");
 #else
     (void)0;   // 苹果侧 mach 那套本来就能取 PC（看门狗的现场导出里已有）| Apple already reads the PC through mach (its watchdog dump has it)

@@ -324,8 +324,54 @@ static VkCommandBuffer g_cb_up;   // 上传专用的那条（见下面"两条，
 // `one_mu -> g_mu`, which forms a cycle -- showing on the device as "a stall at boot with zero presents" (part three of
 // "M3-2n").
 static pthread_mutex_t g_one_mu = PTHREAD_MUTEX_INITIALIZER;
-static void one_lock(void) { pthread_mutex_lock(&g_one_mu); }
-static void one_unlock(void) { pthread_mutex_unlock(&g_one_mu); }
+
+// ---------- M3-2v：读回路径的锁账本 ----------
+// 「M3-2u」把"停住"缩到"查看器 + 逐级扫描同时读回"，并把现场指到"客体线程卡在宿主侧的一把锁 / futex 上"；
+// 剩下的问题只有一个：**哪一把**。这里给 g_one_mu 记四样 —— 持有者 tid、持有人在做什么（hphase）、已持多久、
+// 门外那位是谁、等了多久 —— 超过阈值各打一行日志：**不看转储、只看日志尾巴**也能读出"谁被谁挡住"。队列锁本来
+// 就有这套（vk_queue_lock_state），栅栏那条在 nvn_vk.c 的 inflight_take 里另记（输出在 mtl_wait_state_dump 里）。
+// M3-2v: a ledger for the read-back path. "M3-2u" narrowed the stall to "the viewer and the scan reading back at the
+// same time" and pointed the scene at "the guest thread blocked on a host-side lock / futex"; the only question left is
+// **which** one. This records four things about g_one_mu -- the holder's tid, what it is doing (hphase), how long it has
+// held it, and who is outside waiting and for how long -- and logs a line past a threshold, so the tail of the log alone
+// names the edge. The queue lock already has this (vk_queue_lock_state); the fence wait is accounted for separately in
+// inflight_take (nvn_vk.c) and printed by mtl_wait_state_dump.
+#define DM_LED_MS 300
+static struct {
+    _Atomic int holder; const char *volatile hphase; uint64_t since;          // 持有者及其在做什么 | the holder and what it is doing
+    _Atomic int waiter; const char *volatile wphase; uint64_t wsince;         // 等在门外的那位及其目的 | who waits outside and why
+} g_led_one;
+static int led_tid(void) { return (int)pthread_gettid_np(pthread_self()); }
+
+static void one_lock(const char *phase) {
+    uint64_t t0 = now_ns();
+    atomic_store(&g_led_one.waiter, led_tid()); g_led_one.wphase = phase; g_led_one.wsince = t0;
+    pthread_mutex_lock(&g_one_mu);
+    uint64_t waited = now_ns() - t0;
+    atomic_store(&g_led_one.waiter, 0);
+    atomic_store(&g_led_one.holder, led_tid()); g_led_one.hphase = phase; g_led_one.since = now_ns();
+    if (waited > (uint64_t)DM_LED_MS * 1000000ull)
+        LOG("[vk] 读回锁：等了 %llu 毫秒才拿到（本次要做：%s）", (unsigned long long)(waited / 1000000), phase ? phase : "?");
+}
+static void one_unlock(void) {
+    uint64_t held = now_ns() - g_led_one.since;
+    const char *ph = g_led_one.hphase;
+    atomic_store(&g_led_one.holder, 0);
+    pthread_mutex_unlock(&g_one_mu);
+    if (held > (uint64_t)DM_LED_MS * 1000000ull)
+        LOG("[vk] 读回锁：持有了 %llu 毫秒（做的事：%s）", (unsigned long long)(held / 1000000), ph ? ph : "?");
+}
+
+// 停住 / 按需转储时打几行：读回锁现在在谁手里、在做什么、多久了；门外是谁、等了多久。
+// A few lines for a stall / on-demand dump: who holds the read-back lock, doing what, for how long; and who is outside
+// waiting, for how long.
+void vk_led_line(void) {
+    int h = atomic_load(&g_led_one.holder), w = atomic_load(&g_led_one.waiter);
+    uint64_t now = now_ns();
+    if (h) LOG("[vk] 读回锁：持有者 tid %d，在做「%s」，已持 %llu 毫秒", h, g_led_one.hphase ? g_led_one.hphase : "?", (unsigned long long)((now - g_led_one.since) / 1000000));
+    if (w) LOG("[vk] 读回锁：等它的人 tid %d（要做「%s」），已等 %llu 毫秒", w, g_led_one.wphase ? g_led_one.wphase : "?", (unsigned long long)((now - g_led_one.wsince) / 1000000));
+    if (!h && !w) LOG("[vk] 读回锁：无人持有、没人等");
+}
 
 static uint64_t hsh(uint64_t k) { k *= 11400714819323198485ull; return k ^ (k >> 29); }
 
@@ -946,7 +992,7 @@ static int grab_ser_locked(uint64_t serial, unsigned level, uint8_t *dst, size_t
 // threads at once (the viewer on the front-end thread, present/scan on the guest thread) and they share one command
 // buffer and one resident staging buffer -- not serialising them is exactly the crash described there.
 int vk_tex_grab_ser(uint64_t serial, unsigned level, uint8_t *dst, size_t pitch, uint32_t *out_w, uint32_t *out_h) {
-    one_lock();
+    one_lock("读回整段（抓中转缓冲 → 录制提交 → 等空闲 → 解映射）");
     int r = grab_ser_locked(serial, level, dst, pitch, out_w, out_h);
     one_unlock();
     return r;
@@ -1014,7 +1060,7 @@ int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a) {
     vkQueueWaitIdle(vk_queue());
     vk_queue_unlock();
     int ok = 0;
-    one_lock();   // 与读回 / 上传串行（见 g_one_mu）| serialised against readback / upload (see g_one_mu)
+    one_lock("对照清除（等队列空闲 + 转布局）");   // 与读回 / 上传串行（见 g_one_mu）| serialised against readback / upload (see g_one_mu)
     if (one_begin()) {
         VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .oldLayout = lay, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

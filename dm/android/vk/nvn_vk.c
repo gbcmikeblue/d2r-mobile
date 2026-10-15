@@ -815,12 +815,29 @@ static void inflight_reap(void) {
     }
 }
 
+// M3-2v：等栅栏这一段也记账。「M3-2u」的停住现场是"客体线程卡在宿主侧的一把锁 / futex 上、32 秒不发一次 SVC"，
+// 而这条路上最可疑的宿主等待就是这里（8 个槽全满时等最老的那个栅栏；设备丢失 / 驱动卡住时它永远不回来）。
+// 记三样：现在有没有人在等、等哪个槽、从什么时候开始；超过阈值另打一行日志（不看转储也能看出"谁在等栅栏"）。
+// M3-2v: the fence wait is accounted for too. The scene in "M3-2u" is "the guest thread blocked on a host-side
+// lock / futex, no SVC for 32 s", and the most suspicious host wait on this path is this one (with all 8 slots busy it
+// waits for the oldest fence; on a lost device or a stuck driver that never returns). It records whether anyone is
+// waiting, on which slot, and since when, and logs a line past a threshold.
+static _Atomic int g_led_fence_wait; static int g_led_fence_slot; static uint64_t g_led_fence_since;
 static int inflight_take(void) {   // 取一个空闲槽：没有就等（单一队列按序完成，等最老的那个即可）| Take a free slot, waiting if none is free
     for (;;) {
         inflight_reap();
         for (int i = 0; i < MAX_INFLIGHT; i++) if (!g_inf[i].pending) return i;
-        for (int i = 0; i < MAX_INFLIGHT; i++)
-            if (vkWaitForFences(vk_dev(), 1, &g_inf[i].fence, VK_TRUE, 1000000000ull) == VK_SUCCESS) { inflight_reap(); break; }
+        for (int i = 0; i < MAX_INFLIGHT; i++) {
+            uint64_t t0 = now_ns();
+            atomic_store(&g_led_fence_wait, 1); g_led_fence_slot = i; g_led_fence_since = t0;
+            VkResult wr = vkWaitForFences(vk_dev(), 1, &g_inf[i].fence, VK_TRUE, 1000000000ull);
+            atomic_store(&g_led_fence_wait, 0);
+            if (now_ns() - t0 > 300000000ull)
+                LOG("[vk] 等栅栏：槽 %d 等了 %llu 毫秒（返回 %d，槽的栅栏值 %llu，已提交到栅栏 %llu）", i,
+                    (unsigned long long)((now_ns() - t0) / 1000000), (int)wr,
+                    (unsigned long long)g_inf[i].value, (unsigned long long)g_fence);
+            if (wr == VK_SUCCESS) { inflight_reap(); break; }
+        }
     }
 }
 
@@ -848,6 +865,25 @@ void mtl_wait_state_dump(void) {
         (unsigned long long)atomic_load(&g_draw_skip),
         (unsigned long long)atomic_load(&g_draw_ncN), (unsigned long long)atomic_load(&g_draw_nc0),
         qst, vk_queue_win() != vk_queue() ? "自己的（与客体分开）" : "与客体共用");
+    // M3-2v：再把读回路径那把锁的账本与"等栅栏"那一段打出来 —— 三样合起来就是完整的"谁在等谁"。
+    // M3-2v: then the ledger of the read-back path's lock and the fence-wait stretch -- the three together are the
+    // complete "who waits on whom".
+    vk_led_line();
+    if (atomic_load(&g_led_fence_wait))
+        LOG("[vk] 等栅栏：有人在等槽 %d，已等 %llu 毫秒", g_led_fence_slot,
+            (unsigned long long)((now_ns() - g_led_fence_since) / 1000000));
+    else LOG("[vk] 等栅栏：没人在等");
+    // 直接问驱动：每个在飞槽的栅栏**到底到了没有**（0 = 已就绪、1 = 还没到、其他 = 出错）。
+    // 这一行把"驱动没做完"与"我们自己的记账没跟上"分开 —— 前者是 GPU / 队列的事，后者是我们的 bug。
+    // Ask the driver directly whether each in-flight slot's fence has arrived (0 = signalled, 1 = not yet, other =
+    // error). This line separates "the driver never finished" from "our own bookkeeping is behind": the first is the
+    // GPU / queue, the second is our bug.
+    { char st[200]; int q = 0;
+      for (int i = 0; i < MAX_INFLIGHT && q < (int)sizeof st - 24; i++)
+          q += snprintf(st + q, sizeof st - q, "%s%d:%llu/%d", i ? " " : "", i,
+                        (unsigned long long)(g_inf[i].pending ? g_inf[i].value : 0),
+                        g_inf[i].pending ? (int)vkGetFenceStatus(vk_dev(), g_inf[i].fence) : -1);
+      LOG("[vk] 槽的栅栏实况（槽:栅栏值/驱动状态，-1 = 槽空闲）：%s", st); }
 }
 
 static int vk_sub_ready(void) {
@@ -1047,12 +1083,26 @@ uint64_t mtl_sub_commit(void) {
 
 uint64_t mtl_last_fence(void) { return g_fence; }
 
+// M3-2v：**客体的等栅栏**也记账 —— 这才是「M3-2u」停住现场里那一条（宿主 PC 符号化成 `nanosleep ← … ← mtl_wait`，
+// 也就是驱动在 `vkWaitForFences` 里 poll）。它与 `inflight_take` 那条（槽池满时等最老的）不是一回事：
+// 这条是客体自己按 NVN 的 fence 语义来等，一等等不到就是"这个提交永远没完成"。
+// M3-2v: **the guest's own fence wait** is accounted for too -- that is the one in the "M3-2u" scene (the host PC
+// symbolises to `nanosleep <- ... <- mtl_wait`, i.e. the driver polling inside `vkWaitForFences`). It is not the same
+// thing as the `inflight_take` wait (which waits for the oldest slot when the pool is full): here the guest waits by
+// NVN's own fence semantics, and a wait that never returns means "that submission never completes".
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (!vk_dev() || !fence || fence > g_fence) return 0;
     if (fence <= g_fence - MAX_INFLIGHT) { inflight_reap(); return 1; }   // 早已滑出在飞窗口 | long past the in-flight window
     for (int i = 0; i < MAX_INFLIGHT; i++)
         if (g_inf[i].pending && g_inf[i].value == fence) {
+            uint64_t t0 = now_ns();
+            atomic_store(&g_led_fence_wait, 1); g_led_fence_slot = i; g_led_fence_since = t0;
             VkResult r = vkWaitForFences(vk_dev(), 1, &g_inf[i].fence, VK_TRUE, timeout_ns ? timeout_ns : 1000000000ull);
+            atomic_store(&g_led_fence_wait, 0);
+            if (now_ns() - t0 > 300000000ull)
+                LOG("[vk] 客体等栅栏：槽 %d（栅栏值 %llu，已提交到 %llu）等了 %llu 毫秒、返回 %d（槽状态 %d）", i,
+                    (unsigned long long)g_inf[i].value, (unsigned long long)g_fence,
+                    (unsigned long long)((now_ns() - t0) / 1000000), (int)r, (int)vkGetFenceStatus(vk_dev(), g_inf[i].fence));
             inflight_reap();
             return r == VK_SUCCESS;
         }
