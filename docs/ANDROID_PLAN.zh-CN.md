@@ -636,6 +636,14 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
      **把"最后一次成功的提交"与"第一条 -4"之间那一小段（提交序号 / 出图数 / 时刻）留在日志里**。
    - **量任何帧预算之前**先判这一轮是健康还是生病（判据：`出图` 的 op/帧 与有无 >1 秒的等待），
      否则同一份配置的读数能差 13 倍。
+   ⇒ **「M3-2z」又把"两种状态"追到了系统级**：病态时同一时刻 **SystemUI 也卡了 10 秒**
+   （`Davey! duration=10018ms`、`waitForever: fence(kgsl-timeline-kgsl-3d0_7-ndroid)`）、**composer HAL 的调用
+   9.49 秒**（`IComposerClient code=40`）、`Slow swap buffers`；而**把 app 停掉、清 logcat、等 60 秒 —— 一条都没有**
+   ⇒ **那 ~10 秒的系统级停摆是我们引起的**（形状最像"我们让 GPU 挂住 → kgsl 约 10 秒后才判定/恢复"；
+   `dmesg` / kernel logcat 读不到，`klogctl: Permission denied`）。**下一步**：① 给 `one_end_on` 加
+   "读回 / 上传"标签（**只动日志**），先把 arm D 里那 10 秒的归属分出来（那一轮 viewer 与扫描都关着，
+   长等落在客体线程的「一次性提交等空闲」上，而"建中转缓冲 + 分配 + 映射"没有长等 ⇒ 像是**上传**）；
+   ② 在停顿窗口抓一次 ftrace / perfetto（`gpu` / `kgsl` / `sync`）；③ 换设备 / 换驱动对照。细节见「M3-2z」。
 3. ~~**「九」第 2 项 `HOST_CACHED`**~~ —— **已取证、已否掉（2026-10-15，「M3-2q」）**：类型 6 上导出 fd / `mmap`
    到指定地址 / 双向都**能**（256 MB、512 MB、3968 MB 都过了），但同机 A/B 里 **CPU 时间没有可测差异**（同峰配对
    <3%，轮间波动 ±100%），而用它要**越过缓冲声明的可用类型位**（外部缓冲 `0x13` 里没有类型 6，属规范外用法），
@@ -2008,6 +2016,59 @@ A = 查看器（`DM_WIN_SRC=28`）+ 逐级扫描（`DM_NVN_SHOT_SCAN=50,54,57`�
   可能把后面"真的那次"盖掉）。
 - ⚠ **口径变了**：这三条日志的正文都加了尾巴（`（在「…」）`）。按旧串统计会少算 —— 见「七」的坑
   （"改日志正文等于改统计口径"）。
+
+---
+
+### M3-2z：把"两种状态"追到系统级 —— **那 ~10 秒的停摆是我们引起的**（SystemUI 卡 10 秒 + composer 9.5 秒 + kgsl 栅栏 `waitForever`）；同时收回一条中途的错误读法（2026-10-15 真机）
+
+**一、先否掉一条**（我中途猜的）："装包后第一次启动就健康" —— **不成立**。`probe-H1` 是装完包后的第一次启动，
+照样病（出图卡在 52、心跳断 10.8 秒、两条 10.1/10.3 秒的等待）。
+
+**二、两种状态走的是同一条路**（不是"另一条分支"）
+- `logdiff.ps1`（按"行形状"归一化后逐行对比）：健康轮与病轮**没有任何只在一边出现的行形状**；
+- `pipepairs.ps1`（对比画过的 顶点/片元 对）：病轮画过的**是健康轮的真子集**（3 种 vs 36 种）
+  ⇒ 病轮只是**更早、更慢**地走在同一条路上；
+- 时间也**不在"帧里"**：病轮 `[长帧]` 写的是"帧内 **33 毫秒**、GPU **0.4 毫秒**，而帧与帧隔 **1.64~1.87 秒**"。
+
+**三、形状是"提交不退休"**：账本同一时刻的两条 ~11 秒等待分属**两个不同的队列** —— 客体线程的 `vkQueueWaitIdle`
+（「一次性提交等空闲」，外层是 `nvnQueueSubmitCommands`）与**前端自己那条队列**的 `vkWaitForFences`
+（「上屏：等上一帧的栅栏」）；转储的「等待点」是：**已提交到栅栏 77、在飞槽 1/8（槽 1 的栅栏值 77）、提交 77 次、
+出图 73 次、队列锁无人持有** ⇒ 我们第 77 次提交交给驱动后**一直没退休**。
+
+**四、同一时刻系统也在停（这一轮最重要的读数，来自 logcat）**
+```
+I/Fence    (13724/ndroid.systemui): waitForever: fence(kgsl-timeline-kgsl-3d0_7-ndroid) status(0)
+W/BpBinder (1983): PerfMonitor binderTransact: time=9491ms   interface=…IComposerClient code=40
+I/HWUI     (13724/ndroid.systemui): Davey! duration=10018ms  … GpuCompleted=…（比 SwapBuffers 晚 10 秒）
+W/MiuiPerfServiceClient: interceptAndQueuing:13724|com.android.systemui|…|Slow swap buffers|2
+```
+⇒ **我们 + SystemUI + composer 三条路一起停 ~10 秒**。于是：
+- ⚠ **收回一条中途的错误读法**：我中途在病态中跑过 `vk_probe`（离屏最小 Vulkan）只用 0.07~0.11 秒，据此曾写下
+  "设备对别人是好的、病在我们进程" —— **那个读数不足以下这个结论**（离屏、64 KB，而且很可能正好撞在两次停顿
+  之间）。**撤回**。
+- **判别实验**：把 app 停掉、清 logcat、等 60 秒 ⇒ **60 秒里一条 `Davey!` / composer 卡顿都没有**（0 条）
+  ⇒ **那 ~10 秒的系统级停摆是我们引起的**，不是这台机器自己周期性的毛病。
+- 所以最贴形状的解释是：**我们让 GPU 挂住 → kgsl 约 10 秒后才判定/恢复**（`waitForever` 等的就是那条
+  kgsl-timeline），期间所有走 GPU / 显示的东西一起等；有时以 `VkResult -4`（设备丢失）收尾。
+  **`dmesg` 与 kernel logcat 都读不到**（`klogctl: Permission denied`）⇒ 要坐实"谁挂住 GPU"得越过 adb shell
+  的权限（root / perfetto 的 ftrace 源），或者换设备 / 换驱动对照。
+
+**五、不是这些**（都当场量过）：`Thermal Status: 0`、skin 36.2 ℃、GPU 52~58 ℃、电池 31.4 ℃、省电模式关、
+面板 min/max/cur **120 Hz**、`DynFPS:false`、窗口是**当前焦点**（`mCurrentFocus=ai.d2rm.dm`）、
+`Refresh Rate Map` 没有 per-app 覆盖。（顺带：`settings put system min_refresh_rate 120` 被 MIUI 拒 ——
+shell 没有 `WRITE_SETTINGS`，所以"钉住刷新率"这个实验做不了。）
+
+**六、下一步（按性价比，都还没动代码）**
+1. **「M3-2y」的 arm D 里那 10 秒落在"上传"的一次性提交上**（viewer 与扫描都关着，仍是客体线程
+   `nvnQueueSubmitCommands` 里的「一次性提交等空闲」10 秒；而同一条路上的「vk：上传：建中转缓冲 + 分配 + 映射」
+   **没有**长等）⇒ **先把"读回"与"上传"分开量**：两路现在共用 `one_begin_on/one_end_on`，**站点名分不出来**。
+   给 `one_end_on` 加一个"这是读回还是上传"的标签（**只动日志**），下一轮就能指名道姓。
+2. **在停顿窗口里抓一次 ftrace / perfetto**（`gpu` / `kgsl` / `sync` 三个源，30 秒）—— 设备上能跑 `perfetto`
+   就不用 root；这是唯一能直接看到"谁让 GPU 不动了"的仪器。
+3. **换设备 / 换驱动对照**（最有分辨力）：同一条配方在另一台 Adreno 或另一个驱动版本上跑，看那 ~10 秒还在不在。
+4. 若要动"用法"侧：第一刀建议切**前端那条自己的队列**（`vk_device.c:526` 无条件
+   `vkGetDeviceQueue(g_dev, g_qfi, 1, &g_queue_win)`，没有开关）—— 退回共用队列看那 ~10 秒是否消失；
+   代价是会走那条"实测两边互相堵死"的加锁回退路径（见 `vk_win.c:217-225`），要小心。
 
 ---
 

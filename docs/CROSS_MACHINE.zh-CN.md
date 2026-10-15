@@ -267,6 +267,14 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
   **`vkQueueWaitIdle`（"等队列空闲"）**，其后上传都在 `vkQueueSubmit` 上返回 -4（-4 是粘的）；要答"谁弄丢的"
   还差一件仪器（把"最后一次成功的提交"与"第一条 -4"之间那一小段留在日志里）。
   **量帧预算前先判这一轮是健康还是生病**（判据：op/帧 与有无 >1 秒的等待），否则读数能差 13 倍。细节见「M3-2y」。
+- **那 ~10 秒的停摆是"我们引起的"，而且是系统级的（2026-10-15，「M3-2z」）**：病态时同一时刻 **SystemUI 也卡了
+  10 秒**（`Davey! duration=10018ms`、`waitForever: fence(kgsl-timeline-kgsl-3d0_7-ndroid)`）、**composer HAL 的
+  调用 9.49 秒**（`IComposerClient code=40`）、`Slow swap buffers`；而**把 app 停掉、清 logcat、等 60 秒 ⇒ 一条都没有**
+  ⇒ 那 ~10 秒是**我们让 GPU 挂住、kgsl 约 10 秒后才判定/恢复**（期间所有走 GPU/显示的东西一起等），有时以
+  `VkResult -4` 收尾。两条边界也要记住：① "装包后第一次启动就健康"**不成立**（见 `probe-H1`）；
+  ② 中途那条用 `vk_probe`（离屏最小 Vulkan，0.1 秒就完）推出的"设备对别人是好的、病在我们进程"**已收回**
+  （离屏、64 KB，很可能撞在两次停顿之间）。**下一步**：给 `one_end_on` 加"读回 / 上传"标签（只动日志，先把
+  arm D 里那 10 秒的归属分出来）、在停顿窗口抓 ftrace/perfetto、换设备/驱动对照。细节见「M3-2z」。
 - **一条偶发**：约每轮 1 次 `【红】提交失败 VkResult -4`（`VK_ERROR_DEVICE_LOST`），后面跟上百条
   `贴图上传失败`。**与共用命令缓冲无关**（已排除，「M3-2o」）；「M3-2t」的 t2 里它之后窗口被拆、日志截断 ⇒
   与"停住"很可能是同一条线。
@@ -433,6 +441,14 @@ adb 要经 `run-as` 才看得到（`adb shell run-as ai.d2rm.dm ls -l files`）�
 - **`.ps1` 与 `.cmd` 一样：本机 PowerShell 5.1 会把"无 BOM 的 UTF-8"按 GBK 读**，中文注释会把脚本拆坏
   （实测 `ab-run.ps1` 报一串"意外的标记"、字符串缺终止符）。**抄仓库里那份 `.cmd` 的老规矩**：
   要么脚本里只写 ASCII，要么给它**补 UTF-8 BOM**（`[System.IO.File]::WriteAllBytes($p, [byte[]](0xEF,0xBB,0xBF) + [System.IO.File]::ReadAllBytes($p))`）。
+- **"这轮是健康还是生病"是每次量之前的前置动作**（「M3-2y」/「M3-2z」）：现成的四件工具都在 `.work` 里 ——
+  `ab-run.ps1`（跑 N 轮 + 解析：帧率 / 心跳最大间隔 / >1 秒的等待 / 读回锁 / `-4` 计数）、
+  `probe-launch.ps1`（一次启动 30~60 秒的读数 + 同时抓系统侧 logcat）、`logdiff.ps1`（两份日志的"行形状"差）、
+  `pipepairs.ps1`（两轮画过的 顶点/片元 对）。**判别"停摆是我们还是系统"最便宜的一招**：`am force-stop` +
+  `logcat -c` + 等 60 秒，然后看 `Davey!` / `IComposerClient` / `Slow swap buffers` 有没有 —— 有就是系统在停。
+- **MIUI 上 shell 改不了刷新率**：`settings put system min_refresh_rate 120` 会被拒
+  （`SecurityException: com.android.shell was not granted WRITE_SETTINGS`）⇒ "钉住刷新率"这类实验做不了，
+  别在它上面浪费时间（读数用 `dumpsys SurfaceFlinger` 看，面板当时是 min/max/cur 全 120 Hz）。
 - **本机 cmd 的代码页是 936（GBK），而仓库里的 `.cmd` 是 UTF-8 无 BOM** ⇒ 直接跑 `build_apk.cmd` 会被中文注释
   拆行、报一堆 `'xxx' 不是内部或外部命令` + `此时不应有 …`（「M3-2s」第一次构建就这么失败的，产物一个没出）。
   先 `chcp 65001` 再 call 即可（`.work\build_u8.cmd` 就是这个两行包装；脚本**不用改**，这是本机控制台的事）。
