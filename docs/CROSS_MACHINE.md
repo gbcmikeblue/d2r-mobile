@@ -175,8 +175,8 @@ Three old rules:
 
 ## 7. Where things stand and what comes next (hand-over: start here)
 
-> **This section goes stale.** Written 2026-10-15 against commit `06cc706` (which carries the M3-2p pipeline cache and the
-> toolchain.cmd unification); for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its
+> **This section goes stale.** Written 2026-10-15 against commit `1c5c8c3` (the M3-2s English doc sync; this round's real
+> work is "M3-2t"); for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its
 > "7. Next step" and "8. Progress log".
 
 ### Where it stops
@@ -195,41 +195,42 @@ Three old rules:
   read back all zero**. `DM_NVN_SHOT_SCAN` is now **level-complete** (levels 0/1/2 each once), and on the frames it can
   reach (50/54/57) **every one reads `brightness mean 0.0`** (part six of "M3-2m"). In other words the picture has not
   been written anywhere readable, or the reading side still hides something.
-- **One normal thing**: this device **stalls at 55-60 presents** (stage `CharacterCreate:Hover:Barbarian`, occasionally
-  `MainMenuHD:CheckUpdateLinks`). That is a known scene, not a crash, and the judgement has to be read from "what it is
-  doing across several runs".
-- **The shape of milestone B has been measured (2026-10-15, "M3-2r")**: the main thread polls a **task-completion bitmap**
-  at `main+0x15ee…` and that bitmap is **always 0** (it waits for the low 22 bits to be set) => **not one of the task
-  graph's 22 tasks ever completes**; at the same moment worker thread `0x1005` finishes a Granny decode and then **waits on
-  a lock held by the main thread** (waiting 15 s, and that lock **was never handed off by the kernel**). So the next
-  question is "**why are the tasks never dispatched**", not "what is wrong with the locks" (two lock-semantics changes were
-  both ruled out by measurement).
-- **The same evening, "M3-2s" walked this machinery through (and the wording has to follow)**: that object carries **three**
-  32-bit bitmaps (`+0x3320` dep source / `+0x3324` to-dispatch / `+0x3328` completed); the setter is **one place only**, the
-  tail of the task wrapper (`main+0x15f0e6c`); the arming site is `main+0x1636f50` (writes the low `count` bits, then clears
-  the completion bitmap, then calls the dispatcher `0x15ee598`, then the poll `0x15ee898`). On the device all three bitmaps
-  read **0** while the main thread's stack carries a **live** wrapper frame (it is running one of this graph's tasks), so
-  "**the 22 tasks were never dispatched**" **does not hold**; `0x1005` really is inside one of this graph's tasks and waits
-  on a lock word of `0x40001001` (owner `0x1001` = the main thread). **Next: a time series of the three bitmaps**, to
-  separate "armed 0 bits" from "completed and then cleared" (`+0x3328` has another clearer, `main+0x15eef90`, the tail of the
-  other graph runner). Details and readings in "M3-2s".
-- **One sporadic thing**: about once per run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a
-  hundred-plus `贴图上传失败` lines. **Unrelated to command-buffer sharing** (ruled out; "M3-2o").
+- **One normal thing (wording corrected, see the next bullet)**: this device **sometimes** stalls at 50-80 presents (stage
+  `CharacterCreate:Hover:Barbarian`, occasionally `MainMenuHD:CheckUpdateLinks`), but it has to be read as "what it is doing
+  across several runs" -- this round's t1/t3 runs **never stalled** (presents climbed to 375 / 379 and the last heartbeat
+  still said "presenting"), yet the process was killed by the watchdog, because its progress metric is the **engine tick**
+  and both runs sat at `tick 0`. Judge a stall by the **present count in the heartbeats** and the front end's
+  "**8 seconds without a new present**" report; the watchdog dump is only a photograph of the scene.
+- **Milestone B (task-graph side) is closed (2026-10-15, "M3-2t")**: the shape came from "M3-2r" and the machinery was read
+  out in "M3-2s" (three bitmaps at `+0x3320` / `+0x3324` / `+0x3328`, the arming site `main+0x1636f50`, the single setter
+  `main+0x15f0e6c`); this round turned them into a **time series** (a host sampler every 500 microseconds plus the SVC hook,
+  logging only on change) and ran it three times on the device: **"armed zero bits" is ruled out and "completed then
+  cleared" holds** -- max to-dispatch `0x3fffff` (the arming really writes the low `count` bits, the dispatcher takes them
+  one by one) and max completed `0x3fffff` (all 22 bits set many times, then cleared by the next arming). So both "M3-2r"'s
+  "the 22 tasks were never dispatched" and "M3-2s"'s "all three bitmaps read 0" **were not the stall state** (the latter is
+  a transient during a run), and `0x1005`'s lock is a side effect of the graph running. **Three things caught on the way**:
+  (a) the watchdog's "no progress" measures the **engine tick** (presented frames count only while `pregame`), so
+  "presents progressing + tick 0" is still declared dead => **a dump is not a stall**; (b) the one run that really stopped
+  presenting is the one with the **device loss**; (c) at a stall the main thread's **current PC sits in our own host layer**
+  (`vk_tex_view` / `vk_tex_grab_ser` / `mtl_wait`) while the graph keeps changing => look at the host side. Readings and the
+  disassembly corrections are in "M3-2t".
+- **One sporadic thing**: about once per run, `【红】提交失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a
+  hundred-plus `贴图上传失败` lines. **Unrelated to command-buffer sharing** (ruled out; "M3-2o"); in t2 of "M3-2t" it was
+  followed by the window being torn down and the log ending, so it is probably the same line as the stall.
 
 ### Next steps (detail in "7. Next step" of ANDROID_PLAN)
 
-1. **Milestone B: the guest stall** (**first -- the main blocker**) -- **the shape has been measured (2026-10-15, "M3-2r")**:
-   the main thread polls a task-completion bitmap at `main+0x15ee…` and that bitmap is **always 0** (22 tasks, none done).
-   **Later the same day "M3-2s" finished this route**: the three bitmaps, the arming site (`main+0x1636f50`) and the single
-   setter (the wrapper's tail, `main+0x15f0e6c`) are all located, and the device readings plus one contradiction (all
-   bitmaps 0 versus a live wrapper frame on the main thread's stack) are written up. **Next: a time series of the three
-   bitmaps** (sample on every main-thread SVC, log on change), to separate "armed 0 bits" from "completed and then cleared".
-   How to read the samples, the new instruments, and the two lock hypotheses that measurement killed are all in "M3-2r",
-   with this round's instruments and next steps in "M3-2s"; the one-shot stall sampler and the wait-point dump live in
-   "M3 step 3" (the old label "M3-2g" is dangling). It covers the most ground: the picture is not found before the stall.
-2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- the next
-   candidate is "**who loses it first**". What to measure: what else was on the queue at that moment, whether the device
-   had already been lost on the guest's side, and the `vkQueueSubmit` return value with its context.
+1. ~~**Milestone B: the guest stall** (task-graph side)~~ -- **closed (2026-10-15, "M3-2t")**: the time series of the three
+   bitmaps ran three times on the device and separated "armed zero bits" from "completed then cleared" -- **zero bits is
+   ruled out, completed-then-cleared holds** (max to-dispatch `0x3fffff`, max completed `0x3fffff`, then cleared by the
+   next arming). The machinery is sound and the blocker is not here.
+2. **Host-side read-back / queue waits** (**the real lead from item 1 -- do this first**) -- at a stall the main thread's
+   current PC sits in our own host layer (`vk_tex_view` / `vk_tex_grab_ser` / `mtl_wait`) while the graph keeps changing;
+   the sporadic **device loss** (`【红】提交失败 VkResult -4` plus a hundred-plus `贴图上传失败`, which in t2 was followed by
+   the window being torn down) is likely the same line. What to measure: which lock the main thread holds along its host
+   frame chain at the stall (the known shared points are `g_one_mu` and the one-shot submit), which queue / fence it waits
+   on, and "**who loses it first**" -- the guest's own commands or our one-shot submit (`vkQueueSubmit`'s return value and
+   context, what else was on the queue). Details in "M3-2t".
 3. ~~**Item 2 of the "9. Optimisation list"** (preferring `HOST_CACHED` for the zero-copy memory type)~~ -- **measured and
    ruled out (2026-10-15, "M3-2q")**: type 6 **can** export an fd (256 MB / 512 MB / 3968 MB all pass, `mmap` at the chosen
    address and both directions too), but it means **stepping outside the buffer's declared allowed types** (an external
@@ -271,7 +272,10 @@ DM_PASS_AREA=1         # render-area trace (measure only; =2 swaps in the attach
 ```
 
 The other switches are whatever `getenv` picks up in `dm/android/` (`DM_NVN_SHOT`, `DM_NVN_SHOT_ALL`, `DM_GFX_PROBE`,
-`DM_NO_DEPTH_TEST`, `DM_NO_TEXEL`, `DM_NVN_SPV_DIR`, `DM_NVN_FACTS`, `DM_ROOT/DM_ROMFS/DM_SAVE`, `DM_PIPE_CACHE`).
+`DM_NO_DEPTH_TEST`, `DM_NO_TEXEL`, `DM_NVN_SPV_DIR`, `DM_NVN_FACTS`, `DM_ROOT/DM_ROMFS/DM_SAVE`, `DM_PIPE_CACHE`). The
+**task-graph time series** ("M3-2t", on by default) adds three: `DM_TG_SERIES=0` turns it all off, `DM_TG_SERIES_US=` the
+sampling period in microseconds (default 500) and `DM_TG_SERIES_LINES=` the detail-line budget (default 5000; the detail
+lines lengthen the log noticeably, 1-2 MB per run).
 
 **The pipeline cache** (since 2026-10-15) lands in the app's **internal** directory,
 `/data/user/0/ai.d2rm.dm/files/pipecache.bin`; adb only sees it through `run-as`
@@ -318,6 +322,13 @@ dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
   why the process vanished during the A/B in "M3-2q": **not a crash and not MIUI**, the log ends on the "wait points" line
   plus that thread dump). To turn the watchdog off entirely, **leave the line out** (`if (watch || stall)` is what starts
   it); to observe a longer run, give it a large value.
+- **A watchdog dump is *not* "the guest stalled"** (2026-10-15, "M3-2t", part five): its progress metric is the **engine tick
+  entry** and **UI messages** (`crash_watch_progress(cur_tick(), ...)`, `diag.c:1752` / `:381`), while presented frames
+  count as progress **only while `pregame`** (`crash.c:44`) -- so "**presents progressing + tick 0**" is still declared
+  dead, dumped and `_exit`ed at second 15 (t1 and t3 of this round: presents climbed to 375 / 379 and the last heartbeat
+  said "presenting"). Judge a stall by the **present count in the heartbeats** plus the front end's "**8 seconds without a
+  new present**" report. Also note the dump itself is long (about 5 s to write on Android) and the game threads keep
+  running meanwhile, so fresh `DRAW_IDX` lines inside a dump are normal.
 - **MIUI refuses `adb install -r`**: it reports `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user` (the on-device
   confirmation is cancelled or the permission is off), and `install_apk.cmd` uses exactly that. Installing from the device
   side works at once: `adb push .work\apk-build\dm.apk /data/local/tmp/dm.apk` then

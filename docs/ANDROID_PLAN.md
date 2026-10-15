@@ -657,29 +657,25 @@ it brought out (MIUI SIGKILLs on backgrounding, so the hooks never run) is recor
 value (reordered 2026-10-15: the finished "level-by-level scan" is ticked off, the two duplicate "device loss" items are
 merged, the blocker-independent items from section nine are moved in, and this round's constraints are noted):
 
-1. **Milestone B: the guest stall** (**first -- the main blocker**). This device normally stalls a dozen seconds in at
-   `CharacterCreate:Hover:Barbarian` (occasionally `MainMenuHD:CheckUpdateLinks`). **The judgement has to be read from
-   "what is it doing across several samples", never against the occasional outlier run**: the one-shot stall sampler and
-   the wait-point dump are both in place (their content is in "M3 step 3" -- the old label "M3-2g" is a dangling one).
-   **The shape has been measured (2026-10-15, "M3-2r")**: the main thread polls a **task-completion bitmap** at
-   `main+0x15ee…` and that bitmap is **always 0** (it waits for the low 22 bits to be set) => **not one of the task
-   graph's 22 tasks ever completes**; at the same moment worker thread `0x1005` finishes a Granny decode and then goes to
-   **wait on a lock held by the main thread** (waiting 15 s, and that lock **was never handed off by the kernel**). So the
-   next question is "**why are the tasks never dispatched/set**", not "what is wrong with the locks" (two lock-semantics
-   changes were both ruled out by measurement, part four of "M3-2r"). **Later the same day, "M3-2s" walked this machinery
-   through**: three 32-bit bitmaps (`+0x3320` dep source / `+0x3324` to-dispatch / `+0x3328` completed), the arming site
-   `main+0x1636f50`, and the single setter (the wrapper's tail, `main+0x15f0e6c`) are all located, and the device reads all
-   three bitmaps as 0 while the main thread's stack holds a **live** wrapper frame -- so **"never dispatched" does not
-   hold**. **Next: turn the three bitmaps into a time series** (sample on every main-thread SVC, log on change) to
-   separate "armed 0 bits" from "completed and then cleared" (`+0x3328` has another clearer at `main+0x15eef90`, the tail of
-   the other graph runner). Instruments and readings in "M3-2s". It covers the most ground: the picture is not found
-   before the stall, and both "finding the picture" and "the device loss" are suppressed by it.
-2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- about once per
-   run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a hundred-plus `贴图上传失败` lines.
-   Uploads **are already** off the shared command buffer ("M3-2o") and it did not go away, so the cause lies elsewhere: the
-   next candidate is "**who loses it first**", the guest's own commands or this one one-shot submit of ours. What to
-   measure: what else was on the queue at that moment, whether the queue family / device had already been lost on the
-   guest's side, and the `vkQueueSubmit` return value with its context.
+1. ~~**Milestone B: the guest stall** (task-graph side)~~ -- **closed (2026-10-15, "M3-2t")**: the three bitmaps were
+   turned into a time series and three device runs separated "armed zero bits" from "completed then cleared" -- **zero
+   bits is ruled out, completed-then-cleared holds** (max to-dispatch `0x3fffff`, max completed `0x3fffff`, then cleared
+   by the next arming). So "M3-2r"'s "the 22 tasks were never dispatched" and "M3-2s"'s "all three bitmaps read 0" were
+   **not the stall state** (the latter is a transient during a run). Three old readings were corrected too: the
+   watchdog's "no progress" measures the **engine tick** (presented frames count only while `pregame`), so all three runs
+   read "**presents progressing + tick 0**" and were still declared dead => **the dump is not a stall** (judge by the
+   heartbeat present count plus the front end's "8 s without a new present" report); the one run that really stopped
+   presenting is the one with the **device loss** (`提交失败 VkResult -4` plus a hundred-plus upload failures, then
+   `TERM_WINDOW` and the log ends); and at the stall the main thread's **current PC sits in our own host layer**
+   (`vk_tex_view` / `vk_tex_grab_ser` / `mtl_wait`) while the graph keeps changing. Details and the three runs: "M3-2t".
+2. **Host-side read-back / queue waits** (**the real lead from item 1 -- do this first**) -- who waits on whom along
+   `vk_tex_view` (viewer read-back), `vk_tex_grab_ser` (gamma conversion included; in t3 its PC sat in `powf`) and
+   `mtl_wait`; known shared points are `g_one_mu` (the viewer and the present/scan paths read back at the same time) and
+   the one-shot submit. What to measure: which lock the main thread holds along its host frame chain at the stall, which
+   queue / fence it is waiting on, and -- for the sporadic **device loss** (`【红】提交失败 VkResult -4` plus a hundred-plus
+   `贴图上传失败` once per run) -- "**who loses it first**", the guest's own commands or our one-shot submit
+   (`vkQueueSubmit`'s return value and context, what else was on the queue). Uploads **are already** off the shared command
+   buffer ("M3-2o") and it did not go away, so the cause lies elsewhere.
 3. ~~**Item 2 of section nine, `HOST_CACHED`**~~ -- **measured and ruled out (2026-10-15, "M3-2q")**: exporting an fd on
    type 6, `mmap`-ing it at a chosen address and both directions all **work** (256 MB, 512 MB and 3968 MB alike), but the
    same-device A/B shows **no measurable difference in CPU time** (under 3% within the same mode, while the run-to-run
@@ -1753,6 +1749,120 @@ Next (in order, still measuring rather than changing):
    the thread whose tag a handoff wrote ever actually woken".
 3. While at it: check `graph == x26 + 0x2D40` (read `x26` out of the graph entry's frame) and read `x26+0x6064` (the cell
    the arming site actually writes).
+
+---
+
+### M3-2t: the three bitmaps as a time series -- **"armed zero bits" is ruled out, "completed then cleared" holds**; three old readings corrected along the way (2026-10-15, device, three runs)
+
+The time series promised in part five of "M3-2s" is done and the A/B question of part four (armed zero bits vs completed
+and then cleared) has a definite answer. Six parts below: **instrument**, **disassembly correction**, **three runs**,
+**conclusion**, **three things it caught on the way**, **next**.
+
+**1. Instrument** (`dm/host/hle_thread.c`, on by default, read-only, `DM_TG_SERIES=0` turns it off)
+
+Two sources feed one "log only when something changed" filter:
+
+- a **host sampler thread** (a pthread with a 64 KiB stack, started on the first latch) reading six 32-bit values every
+  `DM_TG_SERIES_US` (default **500 microseconds**);
+- the **SVC hook**: every thread that has latched a graph reads the same six values on every SVC -- while the dispatcher
+  runs it locks / unlocks every few microseconds, so that path is the only one with a chance of catching the window
+  between the arming and the tasks being taken.
+
+Why not the SVC hook alone: **a stalled main thread spins in guest code and can go fifteen seconds without one SVC**
+(the r3 scene of "M3-2r": `call chain 15.0 s ago` plus `/proc` state `R` and `syscall running`), so sampling only on SVCs
+would have seen nothing at all.
+
+The six values: task count at `graph+0x3100`, to-dispatch `+0x3324`, completed `+0x3328`, dep source `+0x3320`, and the
+lengths at `+0x3470` / `+0x3488` (the table whose header is at `+0x3468`: the wrapper's tail scans it and removes its own
+job). Detail lines are budgeted (`DM_TG_SERIES_LINES`, default 5000; **the first round used 200 and exhausted it within
+5 s, cutting off exactly the interval worth seeing**). Over the whole run the instrument also accumulates
+**non-zero count / maximum / time of first non-zero**, and `tg_series_summary` prints that into the state dump -- that
+summary is the reading that settles the A/B question.
+
+**2. Disassembly correction: `[x29-8]` is the **caller's** x19**
+
+The reading of "M3-2s" ("[x29-8] = the x19 the dispatcher saved = the graph") has the direction **backwards**: `stp x20,x19`
+stores the value **coming in**, that is the **caller's** live x19. So "a frame's return address falls inside function F"
+only means **that frame was called by F**, and `[x29-8]` is **F's** x19. A criterion must therefore pick call sites where
+the caller holds the graph, and each one has to be verified:
+
+| call-site range | caller | caller's x19 | device result |
+|---|---|---|---|
+| `[0x15ee598,0x15ee894)` the dispatcher | the dispatcher (`mov x19,x0`, x0 is the graph) | **the graph** yes | holds (runs 2 and 3 latched this way) |
+| `[0x15f0ce4,0x15f0e98)` the wrapper's tail (`0x15f0e78 bl dispatcher`) | the wrapper (`mov x0,x19` in its tail) | **the graph** yes | holds -- so that frame is the **dispatcher's** |
+| `[0x15ee898,0x15ee9c0)` the poll | the poll (`mov x19,x0`) | **the graph** yes | holds (run 1 latched this way) |
+| `[0x1636f3c,0x1636f68)` the run-graph entry | the run-graph entry | **the constant `0x6064`** no | **does not hold**: the device printed `0x1001 帧判据命中（main+0x1636f5c）但 [x29-8] = 0x6064 不是任务图` |
+
+That last row is why every hit must pass two checks: (a) task count at `graph+0x3100` in 1..64; (b) **the two bitmaps
+indexed by task number (completed / to-dispatch) may not carry bits beyond the task count** (dep source `+0x3320` is a
+mask of another shape -- `0x7f` has been seen -- and is left out). (b) is far stronger and rejects almost every "wrong
+address that happens to hold a small integer". Another wording fix from the same disassembly: the old "wrapper frame"
+criterion actually finds the **dispatcher's** frame (the `bl` at `0x15f0e78` returns to `0x15f0e7c`, which is inside the
+wrapper's range), so the `[x29-0x18]` that line prints is the **dispatcher's loop index (x21)**, not a task index; and the
+`+0x3100` value has always been the **task count** (22), not a "wait mask". Both labels were changed.
+
+**3. Three runs** (`.work/logs/t1.log` / `t2.log` / `t3.log`)
+
+| run | graph | tasks | max to-dispatch | max completed | series covers | presents | ending |
+|---|---|---|---|---|---|---|---|
+| t1 | `0x7bf7c0fd40` | 22 | `0x3ffffe` | `0x3fffff` | 3.98 -> 21.53 s | 0 -> 375 (last heartbeat still "progressing") | watchdog dump (the graph was **still changing** around it) |
+| t2 | `0x7bf87cfd40` | 22 / 3 | `0x3ffffe` | `0x3fffff` | 3.75 -> 7.55 s | 0 -> 82 then **stopped** | device loss, then the window was torn down (`TERM_WINDOW`) |
+| t3 | `0x7bf9e19d40` | 22 / 3 | **`0x3fffff`** | `0x3fffff` | 1.88 -> 19.51 s | 0 -> 379 (last heartbeat still "progressing") | watchdog dump (**while presenting normally**) |
+
+The shape of every run (t3 is the most complete): `arm: to-dispatch = 0x3fffff (all bits at once) -> the dispatcher
+takes them one by one (to-dispatch -> 0) -> completed accumulates up to 0x3fffff (all 22 done) -> the next arming clears
+completed to 0`, one turn every few dozen milliseconds, following the present cadence. Also: **the same address gets
+reused for graphs with different task counts** (22 and 3 were seen sharing one address, so the objects are pooled and
+reused for different graph definitions), which is why the instrument has to allow **the graph address to change** -- the
+first version latched only the first one and lost the trail after 7.5 s in run 2.
+
+**4. Conclusion**
+
+- **"Armed zero bits" is ruled out**: the maximum of to-dispatch is `0x3fffff` (t3 caught a whole arming) / `0x3ffffe`
+  (t1, t2) -- the arming really does write the low `count` bits, and the dispatcher then takes them one by one.
+- **"Completed then cleared" holds**: completed repeatedly reaches `0x3fffff` (all 22 bits) and is then cleared to 0 by
+  **the next arming** (`main+0x1636f54`); the other clearer at `main+0x15eef90` (tail of the other graph runner) never
+  needed to appear in these runs.
+- So **neither** "M3-2r"'s "the 22 tasks were never dispatched" **nor** "M3-2s"'s "all three bitmaps read 0" **was the
+  state at the stall**: the latter is a **transient** during a run (everything dispatched, not one completion bit set yet),
+  which any single random read can land on -- the "does not add up" of part four of "M3-2s" is closed.
+- **The task-graph machinery is sound**: arming, dependencies, dispatch, setting and clearing all line up, and the tasks
+  really do finish (all 22 bits set many times over). **The blocker is not here.**
+
+**5. Three things it caught on the way (worth more than the above)**
+
+1. **The watchdog's "no progress" is not "the guest stalled"**: `crash_watch_progress(cur_tick(), ...)` is only called
+   from the **engine tick entry** (`diag.c:1752`) and from **UI messages** (`diag.c:381`), and presented frames count as
+   progress **only while `pregame`** (`crash.c:44`). All three runs read "**presents progressing + tick 0**" (t3's last
+   heartbeat was still `出图 379 ... 出图在推进`) and the watchdog still declared death at second 15, dumped and `_exit`ed
+   => **that dump means "the engine tick has been stopped for 15 s", not "the picture stopped"**. From now on judge a
+   stall by the **present count in the heartbeats** and by the front end's own "**8 seconds without a new present**"
+   report; treat the watchdog dump as a photograph of the scene. (Related: the dump is long -- about 5 s to write on
+   Android -- and the game threads keep running meanwhile, so new `DRAW_IDX` lines inside the dump are normal.)
+2. **The one run that really did stop presenting is the one with the device loss** (t2): `【红】提交失败 VkResult -4` plus
+   a hundred-plus `贴图上传失败`, presents stopped at 82, then the window was torn down (`TERM_WINDOW` -- the foreground
+   pipeline-cache write still succeeded) and **the log ends there**. This merges with item 2 of section 7.
+3. **At the stall, the main thread's *current PC* sits in our own host layer**: t1 `vk_tex_view+0x28` (reached through
+   `mtl_exec` from the guest's `main+0x17443dc`, with the guest frame `main+0x8572b8` below), t3 `libdm.so+0x152950`
+   (called from `main+0x124db10`), and in both runs the other "spinning" thread was in `vk_tex_grab_ser` (in t3 its PC sat
+   in `powf`, so it was **computing** the viewer's gamma conversion, not dead-waiting -- the stall sampler's "spinning in
+   user space" only means "not inside a syscall"). **And the graph was still changing at the same time** (t1 to 21.5 s,
+   t3 to 19.5 s) => what to look at next is the **host-side read-back / queue waits** (`vk_tex_view` / `vk_tex_grab_ser` /
+   `mtl_wait`), not the guest's task graph.
+
+**6. Next**
+
+1. ~~The time series~~ **done (this section)**: the task-graph line is closed (the machinery is sound); judge a stall by
+   the **heartbeat present count + the front end's stall report** from now on.
+2. **Host-side read-back / queue waits** (from 5.3): who waits on whom along `vk_tex_view` / `vk_tex_grab_ser` /
+   `mtl_wait` (two known shared points: `g_one_mu` and the one-shot submit), measured together with the device loss of
+   item 2 of section 7.
+3. **Checking `graph == x26+0x2D40`** (item 3 of "M3-2s") **is demoted to "while at it"**: this round's stronger
+   validation already rejected one mis-read address on the device (the `0x6064` case), so it is no longer a prerequisite.
+4. **The host-side lock ledger** (item 2 of "M3-2s") **drops in priority**: that mutual-wait cycle is a side effect of
+   "the graph is running", and the graph is now proven to finish; revisit it once item 2 has a conclusion.
+
+Roughly 20 lines changed, a 40-second incremental build, ~25 seconds per device run.
 
 ---
 

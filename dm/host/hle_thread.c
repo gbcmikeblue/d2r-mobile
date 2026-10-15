@@ -76,10 +76,11 @@ typedef struct thr {
     // function-level position; the x29 chain is the guest's own (the rewriter's gate block deliberately preserves it)
     uint64_t stack_low, stack_high; uint64_t bt_off[10]; int bt_n; uint64_t bt_at;
     uint64_t wait_at_ns;      // 进入当前等待的时刻（转储里打「已等 X 秒」：判「等太久」用它）| when the current wait began (the dump prints "waiting X s": how to tell "way too long")
-    uint64_t tg_this;         // 主线程等在"任务图完成位图"里时，该位图所属的对象（取自 [x29-8] = 函数序言保存的 x19）| when the main thread waits on the task-graph completion bitmap, the object owning it (taken from [x29-8] = the x19 saved by that function's prologue)
-    uint64_t jb_this;         // 正在跑任务时，任务包装器（main+0x15f0ce4）那张调用帧里的 x19 = 该作业所属的任务图；jb_idx = x21 = 任务序号
-                              // While a task is running: the task wrapper's (main+0x15f0ce4) frame holds x19 = the graph this job belongs to, and x21 = the task index
+    uint64_t tg_this;         // 等"任务图完成位图"时，该位图所属的对象（取自 [x29-8] = 函数序言保存的 x19）| when waiting on the task-graph completion bitmap, the object owning it (taken from [x29-8] = the x19 saved by that function's prologue)
+    uint64_t jb_this;         // 进过任务的证据：包装器尾（main+0x15f0e78）调进来的**派发器**帧的 x19 = 该作业所属的任务图；jb_idx = 同帧 [x29-0x18] = 派发器的循环下标（不是任务序号，见 docs/ANDROID_PLAN 的 M3-2t）
+                              // Evidence of having entered a job: the x19 of the **dispatcher** frame called from the wrapper's tail (main+0x15f0e78) = the graph this job belongs to; jb_idx = [x29-0x18] of the same frame = the dispatcher's loop index (not the task index, see M3-2t in docs/ANDROID_PLAN)
     uint64_t jb_idx; int jb_frame;
+    uint32_t tg_rej;           // 判据命中但 [x29-8] 校验不过的次数（只报前两次）：用来照出"图 == x26+0x2D40"这类地址认错 | Times a criterion matched but [x29-8] failed validation (only the first two are reported): this is what catches a mis-identified graph address (e.g. "graph == x26+0x2D40")
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
     mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
@@ -258,7 +259,9 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
+static int tg_en(void);   // M3-2t 任务图时序的开关（定义在后面：峰值采样那一节）| the M3-2t task-graph series switch (defined later, in the sampling section)
 uint32_t svc_thread_main_init(void) {
+    (void)tg_en();   // 开关在启动时读一次：getenv 要拿 libc 全局环境锁，别让它落在客体 SVC 热路径上（dm.h 的老规矩）| read the switch once at startup: getenv takes the libc environment lock, and it must not land on the guest SVC hot path (the old rule in dm.h)
     pthread_key_create(&g_keythr, NULL);
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
@@ -504,32 +507,237 @@ static int peek32(uint64_t a, uint32_t *out) {
     return 1;
 }
 
+// ---------- M3-2t：任务图三张位图的时间序列 ----------
+// 要回答的一件事：上膛（main+0x1636f50 把低 count 位写进 图+0x3324）**到底有没有写上**，以及完成位图（图+0x3328）
+// 是"从没被置过"还是"置过又被清掉"（清零点：另一条跑图路径的收尾 main+0x15eef90，或下一轮上膛 main+0x1636f54）。
+// 为什么不只在 SVC 钩子里采：主线程停住后是在客体里空转，可以十几秒不发一次 SVC（r3 现场：/proc 状态 R、
+// 系统调用 running、调用链 15.0 秒前）——只靠"每次 SVC 采一次"会一无所获。所以两条来源都走同一个"变了才打一行"
+// 的过滤器：宿主采样线程定期读（缺省 500 微秒一次），SVC 钩子补高分辨率（能看到派发器真在跑的那几微秒）。
+// 明细行有预算（DM_TG_SERIES_LINES，缺省 5000 行，够跑 60 秒），免得每秒几千行的洪水把日志与采样本身拖垮；
+// 整个运行期的"非零次数 / 历史最大值 / 第一次非零的时刻"另有累计，停住时由 tg_series_summary 打一行汇总 ——
+// 那才是判甲/乙的读数（第一轮用 200 行，5 秒就花光，正好把"停住前后那几秒"漏掉了，所以提到 5000）。
+// M3-2t: turn the task graph's three bitmaps into a time series. The question: did the "load" (main+0x1636f50
+// writing the low count bits into graph+0x3324) actually write anything, and was the completion bitmap (+0x3328)
+// never set or set and then cleared (clear sites: the other run path's tail main+0x15eef90, or the next load at
+// main+0x1636f54). Sampled both from a host thread every 500 us and from the SVC hook (which alone would see
+// nothing: a stalled main thread spins in guest code and can go 15 s without one SVC). Both feed one change-only
+// filter; detail lines are budgeted, and a per-run summary (non-zero count / max / first-non-zero time) is printed
+// into the state dump -- that summary is the reading that tells "never loaded" from "loaded then cleared".
+#define TG_SLOTS 8
+#define TG_NVAL  5                                   // 待派发 / 已完成 / 依赖源 / 图+0x3470 / 图+0x3488 | pending / done / ready / graph+0x3470 / graph+0x3488
+static const uint64_t tg_voff[TG_NVAL] = {0x3324, 0x3328, 0x3320, 0x3470, 0x3488};
+static const char *const tg_vname[TG_NVAL] = {"待派发", "已完成", "依赖源", "在飞表(+0x3470)", "表(+0x3488)"};
+typedef struct {
+    int used; uint64_t graph; uint32_t cnt;
+    uint32_t v[TG_NVAL], last[TG_NVAL];
+    uint64_t samples, changes, nz[TG_NVAL];
+    uint32_t mx[TG_NVAL];
+    double first_nz[TG_NVAL], last_chg;
+    int seen;
+} tgw_t;
+static tgw_t g_tgw[TG_SLOTS];
+static int g_tgw_n;
+static pthread_mutex_t g_tgw_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_tgw_lines, g_tgw_line_budget = 5000;
+static int g_tgw_en = -1, g_tgw_us = 500;
+
+static int tg_en(void) {
+    if (g_tgw_en < 0) {
+        const char *e = getenv("DM_TG_SERIES");                  // 0 = 整个仪器关掉（默认开）| 0 turns the whole instrument off (on by default)
+        g_tgw_en = (e && atoi(e) == 0) ? 0 : 1;
+        e = getenv("DM_TG_SERIES_US");                           // 采样周期（微秒，默认 500）| sampling period in microseconds (default 500)
+        if (e && atoi(e) > 0) g_tgw_us = atoi(e);
+        // 明细行预算（默认 5000 行）。第一轮用 200 行，5 秒就花光、正好把"停住前后那几秒"漏掉了 —— 那才是要看的区间。
+        // Detail-line budget (default 5000). The first round used 200 and exhausted it within 5 s, which cut off exactly
+        // the few seconds around the stall -- the interval worth watching.
+        e = getenv("DM_TG_SERIES_LINES");
+        if (e && atoi(e) > 0) g_tgw_line_budget = (uint64_t)atoi(e);
+    }
+    return g_tgw_en;
+}
+
+// 图地址校验（两道，都要过）：
+//   ① 图+0x3100 是任务数（22 这类小值，1..64）；
+//   ② 两张"按任务序号置位"的位图（已完成 +0x3328、待派发 +0x3324）不许出现超出任务数以外的位 —— 这一条比 ① 强得多，
+//      几乎能挡掉所有"地址认错但恰好读到个小整数"的情形。（依赖源 +0x3320 不是这个形状：它是位掩码且见过 0x7f，
+//      所以不参与校验。）
+// 判据命中却过不了校验 ⇒ [x29-8] 不是任务图，或者"图 == x26+0x2D40"这条不成立 —— 要出声，别拿假地址去读位图。
+// Two checks, both required: (1) graph+0x3100 is the task count (a small 1..64 value); (2) the two bitmaps indexed by
+// task number (done +0x3328, pending +0x3324) may not carry bits beyond the task count. The second is far stronger and
+// rejects almost every "wrong address that happens to hold a small integer". The ready bitmap (+0x3320) is left out: it
+// is a mask of another shape (0x7f has been seen). A criterion hit that fails either check means [x29-8] is not the
+// graph (or "graph == x26+0x2D40" does not hold) and must be reported rather than read as bitmaps.
+static int tg_graph_ok(uint64_t g) {
+    uint32_t c = 0, mad = 0, mpe = 0;
+    if (!peek32(g + 0x3100, &c) || c < 1 || c > 64) return 0;
+    if (!peek32(g + 0x3328, &mad) || !peek32(g + 0x3324, &mpe)) return 0;
+    uint32_t low = c >= 32 ? 0xffffffffu : ((1u << c) - 1u);
+    return (mad & ~low) == 0 && (mpe & ~low) == 0;
+}
+
+static void *tg_sampler(void *a);
+
+// 登记一个要观察的任务图（按地址去重；满了就换掉最久没变化的那个），第一次登记时起宿主采样线程
+// Register a task graph to watch (deduplicated by address; when full, evict the one that changed longest ago);
+// the host sampler thread starts on the first registration
+static void tg_watch(uint64_t g, const char *why) {
+    if (!tg_en() || !tg_graph_ok(g)) return;
+    int start = 0, fresh = 0; uint32_t cnt = 0;
+    pthread_mutex_lock(&g_tgw_mu);
+    for (int i = 0; i < g_tgw_n; i++) if (g_tgw[i].used && g_tgw[i].graph == g) { pthread_mutex_unlock(&g_tgw_mu); return; }
+    int idx = -1;
+    if (g_tgw_n < TG_SLOTS) idx = g_tgw_n++;
+    else { double best = 1e18; for (int i = 0; i < TG_SLOTS; i++) if (g_tgw[i].last_chg < best) { best = g_tgw[i].last_chg; idx = i; } }
+    memset(&g_tgw[idx], 0, sizeof g_tgw[idx]);
+    g_tgw[idx].used = 1; g_tgw[idx].graph = g;
+    for (int k = 0; k < TG_NVAL; k++) g_tgw[idx].first_nz[k] = -1;
+    if (g_tgw_n == 1) start = 1;
+    fresh = 1;
+    pthread_mutex_unlock(&g_tgw_mu);
+    if (fresh && peek32(g + 0x3100, &cnt))
+        LOG("图时序：登记任务图 %#llx（判据 %s）任务数 %u、采样 %d 微秒一次", (unsigned long long)g, why, cnt, g_tgw_us);
+    if (start) {
+        pthread_attr_t a; pthread_t th;
+        pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64 << 10);
+        if (!pthread_create(&th, &a, tg_sampler, NULL)) pthread_detach(th);
+        else LOG("任务图时序：采样线程没起起来（只看 SVC 钩子那一路）");
+        pthread_attr_destroy(&a);
+    }
+}
+
+// 采样一次：读六个数（任务数 + 五个量），比上次快照，变了就打一行；同时累计非零次数 / 最大值 / 首次非零时刻。
+// 打日志放到锁外（stderr 可能阻塞，别把采样和客体 SVC 一起卡住）。
+// Sample once: read six values (task count plus five fields), compare with the last snapshot, print a line when
+// anything changed, and accumulate the non-zero count / max / first-non-zero time. The log call is deliberately
+// outside the lock (stderr can block; it must not stall the sampler and the guest SVC path together).
+static void tg_tick(const char *who, uint32_t h) {
+    if (!tg_en() || !g_tgw_n) return;
+    double t = (now_ns() - g_t0_ns) / 1e9;
+    char lb[512]; lb[0] = 0;
+    pthread_mutex_lock(&g_tgw_mu);
+    for (int i = 0; i < g_tgw_n; i++) {
+        tgw_t *w = &g_tgw[i];
+        if (!w->used) continue;
+        uint32_t v[TG_NVAL], cnt = 0;
+        if (!peek32(w->graph + 0x3100, &cnt)) continue;
+        int okall = 1;
+        for (int k = 0; k < TG_NVAL; k++) if (!peek32(w->graph + tg_voff[k], &v[k])) okall = 0;
+        if (!okall) continue;
+        w->samples++;
+        int chg = 0;
+        for (int k = 0; k < TG_NVAL; k++) {
+            if (v[k]) { w->nz[k]++; if (v[k] > w->mx[k]) w->mx[k] = v[k]; if (w->first_nz[k] < 0) w->first_nz[k] = t; }
+            if (v[k] != w->last[k]) chg = 1;
+        }
+        int first = !w->seen;
+        if (!chg && !first) continue;   // 首个快照无论值是多少都打一行：它同时证明"锁存到的确实是图" | the first snapshot is printed whatever it holds: it also proves the address really is the graph
+        w->seen = 1; w->cnt = cnt; w->last_chg = t;
+        if (!first) w->changes++;
+        if (g_tgw_lines < g_tgw_line_budget) {
+            g_tgw_lines++;
+            int q = snprintf(lb, sizeof lb, "图时序 %s[%7.3fs] h=%#x 图 %#llx 任务数 %u：待派发 %#x、已完成 %#x、依赖源 %#x、在飞表 %u/%u", who, t, h, (unsigned long long)w->graph, cnt, v[0], v[1], v[2], v[3], v[4]);
+            if (first && q < (int)sizeof lb - 32) q += snprintf(lb + q, sizeof lb - q, "（首个快照）");
+            else { if (q < (int)sizeof lb - 96) q += snprintf(lb + q, sizeof lb - q, " ← ");
+                   for (int k = 0; k < TG_NVAL && q < (int)sizeof lb - 48; k++) if (v[k] != w->last[k]) q += snprintf(lb + q, sizeof lb - q, "%s%#x→%#x ", tg_vname[k], w->last[k], v[k]); }
+        }
+        for (int k = 0; k < TG_NVAL; k++) w->last[k] = v[k];
+    }
+    pthread_mutex_unlock(&g_tgw_mu);
+    if (lb[0]) LOG("%s", lb);
+}
+
+static void *tg_sampler(void *a) {
+    (void)a;
+    for (;;) {
+        struct timespec ts = {0, (long)g_tgw_us * 1000};
+        nanosleep(&ts, 0);
+        if (g_tgw_n) tg_tick("采样", 0);
+    }
+    return NULL;
+}
+
+// 停住时的汇总（svc_thread_dump 调）：整个运行期"某个量非零过几次、最大多少、第一次什么时候" ——
+// 上膛若真写上了 0x3fffff，待派发的"最大"必然非零；完成位若置过，已完成的"最大"必然非零。
+// The summary printed in the state dump: over the whole run, how often each field was non-zero, its maximum, and
+// when it first turned non-zero. If the load really wrote 0x3fffff, the maximum of 待派发 cannot be zero; if the
+// completion bit was ever set, the maximum of 已完成 cannot be zero.
+void tg_series_summary(void) {
+    if (!tg_en()) { LOG("图时序：关（DM_TG_SERIES=0）"); return; }
+    if (!g_tgw_n) { LOG("图时序：没有登记到任何任务图（三条帧判据一次都没命中）"); return; }
+    pthread_mutex_lock(&g_tgw_mu);
+    for (int i = 0; i < g_tgw_n; i++) {
+        tgw_t *w = &g_tgw[i];
+        if (!w->used) continue;
+        uint32_t cur[TG_NVAL] = {0};
+        for (int k = 0; k < TG_NVAL; k++) peek32(w->graph + tg_voff[k], &cur[k]);
+        LOG("图时序汇总：图 %#llx 任务数 %u，采样 %llu 次、变化 %llu 次（末次 %7.3fs）；现在：待派发 %#x、已完成 %#x、依赖源 %#x、在飞表 %u/%u",
+            (unsigned long long)w->graph, w->cnt, (unsigned long long)w->samples, (unsigned long long)w->changes, w->last_chg,
+            cur[0], cur[1], cur[2], cur[3], cur[4]);
+        for (int k = 0; k < TG_NVAL; k++) if (w->nz[k] || w->mx[k]) LOG("  非零过：%s %llu 次、最大 %#x、首次非零 %7.3fs", tg_vname[k], (unsigned long long)w->nz[k], w->mx[k], w->first_nz[k] < 0 ? 0.0 : w->first_nz[k]);
+    }
+    pthread_mutex_unlock(&g_tgw_mu);
+}
+
 static void bt_sample(thr_t *t, uint64_t fp) {
     t->bt_n = 0; t->bt_at = now_ns();
     for (int i = 0; i < 60 && t->bt_n < (int)(sizeof t->bt_off / sizeof *t->bt_off); i++) {
         if (!fp || (fp & 7) || fp < t->stack_low || fp + 16 > t->stack_high) break;
         uint64_t next = *(volatile uint64_t *)fp, ret = *(volatile uint64_t *)(fp + 8);
         module_t *m = module_of((void *)ret);
-        // 最内层若正好落在"任务图等全部做完"那个函数里（main+0x15ee898 起），它的 x19 就是任务图对象。
-        // 反汇编依据（main.patched.bin 该函数序言）：stp x20,x19,[sp,#0x40] + add x29,sp,#0x50 ⇒ x19 = [x29-8]
-        // If the innermost frame lands exactly in the "task graph waiting for everything" function (from
-        // main+0x15ee898), its x19 is the task-graph object. From the disassembly of that function's prologue
-        // (main.patched.bin): stp x20,x19,[sp,#0x40] plus add x29,sp,#0x50 means x19 = [x29-8]
-        if (i == 0 && m && !strcmp(m->name, "main")) {
+        // 任务图地址的三条帧判据（反汇编依据见 docs/ANDROID_PLAN 的「M3-2t」）。要点：帧的 [x29-8] 是**调用者**的 x19
+        // （序言 stp x20,x19 存进去的是进来时的值，也就是调用者那个活着的 x19），所以判据要挑"调用者手里正拿着图"的
+        // 调用点：把返回地址落在那几处的帧拿出来，它的 [x29-8] 才是图。三处都验过：
+        //   [0x15ee598,0x15ee894) 派发器自己（序言 mov x19,x0，x0 就是图；它调锁 / 解锁 / 建作业 ⇒ 每几微秒一次 SVC，
+        //                          正好覆盖"上膛之后、任务被取走"那段窗口）⇒ 拿到的是被它调的那层的帧，[x29-8] = 图
+        //   [0x15f0ce4,0x15f0e98) 任务包装器尾部（0x15f0e78 bl 派发器，包装器的 x19 = 图）⇒ 派发器的帧
+        //   [0x15ee898,0x15ee9c0) 轮询自己（x19 = 图，它 bl 作业池"边帮忙边等"）⇒ 那个泵的帧
+        // 反面例子（真机实测，见「M3-2t」）：跑图入口 0x1636f58 bl 派发器，但入口的 x19 是常数 0x6064（那个偏移），
+        // 于是 [x29-8] = 0x6064 —— 所以"返回地址落在某个函数区间"并不自动等于"这个函数把图放在 x19"，一律要过校验。
+        // Three frame criteria for the task-graph address (disassembly evidence in "M3-2t" of docs/ANDROID_PLAN). The
+        // key point: a frame's [x29-8] is the **caller's** x19 (the prologue's stp x20,x19 stores the incoming value,
+        // i.e. the caller's live x19), so the criterion must pick call sites where the caller is holding the graph:
+        //   [0x15ee598,0x15ee894) the dispatcher itself (mov x19,x0 = the graph; it locks / unlocks / builds jobs, so it
+        //                         issues an SVC every few microseconds -- exactly the window right after the load)
+        //   [0x15f0ce4,0x15f0e98) the wrapper's tail (0x15f0e78 bl dispatcher; the wrapper's x19 = the graph)
+        //   [0x15ee898,0x15ee9c0) the poll itself (x19 = the graph; it bls the job pool's "help while waiting")
+        // Counter-example (measured, see "M3-2t"): the run-graph entry bls the dispatcher at 0x1636f58, but the entry's
+        // x19 is the constant 0x6064 (that offset), so [x29-8] reads 0x6064 -- "the return address is inside function F"
+        // does not by itself mean "F keeps the graph in x19"; every hit must pass the task-count check.
+        if (m && !strcmp(m->name, "main") && fp - 0x18 >= t->stack_low) {
             uint64_t off = (uint64_t)ret - (uint64_t)m->base;
-            if (off >= 0x15ee800 && off < 0x15eea40 && fp - 8 >= t->stack_low)
-                t->tg_this = *(volatile uint64_t *)(fp - 8);
-        }
-        // 任务包装器（main+0x15f0ce4 起）的帧：序言是 str x25,[sp,#-0x50]! + 五对 stp + add x29,sp,#0x40，
-        // 所以 [x29-8] = 保存的 x19（该作业的任务图）、[x29-0x18] = 保存的 x21（任务序号）。
-        // The task-wrapper frame (from main+0x15f0ce4): its prologue is str x25,[sp,#-0x50]! + five stp pairs +
-        // add x29,sp,#0x40, hence [x29-8] = saved x19 (the graph this job belongs to) and [x29-0x18] = saved x21 (its index).
-        if (!t->jb_this && m && !strcmp(m->name, "main") && fp - 0x18 >= t->stack_low) {
-            uint64_t off = (uint64_t)ret - (uint64_t)m->base;
-            if (off >= 0x15f0ce4 && off < 0x15f0e98) {
-                t->jb_this = *(volatile uint64_t *)(fp - 8);
-                t->jb_idx = *(volatile uint64_t *)(fp - 0x18);
-                t->jb_frame = i;
+            const char *why = NULL;
+            if (off >= 0x15ee598 && off < 0x15ee894) why = "派发器";
+            else if (off >= 0x15f0ce4 && off < 0x15f0e98) why = "包装器尾";
+            else if (off >= 0x15ee898 && off < 0x15ee9c0) why = "轮询";
+            if (why) {
+                uint64_t g = *(volatile uint64_t *)(fp - 8);
+                int ok = tg_graph_ok(g);
+                // 图地址**可以换**，不能只在第一次锁存：同一个地址会被复用成任务数不同的图（真机见过 22 与 3 共用一个
+                // 对象），游戏换场景时也会换对象 —— 第一版只认第一次，结果第 2 轮 7.5 秒之后就跟丢了。所以候选地址
+                // 与当前不同就换过去（并登记进观察表），换了会打一行（有上限）。
+                // The graph address **can change**, so latching it only once is wrong: one address gets reused for graphs
+                // with different task counts (22 and 3 were seen sharing an object), and a scene change swaps objects --
+                // the first version latched only the first one and lost the trail after 7.5 s in round 2. So a different
+                // validated candidate simply takes over (and gets registered); each switch logs one line (capped).
+                if (ok) {
+                    if (t->tg_this != g) {
+                        if (t->tg_this && t->tg_rej < 8) {
+                            t->tg_rej++;
+                            LOG("%#x 任务图换地址：%#llx → %#llx（判据 %s）", t->handle,
+                                (unsigned long long)t->tg_this, (unsigned long long)g, why);
+                        }
+                        t->tg_this = g;
+                    }
+                    tg_watch(g, why);
+                    // 包装器尾部那次调用认出来的帧 = 派发器 ⇒ "这个线程进过这张图的作业"
+                    if (!strcmp(why, "包装器尾") && t->jb_this != g) {
+                        t->jb_this = g; t->jb_idx = *(volatile uint64_t *)(fp - 0x18); t->jb_frame = i;
+                    }
+                } else if (t->tg_rej < 3) {
+                    t->tg_rej++;
+                    LOG("%#x 帧判据命中（%s main+%#llx）但 [x29-8] = %#llx 不是任务图（任务数 1..64、位图不许越位）：图地址这条要重核",
+                        t->handle, why, (unsigned long long)off, (unsigned long long)g);
+                }
             }
         }
         if (m && !strcmp(m->name, "main")) t->bt_off[t->bt_n++] = (uint64_t)ret - (uint64_t)m->base;
@@ -540,6 +748,7 @@ static void bt_sample(thr_t *t, uint64_t fp) {
 
 void svc_thread_dump(void) {
     static const char *kinds[] = {"运行/未在等", "锁", "条件变量", "地址", "同步对象"};
+    tg_series_summary();   // 任务图三张位图的整个运行期读数（M3-2t）：判"上膛 0 位"还是"完成后被清"就看它 | the whole-run reading of the task graph's three bitmaps (M3-2t): this is what separates "loaded zero bits" from "completed then cleared"
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] 句柄表占用 %d / %d，累计建线程 %llu\n", nh, MAX_H, g_next_id - 0x51);
     { uint64_t yn, yns; dm_main_yield_stats(&yn, &yns);   // 主线程「纯轮询 + 让出」的规模：停住时它是紧循环，还是偶尔让一次 | scale of the main thread's "pure polling + yield": a tight loop, or an occasional yield, when it stalls
@@ -613,8 +822,8 @@ void svc_thread_dump(void) {
         if (t->tg_this) {   // 任务图对象的完成位图与本次等待的掩码位：卡在哪一位、位图现在是什么，直接从内存读出来
                             // The task-graph object's completion bitmap and this waiter's mask bit: which bit it is stuck
                             // on and what the bitmap holds right now, read straight out of memory
-            uint64_t bm = 0, mask = 0; int ok1 = peek64(t->tg_this + 0x3328, &bm), ok2 = peek64(t->tg_this + 0x3100, &mask);
-            fprintf(stderr, "[dm]   %#x 任务图 %#llx：完成位图 %s%#llx、等待掩码 %s%#llx\n", t->handle, (unsigned long long)t->tg_this,
+            uint64_t bm = 0, mask = 0; int ok1 = peek64(t->tg_this + 0x3328, &bm), ok2 = peek64(t->tg_this + 0x3100, &mask);   // mask 这里读到的就是任务数（22），M3-2s 记的"等待掩码"是错名 | mask here is the task count (22); the "wait mask" wording of M3-2s was a misnomer
+            fprintf(stderr, "[dm]   %#x 任务图 %#llx：完成位图 %s%#llx、任务数 %s%#llx\n", t->handle, (unsigned long long)t->tg_this,
                     ok1 ? "" : "(读不到) ", (unsigned long long)bm, ok2 ? "" : "(读不到) ", (unsigned long long)mask);
             // 另外两张位图与每条任务的依赖掩码：「22 位一个都没置上」是"没派发"还是"派了没完成"，这一行分开。
             // 反汇编依据（main.patched.bin）：派发器 main+0x15ee598 要求位图 +0x3324 的位，并查记录的 +0x18（对已完成 +0x3328）
@@ -626,7 +835,7 @@ void svc_thread_dump(void) {
             uint32_t done32 = 0, pend32 = 0, ready32 = 0, ndep = 0, npend = 0;
             peek32(t->tg_this + 0x3328, &done32); peek32(t->tg_this + 0x3324, &pend32);
             peek32(t->tg_this + 0x3320, &ready32);
-            peek32(t->tg_this + 0x3470, &ndep); peek32(t->tg_this + 0x3488, &npend);   // 两个"在飞作业"表的长度 | lengths of the two in-flight job lists
+            peek32(t->tg_this + 0x3470, &ndep); peek32(t->tg_this + 0x3488, &npend);   // 两个"在飞作业"表的长度（+0x3470 那个的表头在 +0x3468：包装器尾会扫描它并把本作业摘掉 —— M3-2t 反汇编）| lengths of the two in-flight job lists (the one at +0x3470 has its header at +0x3468: the wrapper's tail scans it and removes its own job -- M3-2t disassembly)
             fprintf(stderr, "[dm]   %#x 位图三张：已完成 %#x、待派发 %#x、依赖源 %#x（在飞作业表 %u / %u）\n",
                     t->handle, done32, pend32, ready32, ndep, npend);
             if (mask > 0 && mask <= 32) {   // 每条任务：依赖 A / 依赖 B / 标志（+0x18/+0x1c/+0x58）| per task: dep A / dep B / flags
@@ -639,13 +848,18 @@ void svc_thread_dump(void) {
                 fprintf(stderr, "[dm]   %#x 任务记录（序号:依赖A/依赖B/标志）: %s\n", t->handle, db);
             }
         }
-        if (t->jb_this) {   // 这个线程正跑在某张任务图的某个任务里（包装器帧）：哪张图、哪个序号、那张图的位图是什么
-                            // This thread is running a task of some graph (the wrapper frame): which graph, which index,
-                            // and what that graph's bitmaps hold
+        if (t->jb_this) {   // 这个线程进过某张任务图的作业（判据：包装器尾调进来的派发器帧）：哪张图、派发器下标、那张图的位图是什么
+                            // This thread has been inside a job of some graph (criterion: the dispatcher frame called from
+                            // the wrapper's tail): which graph, the dispatcher's loop index, and what that graph's bitmaps hold
             uint32_t b11 = 0, b12 = 0, b13 = 0, b1c = 0, b1d = 0;
             peek32(t->jb_this + 0x3328, &b11); peek32(t->jb_this + 0x3324, &b12); peek32(t->jb_this + 0x3320, &b13);
             peek32(t->jb_this + 0x3100, &b1c); peek32(t->jb_this + 0x3470, &b1d);
-            fprintf(stderr, "[dm]   %#x 正在跑作业：任务图 %#llx、任务序号 %llu（帧 %d）%s；该图：任务数 %u、已完成 %#x、待派发 %#x、依赖源 %#x、在飞作业表 %u\n",
+            // 口径更正（M3-2t，反汇编）：包装器尾 0x15f0e78 那句 `bl 0x15ee598` 的返回地址是 0x15f0e7c，所以这条判据
+            // 认出的帧其实是**派发器**的帧，[x29-0x18] 是派发器的循环下标（x21），不是任务序号 —— M3-2s 记的"任务序号"要改口径。
+            // Wording fix (M3-2t, from the disassembly): the return address of the wrapper tail's `bl 0x15ee598` is
+            // 0x15f0e7c, so the frame this criterion finds is the **dispatcher's**, and [x29-0x18] is its loop index
+            // (x21), not a task index -- the "task index" wording of M3-2s is corrected here.
+            fprintf(stderr, "[dm]   %#x 正在跑作业：任务图 %#llx、派发器下标 %llu（帧 %d）%s；该图：任务数 %u、已完成 %#x、待派发 %#x、依赖源 %#x、在飞表(+0x3470) %u\n",
                     t->handle, (unsigned long long)t->jb_this, (unsigned long long)t->jb_idx, t->jb_frame,
                     t->jb_this == t->tg_this ? "（与本线程所等的图是同一个）" : "（**不是**本线程所等的图）",
                     b1c, b11, b12, b13, b1d);
@@ -725,7 +939,13 @@ int svc_thread(int num, uint64_t *regs) {
         // 客体调用链：regs[29] 是客体 svc 点的 x29（regs[30] 是门块地址，不是客体的），沿它读 [x29+8] 得返回地址
         // Guest call chain: regs[29] is the guest's x29 at the svc point (regs[30] is the gate block's, not the guest's);
         // reading [x29+8] along it gives the return address
-        if (me->stack_high) bt_sample(me, regs[29]); } }
+        if (me->stack_high) bt_sample(me, regs[29]);
+        // 任务图时间序列的另一路（高分辨率那一路）：SVC 是"线程刚要进内核"的时刻，派发器真在跑时它每几微秒就打一次
+        // 锁 / 解锁，所以这条比 500 微秒的采样线程密得多 —— 上膛与派发之间那段窗口只有它有机会看见。
+        // The high-resolution half of the time-series instrument: an SVC is "this thread is entering the kernel now",
+        // and while the dispatcher runs it locks / unlocks every few microseconds, so this path is far denser than the
+        // 500 us sampler -- it is the only one with a chance of seeing the window between the load and the dispatch.
+        if (me->tg_this || me->jb_this) tg_tick("svc", me->handle); } }
     if (g_flag.thr && num != 0x0B) { thr_t *me = pthread_getspecific(g_keythr); LOG("[%#x] svc %#x x0=%#llx x1=%#llx x2=%#llx x3=%#llx", me ? me->handle : 0, num, regs[0], regs[1], regs[2], regs[3]); }
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
