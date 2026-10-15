@@ -551,17 +551,34 @@ static _Atomic unsigned g_sample_skip;   // 因"不在用户态"而跳过采样�
 // Why read `/proc/self/maps` instead of `dl_iterate_phdr`: `<link.h>`'s `Elf64_Sym` / `Elf64_Dyn` / `Elf64_Rela` typedefs
 // are **the same names** as dm.h's and collide on include (measured: typedef redefinition, the build stops). maps is the
 // same information as ready-made text, and one read per dump is enough (this is never on a hot path).
-static struct { uint64_t lo, hi; } g_execseg[64];
+// M3-2w 修正：原来只有 **64** 个槽，而这台机（真机实测）进程里有 **455 个可执行段** —— 表一满就丢掉后面的，
+// 于是**丢掉的是谁**决定了你会看到什么：libdm.so 排第 **24** 个（留下了，所以 libdm 帧看得见），
+// 而 **libc.so 排第 403、libvulkan.so 第 404** —— 两个都没了。后果是致命的**假阴性**：
+// 主线程明明 `pc=nanosleep+0xc lr=usleep+0x54`（在 usleep 里），栈扫描里却"一个 libc 地址都没有"，
+// 于是「M3-2w」据此写下"它不在 usleep、而在睡一下看一眼之间来回"—— 那句话是**仪器的假阴性**，不是读数。
+// 现在：槽数按真机量级放宽（1024），并且**表满时明说**（不许再无声地说谎）。
+// M3-2w correction: the table had only **64** slots while this device's process really has **455** executable
+// segments, so whatever came later was dropped -- and *which* one is dropped decides what you see: libdm.so is
+// number **24** (kept, so libdm frames show) while **libc.so is number 403 and libvulkan.so 404** -- both gone.
+// The consequence is a fatal **false negative**: the main thread is demonstrably in usleep (pc=nanosleep+0xc,
+// lr=usleep+0x54) yet the stack scan shows "not one libc address", and on that basis "M3-2w" wrote "it is not in
+// usleep, it alternates between sleeping a little and taking a look" -- that was the instrument lying, not a reading.
+// Now: the slot count matches the measured order of magnitude (1024) and a full table **says so** out loud.
+#define DM_EXECSEG_MAX 1024
+static struct { uint64_t lo, hi; } g_execseg[DM_EXECSEG_MAX];
 static int g_nexec;
+static int g_nexec_dropped;   // 表满后还有多少个可执行段没记上 | how many executable segments did not fit
 static void maps_load_exec(void) {
-    g_nexec = 0;
+    g_nexec = 0; g_nexec_dropped = 0;
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) return;
     char line[512];
-    while (fgets(line, sizeof line, f) && g_nexec < 64) {
+    while (fgets(line, sizeof line, f)) {
         unsigned long long lo = 0, hi = 0; char perm[8] = "";
         if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perm) != 3) continue;
-        if (perm[2] == 'x') { g_execseg[g_nexec].lo = lo; g_execseg[g_nexec].hi = hi; g_nexec++; }
+        if (perm[2] != 'x') continue;
+        if (g_nexec >= DM_EXECSEG_MAX) { g_nexec_dropped++; continue; }
+        g_execseg[g_nexec].lo = lo; g_execseg[g_nexec].hi = hi; g_nexec++;
     }
     fclose(f);
 }
@@ -580,7 +597,12 @@ static void dump_stack_words(const char *who, const uint64_t *w, int n) {
         if (!v || !addr_is_exec(v)) continue;
         off("", v); shown++;
     }
-    fprintf(stderr, "（%d 个）\n", shown);
+    // 表满时必须说出来：当初 64 个槽把 libc / libvulkan 丢掉，读出的是"没有任何 libc 帧"这种**假阴性**，
+    // 而它看起来与"真的没有"一模一样（这正是「M3-2w」那句结论的来历）。
+    // A full table must say so: 64 slots once dropped libc / libvulkan, yielding the **false negative** "not one
+    // libc frame", which looks exactly like the real thing (that is where the "M3-2w" conclusion came from).
+    fprintf(stderr, "（%d 个）；可执行段 %d 个%s\n", shown, g_nexec,
+            g_nexec_dropped ? "，【黄】表满、还有段没记上（读数不完整）" : "");
 }
 
 // ---------- M3-2w：栈扫描（从 sp 起找返回地址）----------
