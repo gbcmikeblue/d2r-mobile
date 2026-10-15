@@ -660,9 +660,14 @@ merged, the blocker-independent items from section nine are moved in, and this r
 1. **Milestone B: the guest stall** (**first -- the main blocker**). This device normally stalls a dozen seconds in at
    `CharacterCreate:Hover:Barbarian` (occasionally `MainMenuHD:CheckUpdateLinks`). **The judgement has to be read from
    "what is it doing across several samples", never against the occasional outlier run**: the one-shot stall sampler and
-   the wait-point dump are both in place ("M3-2g"), so sample `/proc` over several rounds to classify it. It covers the
-   most ground: the picture is not found before the stall, and both "finding the picture" and "the device loss" are
-   suppressed by it -- so "why does it stop here" comes first.
+   the wait-point dump are both in place (their content is in "M3 step 3" -- the old label "M3-2g" is a dangling one).
+   **The shape has been measured (2026-10-15, "M3-2r")**: the main thread polls a **task-completion bitmap** at
+   `main+0x15ee…` and that bitmap is **always 0** (it waits for the low 22 bits to be set) => **not one of the task
+   graph's 22 tasks ever completes**; at the same moment worker thread `0x1005` finishes a Granny decode and then goes to
+   **wait on a lock held by the main thread** (waiting 15 s, and that lock **was never handed off by the kernel**). So the
+   next question is "**why are the tasks never dispatched/set**", not "what is wrong with the locks" (two lock-semantics
+   changes were both ruled out by measurement, part four of "M3-2r"). It covers the most ground: the picture is not found
+   before the stall, and both "finding the picture" and "the device loss" are suppressed by it.
 2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- about once per
    run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a hundred-plus `贴图上传失败` lines.
    Uploads **are already** off the shared command buffer ("M3-2o") and it did not go away, so the cause lies elsewhere: the
@@ -1510,6 +1515,115 @@ behaviour is exactly as before); the probe keeps the switches above for a one-co
   means "stalled for 15 s -> declared dead -> dump -> `_exit`". That is why the process vanished during this round's A/B
   (not a crash, not MIUI). To turn the watchdog off entirely, leave the line out (`if (watch || stall)` is what starts it);
   to observe a longer run, give it a large value.
+
+### M3-2r: the shape of milestone B is measured -- the main thread waits on a task graph that was **never dispatched** (2026-10-15, device)
+
+Item 1 of "next steps" (the guest stall) moved this round from "classify by sampling" to "a shape with concrete readings".
+Four things below: **how to read the samples**, **which instruments were added**, **what was measured** and **which
+hypotheses measurement killed**; a note on the disassembly route closes it out (this machine has no Python).
+
+**1. How to read the samples (two easy misreadings)**:
+
+- **The watchdog's "stuck at tick 0" is normal**, not a defect: `cur_tick()` (`diag.c:1316`) only reads `G+0x170`
+  **inside a run**, and the stall happens at the **character-select screen** (not in a run), so a constant 0 is by design.
+  What actually declares death is the **presented-frame** progress of the pregame phase (`crash_watch_frame`) => "declared
+  dead" means **presenting stopped for 15 seconds**.
+- **Two stopping points showed up this round**: most runs stop at **49-59** presents and a few reach **377-381** (about
+  3/8). The latter are the "occasional outlier" runs of "M3-2l"; the judgement still reads "what is it doing across
+  samples".
+
+**2. New instruments** (all in `dm/host/hle_thread.c`, no behaviour change by default):
+
+| Instrument | What it gives |
+|---|---|
+| `SleepThread` duration and time | recorded per thread and printed in the state dump; a line is logged at 200 ms and up. **Measured: no long sleeps** (each thread's last one was 1-50 ms), which kills the earlier "the main thread is sleeping" guess |
+| **SVC ring** | the last 16 SVCs per thread (`number + x0/x1/x2 + LR`). This is what exposed the mutual wait |
+| **x29 call chain** | walking `regs[29]`, keeping the return addresses that land in `main` (up to 10 layers) -- **the first time Android can read "which game function"** |
+| "waiting X s" per wait | to tell "way too long" (`0x1005` measured at **15.1 s**) |
+| Lock handoff history | the last 16 `ArbitrateUnlock`s (`address -> waiter`), used to recognise a stale lock word |
+| **Task-graph completion bitmap** | the task-graph object comes from `[x29-8]` (see below); `+0x3328` (bitmap) and `+0x3100` (this waiter's mask) are read straight out |
+
+Two disassembly facts that matter (`main.patched.bin`; this machine uses the NDK's `llvm-objcopy`/`llvm-objdump`, part 5):
+- **`regs[30]` is not the guest's LR**: it is the gate block's return address (so `lr=sdk+0xe6d09c` in the SVC ring only
+  says "which gate"). The guest's real return address is at **`[x29+8]`** (`patch_nso.py:429` relies on exactly that; the
+  gate block deliberately preserves the x29 chain).
+- The prologue of the function at `main+0x15ee898` is `stp x20,x19,[sp,#0x40]` plus `add x29,sp,#0x50`, so **`x19` (the
+  task-graph object) is `[x29-8]`**.
+
+**3. What was measured** (from `main+0x15ee8b4`: disassembly plus device readings):
+
+```asm
+w8 = [x0+0x3328]        ; task-completion bitmap (ldar)
+x9 = [x0+0x3100]        ; this waiter's mask (=22)
+w9 = ~(-1 << x9)        ; low 22 bits all set
+cmp w8, w9 ; b.eq skip the wait
+bl  0xdf9794            ; when it is not done, call it (those SleepThread(-1)s)
+ldar w8, [x25] ; cmp ; b.ne  (loop)   ; **the polling loop**
+```
+
+Two runs on the device agree (the line is the Chinese log line, quoted verbatim):
+
+```
+[dm] 0x1001 任务图 0x7bf5752d40：完成位图 0、等待掩码 0x16     <- task graph <ptr>: completion bitmap 0, wait mask 0x16
+[dm] 0x1001 任务图 0x7bfc214d40：完成位图 0、等待掩码 0x16
+```
+
+=> **the bitmap is always 0**: none of the 22 tasks ever completes.
+
+The other threads at that moment (identical across three runs):
+
+| Thread | State | What it is doing |
+|---|---|---|
+| `0x1001` main | running in user mode; all 16 SVCs in the ring are **`SleepThread(-1)`** | polling that bitmap |
+| `0x1005` (prio 28) | the last 15 are `0x83/0x84` (**Granny segment-decode host gates**) plus a final `1a(x0=0x1001 …)` | after decoding, **waiting on a lock the main thread holds** (`waiting 15.1 s`) |
+| `0x1004` (prio 28) | `1c(condition variable)` x16 | waiting on a condition variable (paired with the main thread's `1d`/`1b`, normal) |
+| the rest (FMOD / network / AIO / libcurl / bs Resolver) | identical across three runs | ordinary waits |
+
+**Current classification**: the **main cause** is that "**none of the task graph's 22 tasks is ever dispatched or ever
+set**", which is why the main thread waits forever; "worker `0x1005` waits on a lock the main thread holds" is a **side
+effect** (the main thread holds that lock while waiting on the bitmap). Note that although `0x1005` keeps running
+`0x83/0x84`, **not one bit of the bitmap is set** => what it executes is **not** a task of this task graph.
+
+Two supporting readings: **that lock never appears in any handoff** (the history holds only active co-operative locks such
+as `0x7c110e0bb8`), so "the lock word was mis-written by `lock_handoff`" is ruled out; and **our graphics side is idle**
+(wait points: 0/8 slots in flight, no pass open, the queue lock held by nobody), so the missing presents are a result, not a
+cause.
+
+**4. Two hypotheses measurement killed (so nobody walks them again)**:
+
+- **Not the Granny pre-decode**: `DM_GRANNY_PRE=0` (pre-decode off, real decode) ran 3 rounds and **still declared dead
+  every time**.
+- **Not the lock semantics** (`DM_LOCK_SEM`, default 0; both directions tried, both **worse**):
+  - `bit0` (`ArbitrateUnlock` switched to Horizon's "clear the word, wake one") => all 3 rounds ended early in startup with
+    `Break#1 reason=0` (a guest `svcBreak`, i.e. panic) and **0 presents**;
+  - `bit1` (loosening `0x1A`'s wait test from "word == expected | waiters bit" to "owner == expected") => all 3 rounds were
+    declared dead in the `启动` (startup) stage with **0 presents**.
+
+  => the current lock implementation ("hand-off" style plus the waiters-bit requirement) is **self-consistent** with the SDK
+  and **the locks are not the root cause**. The switch stays in the code, off by default, for a re-check elsewhere.
+
+**5. The disassembly route (worth recording: this machine has no Python)**:
+
+```
+llvm-objcopy -I binary -O elf64-littleaarch64 \
+  --rename-section .data=.text,alloc,load,readonly,code \
+  .work/build/cache/dm/out/3.3.94012-r41-keypage/main.patched.bin .work/recon/main_elf/main.elf
+llvm-objdump -d --start-address=0x15ee860 --stop-address=0x15eea10 .work/recon/main_elf/main.elf
+```
+
+Both binaries come from the NDK (`...\ndk\30.0.16248370\toolchains\llvm\prebuilt\windows-x86_64\bin\`); **the file offset
+in `main.patched.bin` is exactly `main+0x`**; output lands in `.work/recon/` (gitignored). `dm/tools/sdis.py` in the
+repository is stronger (`--fn` / `--sym` / `--xref`) but needs capstone/Python, which this machine lacks.
+
+**6. Next (in this order)**:
+
+1. **Find who writes `this+0x3328`**: disassemble `main.patched.bin` wholesale and look for the `str/stlr` writing `#0x3328`
+   -- that is the "task completed / set the bit" code, and it answers "why is not one of the 22 bits set";
+2. Compare against the **task submission point** (`main+0x147f154`, the job-object submit) and the **job pool's
+   "help while waiting" loop** (`main+0x14f08d8`) to see who submits those 22 tasks and what blocks them;
+3. Along the way (item 2 of "next steps", the device loss): **3/8 rounds this round showed "our one-shot submit holding the
+   queue lock"** rather than a guest stall -- the same source as the sporadic `VK_ERROR_DEVICE_LOST` in part six of
+   "M3-2l"; the way to measure it is unchanged.
 
 ---
 

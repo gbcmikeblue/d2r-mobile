@@ -198,15 +198,23 @@ Three old rules:
 - **One normal thing**: this device **stalls at 55-60 presents** (stage `CharacterCreate:Hover:Barbarian`, occasionally
   `MainMenuHD:CheckUpdateLinks`). That is a known scene, not a crash, and the judgement has to be read from "what it is
   doing across several runs".
+- **The shape of milestone B has been measured (2026-10-15, "M3-2r")**: the main thread polls a **task-completion bitmap**
+  at `main+0x15ee…` and that bitmap is **always 0** (it waits for the low 22 bits to be set) => **not one of the task
+  graph's 22 tasks ever completes**; at the same moment worker thread `0x1005` finishes a Granny decode and then **waits on
+  a lock held by the main thread** (waiting 15 s, and that lock **was never handed off by the kernel**). So the next
+  question is "**why are the tasks never dispatched**", not "what is wrong with the locks" (two lock-semantics changes were
+  both ruled out by measurement).
 - **One sporadic thing**: about once per run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a
   hundred-plus `贴图上传失败` lines. **Unrelated to command-buffer sharing** (ruled out; "M3-2o").
 
 ### Next steps (detail in "7. Next step" of ANDROID_PLAN)
 
-1. **Milestone B: the guest stall** (**first -- the main blocker**) -- classify it by sampling `/proc` over several
-   rounds (the one-shot stall sampler and the wait-point dump are both in place, "M3-2g"); the judgement reads "what is it
-   doing across several samples", never against the occasional outlier run. It covers the most ground: the picture is not
-   found before the stall.
+1. **Milestone B: the guest stall** (**first -- the main blocker**) -- **the shape has been measured (2026-10-15, "M3-2r")**:
+   the main thread polls a task-completion bitmap at `main+0x15ee…` and that bitmap is **always 0** (22 tasks, none done) =>
+   the next question is "**why are the tasks never dispatched/set**" (method: disassemble and find whoever writes
+   `this+0x3328`). How to read the samples, the new instruments, and the two lock hypotheses that measurement killed are all
+   in "M3-2r"; the one-shot stall sampler and the wait-point dump live in "M3 step 3" (the old label "M3-2g" is dangling).
+   It covers the most ground: the picture is not found before the stall.
 2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- the next
    candidate is "**who loses it first**". What to measure: what else was on the queue at that moment, whether the device
    had already been lost on the guest's side, and the `vkQueueSubmit` return value with its context.

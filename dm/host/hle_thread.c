@@ -61,6 +61,22 @@ typedef struct thr {
     struct thr *next;          // 等待链 | Wait chain
     struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr;
+    // 最近一次 SleepThread 的时长与时刻（停住时的现场导出要它：「主线程睡多久」是判据的一半）
+    // Duration and time of the most recent SleepThread (the state dump needs it when the guest stalls: "how long does
+    // the main thread sleep" is half of the judgement)
+    int64_t sleep_ns; uint64_t sleep_at_ns;
+    // 最近 16 次 SVC 的轨迹（号 + x0/x1/x2 + LR）：停住时「主线程在哪个地址上反复 lock / unlock / 让出」直接可读
+    // Trace of the last 16 SVCs (number + x0/x1/x2 + LR): when it stalls, "which address the main thread keeps
+    // locking / unlocking / yielding on" is directly readable
+    uint32_t ring_i; uint32_t ring_num[16]; uint64_t ring_x0[16], ring_x1[16], ring_x2[16], ring_lr[16];
+    // 客体栈范围 +「落在 main 模块的调用链」：停住时给出"游戏在哪个函数里"（沿 x29 链走，见 bt_sample）。
+    // 安卓此前只有 /proc 三样，读不到函数级位置；x29 链是客体自带的（改写器的门块刻意保留了它）
+    // Guest stack range + the call-chain entries landing in the main module: which game function it sits in when it
+    // stalls (walked along the x29 chain, see bt_sample). Android only had the three /proc items before, with no
+    // function-level position; the x29 chain is the guest's own (the rewriter's gate block deliberately preserves it)
+    uint64_t stack_low, stack_high; uint64_t bt_off[10]; int bt_n; uint64_t bt_at;
+    uint64_t wait_at_ns;      // 进入当前等待的时刻（转储里打「已等 X 秒」：判「等太久」用它）| when the current wait began (the dump prints "waiting X s": how to tell "way too long")
+    uint64_t tg_this;         // 主线程等在"任务图完成位图"里时，该位图所属的对象（取自 [x29-8] = 函数序言保存的 x19）| when the main thread waits on the task-graph completion bitmap, the object owning it (taken from [x29-8] = the x19 saved by that function's prologue)
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
     mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
@@ -127,6 +143,7 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {   // 启动时间线：�
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
+    t->wait_at_ns = now_ns();      // 转储里打「已等 X 秒」| the dump prints "waiting X s"
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
@@ -152,12 +169,34 @@ static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, 
 static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a, v, __ATOMIC_SEQ_CST); }
 static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic_compare_exchange_n((uint32_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 
+// 锁语义开关（诊断，默认 0 = 改动前的行为）：见 docs/ANDROID_PLAN 的「M3-2r」
+//   bit0：ArbitrateUnlock 走 Horizon 的「锁字清零 + 唤醒一个」，而不是把锁字改写成等待者的 tag
+//         （SDK 在用户态已把锁字换成 0，内核只负责唤醒；改写它会让等待者"等一把锁字记着自己的锁"）
+// Lock-semantics switch (diagnostic, default 0 = the behaviour before the change): see "M3-2r" in docs/ANDROID_PLAN
+//   bit0: ArbitrateUnlock clears the lock word to zero and wakes one waiter (Horizon) instead of rewriting the lock
+//         word to the waiter's tag (the SDK has already exchanged it to 0 in user mode; rewriting it makes a waiter
+//         wait on a lock whose word names itself)
+static int lock_sem(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_LOCK_SEM"); v = e ? atoi(e) : 0; } return v; }
+
+// 移交历史（最近 16 次 ArbitrateUnlock）：判「锁字残留」用它 —— 某个地址若只被"等"、从没被移交过，
+// 却记着 owner，那这个锁字就是残留（M3-2r 的现场）
+// Handoff history (the last 16 ArbitrateUnlocks): this is what tells "a stale lock word" -- if an address is only ever
+// waited on and never handed off, yet carries an owner, that lock word is stale (the M3-2r scene)
+static struct { uint64_t addr, waiter; int more, found, pad; uint64_t at; } g_ho[16];
+static uint32_t g_ho_i;
+static void ho_note(uint64_t addr, uint64_t waiter, int more, int found) {
+    uint32_t i = g_ho_i++ & 15;
+    g_ho[i].addr = addr; g_ho[i].waiter = waiter; g_ho[i].more = more; g_ho[i].found = found; g_ho[i].at = now_ns();
+}
+
 // 释放 addr 处的锁：交给等在它上面的第一个线程，或清零（持 G）
 // Release the lock at addr: hand it to the first thread waiting on it, or clear it to zero (holding G)
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
-    if (!w) { st32(addr, 0); return; }
+    if (!w) { ho_note(addr, 0, 0, 0); st32(addr, 0); return; }
     for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
+    ho_note(addr, w->handle, more, 1);
+    if (lock_sem() & 1) { st32(addr, 0); wake(w, 0); return; }    // Horizon 语义：清零 + 唤醒一个（等待者自己 CAS 抢，抢不到它会自己重新置等待位）| Horizon: clear and wake one (the waiter CASes for it itself; if it loses it sets the waiters bit again)
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
 }
@@ -224,6 +263,12 @@ uint32_t svc_thread_main_init(void) {
 #if defined(__ANDROID__)
     t->tid = and_tid();   // 现场导出要用（见 thr_proc_dump）| Needed by the state dump (see thr_proc_dump)
 #endif
+    // 主线程的栈范围：bt_sample 只在这个范围里读 x29 链（读坏地址在安卓上会直接崩）
+    // The main thread's stack range: bt_sample reads the x29 chain only inside it (a bad read would crash on Android)
+    { pthread_attr_t a; if (!pthread_getattr_np(t->pt, &a)) {
+        void *lo = NULL; size_t sz = 0;
+        if (!pthread_attr_getstack(&a, &lo, &sz) && lo) { t->stack_low = (uint64_t)lo; t->stack_high = (uint64_t)lo + sz; }
+        pthread_attr_destroy(&a); } }
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
@@ -428,10 +473,58 @@ static void proc_thread_line(const char *tag, pid_t tid) {
 }
 #endif
 
+// 沿客体的 x29 链走一遍，记下落在 main 模块的返回地址（最多 4 个）：停住时「游戏在哪个函数里」就靠它。
+// 只在 fp 落在该线程的栈范围内时才读 —— 安卓上直接读坏地址会崩（苹果那条路用 vm_read_overwrite，不崩）。
+// 为什么要它：安卓此前只有 /proc 的状态 / 内核等待点 / 系统调用三样，读到的是"在等什么"而不是"在哪个函数"；
+// 而改写器的门块刻意保留了 x29 链（patch_nso.py 的 stp x29,x30），客体真正的返回地址就在 [x29+8]。
+// Walk the guest's x29 chain once and record the return addresses landing in the main module (up to 4): that is what
+// says "which game function it is in" when it stalls. Memory is read only while fp stays inside the thread's stack
+// range -- reading a bad address directly would crash on Android (the Apple path uses vm_read_overwrite, which does
+// not). Why it is needed: Android only had the three /proc items (state / kernel wait point / syscall), which say
+// "what it is waiting for", not "in which function"; the rewriter's gate block deliberately preserves the x29 chain
+// (the stp x29,x30 in patch_nso.py), and the guest's real return address is at [x29+8].
+// 读一个客体地址（可能是坏地址）：只在客体地址空间、8 字节对齐时才读 —— 诊断用，读崩了得不偿失
+// Read a guest address (possibly bogus): only inside the guest address space and 8-byte aligned -- diagnostic only;
+// a crash here would cost more than it pays
+static int peek64(uint64_t a, uint64_t *out) {
+    if ((a & 7) || a < 0x10000ull || a > 0x7fffffffffffull) return 0;
+    *out = *(volatile uint64_t *)a;
+    return 1;
+}
+
+static void bt_sample(thr_t *t, uint64_t fp) {
+    t->bt_n = 0; t->bt_at = now_ns();
+    for (int i = 0; i < 60 && t->bt_n < (int)(sizeof t->bt_off / sizeof *t->bt_off); i++) {
+        if (!fp || (fp & 7) || fp < t->stack_low || fp + 16 > t->stack_high) break;
+        uint64_t next = *(volatile uint64_t *)fp, ret = *(volatile uint64_t *)(fp + 8);
+        module_t *m = module_of((void *)ret);
+        // 最内层若正好落在"任务图等全部做完"那个函数里（main+0x15ee898 起），它的 x19 就是任务图对象。
+        // 反汇编依据（main.patched.bin 该函数序言）：stp x20,x19,[sp,#0x40] + add x29,sp,#0x50 ⇒ x19 = [x29-8]
+        // If the innermost frame lands exactly in the "task graph waiting for everything" function (from
+        // main+0x15ee898), its x19 is the task-graph object. From the disassembly of that function's prologue
+        // (main.patched.bin): stp x20,x19,[sp,#0x40] plus add x29,sp,#0x50 means x19 = [x29-8]
+        if (i == 0 && m && !strcmp(m->name, "main")) {
+            uint64_t off = (uint64_t)ret - (uint64_t)m->base;
+            if (off >= 0x15ee800 && off < 0x15eea40 && fp - 8 >= t->stack_low)
+                t->tg_this = *(volatile uint64_t *)(fp - 8);
+        }
+        if (m && !strcmp(m->name, "main")) t->bt_off[t->bt_n++] = (uint64_t)ret - (uint64_t)m->base;
+        if (next <= fp) break;                       // 必须向上递增，否则判为坏链 | must walk upwards, otherwise the chain is broken
+        fp = next;
+    }
+}
+
 void svc_thread_dump(void) {
     static const char *kinds[] = {"运行/未在等", "锁", "条件变量", "地址", "同步对象"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] 句柄表占用 %d / %d，累计建线程 %llu\n", nh, MAX_H, g_next_id - 0x51);
+    { uint64_t yn, yns; dm_main_yield_stats(&yn, &yns);   // 主线程「纯轮询 + 让出」的规模：停住时它是紧循环，还是偶尔让一次 | scale of the main thread's "pure polling + yield": a tight loop, or an occasional yield, when it stalls
+      fprintf(stderr, "[dm] 主线程让出（SleepThread 0/-1/-2）：%llu 次、累计 %.3f 秒\n", (unsigned long long)yn, yns / 1e9); }
+    { uint32_t n = g_ho_i < 16 ? g_ho_i : 16;   // 最近几次锁移交（判"锁字残留"）| the most recent lock handoffs (to spot a stale lock word)
+      if (n) { fprintf(stderr, "[dm] 最近 %u 次锁移交（ArbitrateUnlock）：\n", n);
+          for (uint32_t k = 0; k < n; k++) { uint32_t j = (g_ho_i - n + k) & 15;
+              fprintf(stderr, "[dm]   %#llx → 等待者 %#x%s（%.1f 秒前）\n", (unsigned long long)g_ho[j].addr, g_ho[j].waiter,
+                      g_ho[j].found ? (g_ho[j].more ? "（还有别人在等）" : "") : "（无等待者：清零）", (now_ns() - g_ho[j].at) / 1e9); } } }
     for (thr_t *t = g_all; t; t = t->all) {
         module_t *m = module_of((void *)t->last_lr);
         // 线程名：SDK ThreadType+0x1a0 是名字指针（ThreadManager::SetInitialThreadNameUnsafe 0x34a2a4）；CreateThread 的 x2 = ThreadType*
@@ -455,6 +548,36 @@ void svc_thread_dump(void) {
                 m ? m->name : "?", m ? t->last_lr - (uint64_t)m->base : t->last_lr);
         if (have_raw) { char hx[200]; int q = 0; for (int i = 0; i < 64; i += 4) q += snprintf(hx + q, sizeof hx - q, "%08x ", *(uint32_t *)(raw + i));
                         fprintf(stderr, "[dm]   %#x 所等对象 %#llx 起 64 字节: %s\n", t->handle, t->waddr & ~0xfull, hx); }
+        if (t->sleep_ns > 0)   // 最近一次 SleepThread 的时长（0/-1/-2 的让出不记）| duration of the most recent SleepThread (the 0/-1/-2 yields are not recorded)
+            fprintf(stderr, "[dm]   %#x 最近 SleepThread %lld 毫秒（%.1f 秒前）\n", t->handle,
+                    (long long)(t->sleep_ns / 1000000), (nowns - t->sleep_at_ns) / 1e9);
+        // 最近 16 次 svc 的轨迹（一行）：停住时主线程在这串里、在哪个地址上打转，一眼可见
+        // The last 16 SVCs in one line: when it stalls, which of them is the main thread and which address it spins on
+        // is visible at a glance
+        if (t->nsvc) {
+            char rb[1024]; int q = 0;
+            uint32_t from = t->ring_i > 16 ? t->ring_i - 16 : 0;
+            for (uint32_t k = from; k < t->ring_i && q < (int)sizeof rb - 64; k++) {
+                uint32_t j = k & 15;
+                q += snprintf(rb + q, sizeof rb - q, "%s%x(x0=%#llx x1=%#llx)", k > from ? " " : "",
+                              t->ring_num[j], (unsigned long long)t->ring_x0[j], (unsigned long long)t->ring_x1[j]);
+            }
+            fprintf(stderr, "[dm]   %#x svc 环: %s\n", t->handle, rb);
+        }
+        if (t->bt_n) {   // 落在 main 的调用链（最近一次 svc 时采的）| the call chain landing in main (sampled at the most recent svc)
+            char bb[400]; int q = 0;
+            for (int k = 0; k < t->bt_n; k++) q += snprintf(bb + q, sizeof bb - q, "%smain+%#llx", k ? " " : "", (unsigned long long)t->bt_off[k]);
+            fprintf(stderr, "[dm]   %#x 调用链（main）: %s（%.1f 秒前）\n", t->handle, bb, (nowns - t->bt_at) / 1e9);
+        }
+        if (t->wkind && t->wait_at_ns)   // 这次等待已经多久（"等太久"的判据）| how long this wait has been running (to tell "way too long")
+            fprintf(stderr, "[dm]   %#x 已等 %.1f 秒\n", t->handle, (nowns - t->wait_at_ns) / 1e9);
+        if (t->tg_this) {   // 任务图对象的完成位图与本次等待的掩码位：卡在哪一位、位图现在是什么，直接从内存读出来
+                            // The task-graph object's completion bitmap and this waiter's mask bit: which bit it is stuck
+                            // on and what the bitmap holds right now, read straight out of memory
+            uint64_t bm = 0, mask = 0; int ok1 = peek64(t->tg_this + 0x3328, &bm), ok2 = peek64(t->tg_this + 0x3100, &mask);
+            fprintf(stderr, "[dm]   %#x 任务图 %#llx：完成位图 %s%#llx、等待掩码 %s%#llx\n", t->handle, (unsigned long long)t->tg_this,
+                    ok1 ? "" : "(读不到) ", (unsigned long long)bm, ok2 ? "" : "(读不到) ", (unsigned long long)mask);
+        }
 #if defined(__ANDROID__)
         { char tg[24]; snprintf(tg, sizeof tg, "%#x", t->handle); proc_thread_line(tg, t->tid); }   // 安卓：/proc 三样（状态 / 内核等待点 / 系统调用与 PC）| Android: the three /proc items (state / kernel wait point / syscall and PC)
 #else
@@ -522,13 +645,23 @@ void svc_thread_dump(void) {
 }
 
 int svc_thread(int num, uint64_t *regs) {
-    { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }
+    { thr_t *me = pthread_getspecific(g_keythr); if (me) {
+        me->last_svc = num; me->last_lr = regs[30]; me->nsvc++;
+        uint32_t i = me->ring_i++ & 15;                       // 环形：每线程自己写，不加锁（只被自己读）| ring: each thread writes its own, no lock (read only by itself)
+        me->ring_num[i] = (uint32_t)num; me->ring_x0[i] = regs[0]; me->ring_x1[i] = regs[1];
+        me->ring_x2[i] = regs[2]; me->ring_lr[i] = regs[30];
+        // 客体调用链：regs[29] 是客体 svc 点的 x29（regs[30] 是门块地址，不是客体的），沿它读 [x29+8] 得返回地址
+        // Guest call chain: regs[29] is the guest's x29 at the svc point (regs[30] is the gate block's, not the guest's);
+        // reading [x29+8] along it gives the return address
+        if (me->stack_high) bt_sample(me, regs[29]); } }
     if (g_flag.thr && num != 0x0B) { thr_t *me = pthread_getspecific(g_keythr); LOG("[%#x] svc %#x x0=%#llx x1=%#llx x2=%#llx x3=%#llx", me ? me->handle : 0, num, regs[0], regs[1], regs[2], regs[3]); }
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
         thr_t *t = calloc(1, sizeof *t);
         pthread_cond_init(&t->cv, NULL);
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
+        t->stack_high = t->stack_top;                          // 客体栈顶向下 1 MiB 视为栈范围（x29 链只在这里面读）| 1 MiB below the guest stack top counts as the stack range (the x29 chain is read only inside it)
+        t->stack_low = t->stack_top > (1ull << 20) ? t->stack_top - (1ull << 20) : 0;
         t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
@@ -550,6 +683,15 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x0B: {  // SleepThread(x0 ns)；0/-1/-2 = 各类让出 | SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
         uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
+        // 把「这次睡多久、什么时候」记进线程：停住时的现场导出据此打印（主线程长睡是停住的一种形状，见「M3-2q」那轮取样）；
+        // 200 毫秒以上再额外打一行 —— 每帧的节拍远小于它，所以这行只在"真在长睡"时出现
+        // Record "how long this sleep is and when" on the thread: the state dump prints it when the guest stalls (a long
+        // main-thread sleep is one shape of the stall, see the sampling in "M3-2q"); 200 ms and up also logs a line --
+        // a per-frame beat is far below that, so this line shows up only for a genuinely long sleep
+        { thr_t *me = pthread_getspecific(g_keythr);
+          if (me) { me->sleep_ns = ns; me->sleep_at_ns = t0 ? t0 : now_ns();
+                    if (ns >= 200000000LL) LOG("SleepThread 长睡：h=%#x %llu 毫秒（lr=%#llx）", me->handle,
+                                               (unsigned long long)(ns / 1000000), (unsigned long long)me->last_lr); } }
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
@@ -578,7 +720,18 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *t = cur(); uint64_t addr = regs[1];
         pthread_mutex_lock(&G);
         int64_t r = 0;
-        if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2]; r = block(t, 1, -1); }
+        uint32_t lockv = ld32(addr);
+        // bit1（诊断）：放宽"何时阻塞" —— 不再要求锁字带等待位，只要"当前持有人正是这次调用期望的那位"就等。
+        // 真机上内核侧的判据是"锁字的持有人 tag ≠ 调用者期望的那位才返回"，我们多要求了一个等待位；
+        // 这个多出来的要求会让本该阻塞的调用提前返回（用户态继续跑），可能改变持锁顺序。见 docs/ANDROID_PLAN「M3-2r」
+        // bit1 (diagnostic): loosen "when to block" -- no longer requires the waiters bit, waiting whenever the current
+        // owner is exactly the one this call expects. The kernel's own test is "return when the lock word's owner tag is
+        // not the expected one", while ours additionally demands the waiters bit; that extra demand lets a call return
+        // early (and keep running in user mode) where the real machine would block, which can change the locking order.
+        // See "M3-2r" in docs/ANDROID_PLAN
+        int wait = (lock_sem() & 2) ? (((lockv & ~WAITERS_BIT) == (uint32_t)regs[0]) && (lockv & ~WAITERS_BIT) != 0)
+                                    : (lockv == ((uint32_t)regs[0] | WAITERS_BIT));
+        if (wait) { t->waddr = addr; t->wtag = (uint32_t)regs[2]; r = block(t, 1, -1); }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
