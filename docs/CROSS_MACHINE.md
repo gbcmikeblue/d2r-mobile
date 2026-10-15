@@ -204,17 +204,29 @@ Three old rules:
   a lock held by the main thread** (waiting 15 s, and that lock **was never handed off by the kernel**). So the next
   question is "**why are the tasks never dispatched**", not "what is wrong with the locks" (two lock-semantics changes were
   both ruled out by measurement).
+- **The same evening, "M3-2s" walked this machinery through (and the wording has to follow)**: that object carries **three**
+  32-bit bitmaps (`+0x3320` dep source / `+0x3324` to-dispatch / `+0x3328` completed); the setter is **one place only**, the
+  tail of the task wrapper (`main+0x15f0e6c`); the arming site is `main+0x1636f50` (writes the low `count` bits, then clears
+  the completion bitmap, then calls the dispatcher `0x15ee598`, then the poll `0x15ee898`). On the device all three bitmaps
+  read **0** while the main thread's stack carries a **live** wrapper frame (it is running one of this graph's tasks), so
+  "**the 22 tasks were never dispatched**" **does not hold**; `0x1005` really is inside one of this graph's tasks and waits
+  on a lock word of `0x40001001` (owner `0x1001` = the main thread). **Next: a time series of the three bitmaps**, to
+  separate "armed 0 bits" from "completed and then cleared" (`+0x3328` has another clearer, `main+0x15eef90`, the tail of the
+  other graph runner). Details and readings in "M3-2s".
 - **One sporadic thing**: about once per run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a
   hundred-plus `贴图上传失败` lines. **Unrelated to command-buffer sharing** (ruled out; "M3-2o").
 
 ### Next steps (detail in "7. Next step" of ANDROID_PLAN)
 
 1. **Milestone B: the guest stall** (**first -- the main blocker**) -- **the shape has been measured (2026-10-15, "M3-2r")**:
-   the main thread polls a task-completion bitmap at `main+0x15ee…` and that bitmap is **always 0** (22 tasks, none done) =>
-   the next question is "**why are the tasks never dispatched/set**" (method: disassemble and find whoever writes
-   `this+0x3328`). How to read the samples, the new instruments, and the two lock hypotheses that measurement killed are all
-   in "M3-2r"; the one-shot stall sampler and the wait-point dump live in "M3 step 3" (the old label "M3-2g" is dangling).
-   It covers the most ground: the picture is not found before the stall.
+   the main thread polls a task-completion bitmap at `main+0x15ee…` and that bitmap is **always 0** (22 tasks, none done).
+   **Later the same day "M3-2s" finished this route**: the three bitmaps, the arming site (`main+0x1636f50`) and the single
+   setter (the wrapper's tail, `main+0x15f0e6c`) are all located, and the device readings plus one contradiction (all
+   bitmaps 0 versus a live wrapper frame on the main thread's stack) are written up. **Next: a time series of the three
+   bitmaps** (sample on every main-thread SVC, log on change), to separate "armed 0 bits" from "completed and then cleared".
+   How to read the samples, the new instruments, and the two lock hypotheses that measurement killed are all in "M3-2r",
+   with this round's instruments and next steps in "M3-2s"; the one-shot stall sampler and the wait-point dump live in
+   "M3 step 3" (the old label "M3-2g" is dangling). It covers the most ground: the picture is not found before the stall.
 2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- the next
    candidate is "**who loses it first**". What to measure: what else was on the queue at that moment, whether the device
    had already been lost on the guest's side, and the `vkQueueSubmit` return value with its context.
@@ -310,3 +322,9 @@ dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
   confirmation is cancelled or the permission is off), and `install_apk.cmd` uses exactly that. Installing from the device
   side works at once: `adb push .work\apk-build\dm.apk /data/local/tmp/dm.apk` then
   `adb shell pm install -r /data/local/tmp/dm.apk`.
+- **This machine's cmd runs with codepage 936 (GBK) while the repo's `.cmd` files are UTF-8 without BOM**, so running
+  `build_apk.cmd` directly gets shredded by its own Chinese comments: a pile of `'xxx' is not recognized` plus
+  `… was unexpected at this time`, and no artifact is produced (that is how the first build of "M3-2s" failed).
+  Run `chcp 65001` first and then `call` it (`.work\build_u8.cmd` is that two-line wrapper; **the scripts themselves need
+  no change** -- this is a property of the local console). How to tell: on failure `build.err` holds half a Chinese
+  comment; on success the `== 1/5 … ==` line looks like mojibake in the log but `BUILD_RC=0` and the APK appears.

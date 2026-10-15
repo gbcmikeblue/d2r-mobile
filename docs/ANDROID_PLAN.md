@@ -666,7 +666,13 @@ merged, the blocker-independent items from section nine are moved in, and this r
    graph's 22 tasks ever completes**; at the same moment worker thread `0x1005` finishes a Granny decode and then goes to
    **wait on a lock held by the main thread** (waiting 15 s, and that lock **was never handed off by the kernel**). So the
    next question is "**why are the tasks never dispatched/set**", not "what is wrong with the locks" (two lock-semantics
-   changes were both ruled out by measurement, part four of "M3-2r"). It covers the most ground: the picture is not found
+   changes were both ruled out by measurement, part four of "M3-2r"). **Later the same day, "M3-2s" walked this machinery
+   through**: three 32-bit bitmaps (`+0x3320` dep source / `+0x3324` to-dispatch / `+0x3328` completed), the arming site
+   `main+0x1636f50`, and the single setter (the wrapper's tail, `main+0x15f0e6c`) are all located, and the device reads all
+   three bitmaps as 0 while the main thread's stack holds a **live** wrapper frame -- so **"never dispatched" does not
+   hold**. **Next: turn the three bitmaps into a time series** (sample on every main-thread SVC, log on change) to
+   separate "armed 0 bits" from "completed and then cleared" (`+0x3328` has another clearer at `main+0x15eef90`, the tail of
+   the other graph runner). Instruments and readings in "M3-2s". It covers the most ground: the picture is not found
    before the stall, and both "finding the picture" and "the device loss" are suppressed by it.
 2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- about once per
    run, `【红】一次性提交等待失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a hundred-plus `贴图上传失败` lines.
@@ -1584,6 +1590,15 @@ set**", which is why the main thread waits forever; "worker `0x1005` waits on a 
 effect** (the main thread holds that lock while waiting on the bitmap). Note that although `0x1005` keeps running
 `0x83/0x84`, **not one bit of the bitmap is set** => what it executes is **not** a task of this task graph.
 
+> **Correction by "M3-2s" (later the same day; disassembly plus new instruments)**: the phrase "never dispatched" above is
+> **not accurate**. Once the arming site (`main+0x1636f50`, writing the low `count` bits into `+0x3324`) and the setter
+> (**only** the task wrapper's tail, `main+0x15f0e6c`) were located, the device shows all three bitmaps **0 at the same
+> time** (completed `+0x3328` / to-dispatch `+0x3324` / dep source `+0x3320`) while the main thread's own stack carries a
+> **live** wrapper frame (it is running one of this graph's tasks) -- "never dispatched" and "running right now" cannot both
+> be true. Also, `0x1005` really is inside a task of **this** graph (the graph read out of the wrapper frame equals the one
+> the main thread waits on), and the lock it waits for has the word `0x40001001` (owner `0x1001` = the main thread). The
+> wording and what comes next are in "M3-2s".
+
 Two supporting readings: **that lock never appears in any handoff** (the history holds only active co-operative locks such
 as `0x7c110e0bb8`), so "the lock word was mis-written by `lock_handoff`" is ruled out; and **our graphics side is idle**
 (wait points: 0/8 slots in flight, no pass open, the queue lock held by nobody), so the missing presents are a result, not a
@@ -1624,6 +1639,120 @@ repository is stronger (`--fn` / `--sym` / `--xref`) but needs capstone/Python, 
 3. Along the way (item 2 of "next steps", the device loss): **3/8 rounds this round showed "our one-shot submit holding the
    queue lock"** rather than a guest stall -- the same source as the sporadic `VK_ERROR_DEVICE_LOST` in part six of
    "M3-2l"; the way to measure it is unchanged.
+
+---
+
+### M3-2s: "who writes `this+0x3328`" now has an answer -- three bitmaps, the arming site, and one thing that does **not** add up (2026-10-15, device)
+
+Both steps left by part six of "M3-2r" (search for the setter, then compare with the submit point and the pool loop) are done.
+The result is bigger than expected, and it leaves one contradiction that only a time series can settle. Five parts: the
+bitmaps and the code, the arming site, the device readings, where the contradiction is, and the new instruments plus what
+comes next.
+
+**1. That object carries three 32-bit bitmaps, not one** (task records are `rec[i] = this + i*0x188`; `this+0x3100` is the
+task count; 22 tasks, so only the low 22 bits matter):
+
+| Offset | Who writes it | Who reads it | Meaning |
+|---|---|---|---|
+| `+0x3320` | **Submitters**: `ldxr/orr/stlxr` of `1 << entry->index` at `entry->graph + 0x3320` (seven copies of the same idiom: `main+0x14e9758`, `0x14fe97c`, `0x1666a68`, ...) | the dispatcher's second dependency source | "something became ready" (the source of dependency B) |
+| `+0x3324` | **The arming site** `main+0x1636f50` writes all low `count` bits at once; the **dispatcher** atomically clears one bit per task it dispatches | the dispatcher (candidate set) | "to be dispatched" |
+| `+0x3328` | **Exactly one place**: the tail of the task wrapper, `main+0x15f0e6c` (`ldxr/orr/stlxr` of `1 << index`) | the poll, and the dispatcher's first dependency source | "completed" |
+
+`+0x3328` is zeroed in three places: the arming site (`main+0x1636f54`), the tail of **the other graph runner**
+(`main+0x15eef90`, which clears only this bitmap and leaves the count and the armed set alone), and a big constructor-era
+block of `str wzr/xzr` (`0xa95d6c`, `0x12c7874`, ...). So the answer to "who writes `this+0x3328`" is settled: **the only
+setter is the tail of the wrapper**. The wrapper (from `main+0x15f0ce4`) is the **job body** the dispatcher hands to the
+job pool, and it sets the bit only after the task's function pointer (`[[rec]+0x10]`) has run -- so **a bit that never
+appears means the task never finished, or the bit was cleared**.
+
+**2. The arming site (this round's main find)**: the short block from `main+0x1636f3c` is the "run this graph" entry
+(the game reaches it from `0x856f50`):
+
+```asm
+1636f3c: ldr  x9, [x26, #0x5e40]   ; task count (the same field as graph+0x3100 if graph = x26+0x2D40)
+1636f40: mov  x10, #-1
+1636f44: lsl  x9, x10, x9
+1636f48: mvn  w9, w9               ; w9 = all low `count` bits
+1636f4c: mov  x0, x21              ; x21 = the task graph
+1636f50: str  w9, [x8]             ; **arm: graph+0x3324 = the low `count` bits** (x8 = x26+0x6064)
+1636f54: str  wzr, [x8, #4]        ; clear the completion bitmap (graph+0x3328)
+1636f58: bl   0x15ee598            ; dispatcher
+1636f5c: mov  x0, x21
+1636f60: bl   0x15ee898            ; poll (wait for all of them)
+```
+
+**The dispatcher's conditions** (`0x15ee598`; one call enqueues **every** eligible task, it is not one at a time): bit i of
+`+0x3324` set, and `rec[i]+0x18` a subset of `+0x3328` (dependency A), and `rec[i]+0x1c` a subset of `+0x3320`
+(dependency B); then it atomically clears that bit and enqueues the job `{function pointer, index i, graph}` into the global
+job pool (pool object = `[0x31143d0]`, queue lock at `+0x28`, queue head `+0x68` / tail `+0x70`). **A bit that was taken is
+gone** -- so "to-dispatch reads 0" can mean "never armed" just as well as "all taken".
+
+**3. Device readings** (three rounds, `.work/logs/r1/r2/r3.log`):
+
+| Round | Graph | Tasks | completed `+0x3328` | to-dispatch `+0x3324` | dep source `+0x3320` | presents |
+|---|---|---|---|---|---|---|
+| r2 | `0x7bfcf15d40` | 3 | 0 | 0 | 0 | before the stall (the small graph) |
+| r3 | `0x7bfa5a1d40` | **22** | 0 | 0 | 0 | 62 (the usual stall) |
+| r1 | `0x7bf7e45d40` | 22 | 0 | 0 | 0 | 59 |
+
+The 22 task records (`index:depA/depB/flags`): `0:0/0/0x19 1:0/0x2/0x9 2:0/0x2/0x14 3:0x1/0x2/0x19 4:0x1/0x2/0x4
+5:0/0x2/0x18 6:0x19/0x2/0x9 7:0x39/0x2/0x9 8:0/0x2/0x18 9:0x8/0x2/0x9 10:0/0x4/0x9 11:0xd/0x8/0x9 12:0/0x3/0x18
+13:0x1001/0x10/0x9 14:0x1105/0x20/0x9 15:0x9/0x10/0x9 16:0x1105/0x20/0x19 17:0x1005/0/0x19 18:0x1005/0x20/0x9
+19:0x5/0/0x19 20:0x1005/0x50/0x19 21:0x177000/0/0` => this is a dependency graph **rooted at task 0**: 3/4 need 0,
+6 needs 0/3/4, 7 needs 0/3/4/5, and 13/14/16/18/20 need task 0 (bit 0). In other words, **if task 0 never finishes, the
+whole graph stops**.
+
+The main thread's stack (r3, read by the new instruments): `renderer (0x856f50) -> graph entry (ret 0x1636f64) ->
+poll (0x15ee898) -> pump (0xdf9794, "wait and help") -> task wrapper (0x15f0ce4) -> dispatcher (0x15ee598) -> unlock
+(0x1b76d40)`. **So the main thread is itself running one of this graph's tasks** (the wrapper frame is right there on its
+stack, and the wrapper's tail is what sets the completion bit) **-- while the completion bitmap reads 0.**
+
+The lock readings from the same sample (the "lock word of the most recent ArbitrateLock" line added this round):
+
+| Thread | Address / lock word of its most recent ArbitrateLock | Expected owner |
+|---|---|---|
+| `0x1005` | `0x7c2d11f818` = **`0x40001001`** (waiters bit \| owner `0x1001`) | `0x1001` (the main thread) -> **it really is waiting for it** |
+| `0x1004` / `0x1006` / `0x1007` | lock word **0** | the expected owners do not match -> not blocked on a lock |
+| `0x1001` (main) | `this+0x3460`, lock word **0** | it merely tries for `0x1005`'s lock; it is not blocked |
+
+=> The "M3-2r" framing of "the worker waits on a lock held by the main thread" as a **by-product** has to be reworded: it
+really is **one half of a mutual wait** (the worker waits on a lock word of `0x40001001`, owned by the main thread). The
+other half is "the main thread holds `0x7c2d11f818`" (a heap object, not a field of this graph), and whether that is
+really true was **not** measured this round -- see the next steps.
+
+**4. Where the contradiction is** (the one open item this round). Three readings cannot all hold at once:
+(1) the arming site writes all low `count` bits (`count` = 22, and the poll uses the same field: `~(-1<<22)` = `0x3FFFFF`);
+(2) the dispatcher only clears the bits it takes -- bits whose dependencies are unmet **stay set** in `+0x3324` (the
+`b.ne` jumps back into the loop);
+(3) the measured `+0x3324` is 0 **and** `+0x3328` is 0.
+By (1) and (2), `+0x3324` can only be 0 if **all** 22 tasks were dispatched -- but that requires dependency A to be
+satisfied, i.e. the completion bitmap already holding bits 0/3/4..., and it holds none. The other way round, if the count
+read at arming time was 0 or very small (say the arming field and the poll field are **not the same value**), then both
+bitmaps being 0 fits -- but the **live** wrapper frame on the main thread's stack says jobs really were being executed.
+The two cannot both be true, so one of them must be "**cleared in flight**" or "**the arming and the poll do not look at
+the same number**". Static reading stops here: `+0x3328` has another clearer (`main+0x15eef90`, which touches neither the
+count nor the armed set -- **exactly matching the measured state of the three bitmaps**), and it belongs to the tail of
+**the other graph runner** (`main+0x15ee9d8`, reached from `0x853b38` and `0x857270`), while `0x853b38`, `0x856f50` and
+`0x857270` are **three adjacent graph runs** in the same renderer code.
+
+**5. New instruments** (`dm/host/hle_thread.c`, all read-only; nothing changes behaviour by default) **and what comes next**:
+
+| Instrument | What it reads |
+|---|---|
+| `peek32` + the three bitmaps | `+0x3320`/`+0x3324`/`+0x3328` and the lengths of the two in-flight job tables (`+0x3470`, `+0x3488`) |
+| the task-record dump | every task's `depA (+0x18)/depB (+0x1c)/flags (+0x58)` |
+| the wrapper frame capture | `[x29-8]` = that job's graph, `[x29-0x18]` = its index (**note**: the wrapper's address range also captures the **dispatcher** frame when it was called from the wrapper's tail, and in that case the "index" is the dispatcher's loop counter, not the task index) |
+| the lock word of the most recent `ArbitrateLock` | the expected owner (`x0`) and the lock word at that address right now -- the other half of a mutual wait |
+
+Next (in order, still measuring rather than changing):
+1. **A time series** (the only way to separate the two cases of part four): sample that graph's three bitmaps and `count` on
+   every main-thread SVC and **log a line whenever a value changes**. One look then tells "armed 22 bits -> taken",
+   "armed 0 bits", or "completed and then cleared".
+2. **A host-side lock ledger**: have `arb_lock`/`arb_unlock` record "which thread we granted this address to", and check
+   the lock word against that ledger at the stall -- answering "does the main thread really hold `0x7c2d11f818`" and "was
+   the thread whose tag a handoff wrote ever actually woken".
+3. While at it: check `graph == x26 + 0x2D40` (read `x26` out of the graph entry's frame) and read `x26+0x6064` (the cell
+   the arming site actually writes).
 
 ---
 
