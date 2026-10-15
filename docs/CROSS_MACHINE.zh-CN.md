@@ -275,6 +275,22 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
   ② 中途那条用 `vk_probe`（离屏最小 Vulkan，0.1 秒就完）推出的"设备对别人是好的、病在我们进程"**已收回**
   （离屏、64 KB，很可能撞在两次停顿之间）。**下一步**：给 `one_end_on` 加"读回 / 上传"标签（只动日志，先把
   arm D 里那 10 秒的归属分出来）、在停顿窗口抓 ftrace/perfetto、换设备/驱动对照。细节见「M3-2z」。
+- **归属分完了，而且那 ~10 秒的形状查清了（2026-10-15，「M3-3a」）**：给 `one_end_on` 加"读回 / 对照"与"上传"两个标签（**只动日志**）之后 ——
+  **arm D（一次读回都没有）里那 10 秒确定是「上传」**（10005 / 10262 / 11993 ms），但 **arm A 有一轮是「读回：等队列空闲」10800 ms** ⇒ **两条路都会中，
+  "读回是罪魁"作罢**。**换仪器**：`/system/bin/atrace` 在 shell 下**能吐文本 ftrace**（`--async_start -b 32768 -c sched freq sync` → `--async_stop -o 文件`；
+  带 `prev_state`、`sched_blocked_reason` 的 `caller=`、`cpu_frequency`、`clk_set_rate`，还有一条能把 trace 时钟对到墙钟的 `realtime_ts=`），
+  而 `tracefs` 的 `enable` 与 `/sys/class/kgsl/*` 对 shell 仍是 `Permission denied` —— shell 在 `readtracefs` 组里，**atrace 这条路能走通**。
+  在停顿窗口抓到 171 MB 原文（扳机＝"最近 4 条心跳出图数相同且 >0"，配方已落成 `.work\trace\stall-ftrace.ps1`），四条读数：
+  ① 我方两个线程各有 ~10 秒的离 CPU 间隔、**同一瞬间结束**（前端 tid 19581 = 「上屏：等上一帧的栅栏」；客体 tid 19592 = 「一次性提交等空闲（上传）」）；
+  ② **整条 GPU/显示通路一起睡又一起醒**（`kgsl-events` 10.035 s、`kgsl_hwsched`、`gmu_f2h`、`crtc_commit:205`、`crtc_event:205`、`mFrameBuffer`、
+  `DISP_EVENT_SUBJ`、SystemUI 的 `SystemUIBg-*`，结束时刻都落在同一 20 毫秒内）；
+  ③ **全是 S 态，全 trace 没有一条 >0.5 秒的 D 态阻塞**（唯一 D 在起点那一瞬），CPU 大部分 idle、**频率全程 556 MHz~1.99 GHz 正常来回** ⇒ 不是热 / 省电 / 降频 / 我方烧 CPU，
+  也不是"内核不可中断地挂住"；④ **恢复瞬间 = `gmu_f2h`（GMU 固件→主机中断）→ `kgsl_hwsched` → 整套 GPU/GMU 时钟与总线重编程**
+  （`clk_set_rate: gpu_cc_pll0/gmu_clk_src/gx_gmu_clk/cx_gmu_clk`、第二次恢复里 `icc_set_bw`）⇒ 形状是"**GPU/GMU 掉了约 10 秒，回来时重编程**"，不是某个进程自卡。
+  **唯一"像原因"的东西**：我方在 **启动那 4.8 秒**里于驱动中做成了 **`rpmh_write_batch` 441 次、`rpm_resume` 93 次、`gpu_cc_cx_smmu_gdsc` 13 次、`icc_set_bw` 6 次**，
+  外加 `kgsl_iopgtbl_map`（每次分配都做 IOMMU 映射）—— 也就是"**每次上传都新建 `VkBuffer`/`VkDeviceMemory`/视图**"（「九」第 5 项）在驱动里变成成百次电源 / 总线投票；
+  系统侧同一套 caller 是 `gmu_core_timed_poll_check` / `adreno_hwsched_wait_ack_completion` / `gen8_hfi_send_cmd_wait_inline`（等 GMU 固件回 ack）。
+  ⇒ **下一轮的第一刀改成「九」第 5 项（贴图上传改常驻上传环，加 `DM_UP_RING` 做成 A/B 第五臂）**。细节（含 perfetto 的负面结论）见「M3-3a」。
 - **一条偶发**：约每轮 1 次 `【红】提交失败 VkResult -4`（`VK_ERROR_DEVICE_LOST`），后面跟上百条
   `贴图上传失败`。**与共用命令缓冲无关**（已排除，「M3-2o」）；「M3-2t」的 t2 里它之后窗口被拆、日志截断 ⇒
   与"停住"很可能是同一条线。
@@ -300,6 +316,9 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
    更早更轻的场景里），在它量清之前不去给"停住"加护栏；**设备丢失**已由新日志（`vk_tex.c` 的 `step_fail`）
    说出"谁先看见" = **`vkQueueWaitIdle`（"等队列空闲"）**，其后上传都在 `vkQueueSubmit` 上返回 -4（-4 是粘的），
    要答"谁弄丢的"还差"最后一次成功的提交 ↔ 第一条 -4"之间那一小段留在日志里。细节见「M3-2y」。
+  ⇒ **「M3-3a」把 ①② 做完了（③ 换设备没做：本机只有一台）**：① 标签加上后，**arm D 里那 10 秒是「上传」**，而 **arm A 一轮是「读回：等队列空闲」10800 ms**
+  ⇒ **两条路都会中**；② ftrace 抓到了（走 **atrace 文本**，不是 perfetto —— 见下面「坑」里三条 perfetto 约束），读数见「现在停在哪」最后一条。
+  **下一步的第一刀因此换成「九」第 5 项（贴图上传改常驻上传环）**，理由见那条 bullet 的末尾。细节见「M3-3a」。
 3. ~~**「九」优化清单第 2 项**（零拷贝内存类型优先 `HOST_CACHED`）~~ —— **已取证、已否掉（2026-10-15，「M3-2q」）**：
    类型 6 **能**导出 fd（256 MB / 512 MB / 3968 MB 都过，`mmap` 到指定地址、双向也通），但要**越过缓冲声明的可用
    类型位**（外部缓冲是 `0x13`，里面没有类型 6 —— 属规范外用法、靠驱动宽容），而 A/B 里 CPU 时间**没有可测差异**
@@ -449,6 +468,18 @@ adb 要经 `run-as` 才看得到（`adb shell run-as ai.d2rm.dm ls -l files`）�
 - **MIUI 上 shell 改不了刷新率**：`settings put system min_refresh_rate 120` 会被拒
   （`SecurityException: com.android.shell was not granted WRITE_SETTINGS`）⇒ "钉住刷新率"这类实验做不了，
   别在它上面浪费时间（读数用 `dumpsys SurfaceFlinger` 看，面板当时是 min/max/cur 全 120 Hz）。
+- **要"谁在等 / 谁在跑 / 等的是哪个内核函数"，本机这台手机上最便宜的仪器是 `atrace`，不是 perfetto**（2026-10-15，「M3-3a」）：
+  `atrace --async_start -b 32768 -c sched freq sync` → 命中后 `--async_stop -o /data/local/tmp/x.txt`，**输出是文本 ftrace**（`prev_state`、
+  `sched_blocked_reason: pid=… caller=…`、`cpu_frequency`、`clk_set_rate`、`dma_fence_signaled`），**开头那条 `tracing_mark_write: trace_event_clock_sync: realtime_ts=…`
+  能把 trace 时钟对到墙钟**（对窗口就靠它）。**shell 读不了 `tracefs` 的 `enable` / `available_events`，也读不了 `/sys/class/kgsl/*`（都是 `Permission denied`）**，
+  但 shell 在 `readtracefs` 组里、atrace 走的是它自己有权限的那条路 —— **别在"直接抓 ftrace"上放弃**。抓取配方（环状缓冲 + "最近 4 条心跳出图数相同且 >0"当扳机）
+  已落成 `.work\trace\stall-ftrace.ps1`（**纯 ASCII**：`.ps1` 有 BOM 那条老规矩在这里是反过来用的，脚本里一个中文都没有，免得被 GBK 拆坏）。
+- **perfetto 在这台机上有三条硬约束，而且"没报错"不能当"原子可用"**（2026-10-15，「M3-3a」）：① **配置只能放 `/data/misc/perfetto-configs/`、产物只能写
+  `/data/misc/perfetto-traces/`** —— perfetto 自己的 SELinux 域**读不了 `/data/local/tmp` 的配置、也写不了那儿的输出**（`errno 13`），`cmp` 出来是权限不是路径；
+  ② `compression_type: COMPRESSION_TYPE_NONE` **不是合法枚举**（只有 `UNSPECIFIED` / `DEFLATE`），写了会被判"配置非法"，要"不压缩"就**整行不写**；
+  **pbtxt 不能带 UTF-8 BOM**（带 BOM 报 `1:1 error: Unexpected character ''`）；③ **`perfetto` 对"根本不存在的原子名"也不报错**（负对照：写 `kgsl/no_such_atom_xyz`
+  照样跑完出 trace）⇒ 判据只能看 logcat 里 `traced_probes` 的 `avc: denied { read } … name="format" … tcontext=u:object_r:debugfs_tracing_debug:s0`
+  —— **这台机上 kgsl 那一族原子就是被它挡下的**（MIUI 不让 `traced_probes` 读 vendor 事件的 `format`，而 perfetto 要靠 `format` 才能解析事件）。
 - **本机 cmd 的代码页是 936（GBK），而仓库里的 `.cmd` 是 UTF-8 无 BOM** ⇒ 直接跑 `build_apk.cmd` 会被中文注释
   拆行、报一堆 `'xxx' 不是内部或外部命令` + `此时不应有 …`（「M3-2s」第一次构建就这么失败的，产物一个没出）。
   先 `chcp 65001` 再 call 即可（`.work\build_u8.cmd` 就是这个两行包装；脚本**不用改**，这是本机控制台的事）。

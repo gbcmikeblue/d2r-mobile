@@ -644,6 +644,14 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
    "读回 / 上传"标签（**只动日志**），先把 arm D 里那 10 秒的归属分出来（那一轮 viewer 与扫描都关着，
    长等落在客体线程的「一次性提交等空闲」上，而"建中转缓冲 + 分配 + 映射"没有长等 ⇒ 像是**上传**）；
    ② 在停顿窗口抓一次 ftrace / perfetto（`gpu` / `kgsl` / `sync`）；③ 换设备 / 换驱动对照。细节见「M3-2z」。
+   ⇒ **「M3-3a」把 ①② 做完了，③ 没做（本机只有一台设备）**：① 标签加上后 **arm D 里那 10 秒确实是「上传」**，但 **arm A 有一轮是「读回：等队列空闲」10800 ms**
+   ⇒ **两条路都会中**，"读回是罪魁"作罢；② 换了个更便宜的仪器 —— **`atrace` 在 shell 下能吐文本 ftrace**（含 `prev_state` 与 `sched_blocked_reason` 的 `caller=`），
+   在停顿窗口抓到 171 MB 原文后读数四条：我方两个线程各有 ~10 秒的离 CPU 间隔（同一瞬间结束）、**整条 GPU/显示通路（`kgsl-events` / `kgsl_hwsched` / `gmu_f2h` /
+   `crtc_commit:205` / `crtc_event:205` / `mFrameBuffer` / SystemUI）一起睡又一起醒**、**全是 S 态且全 trace 无 >0.5 秒的 D 态、CPU 大部分 idle、频率正常**、
+   **恢复瞬间是 `gmu_f2h` 中断 + 整套 GPU/GMU 时钟与带宽重编程**（`clk_set_rate gpu_cc_*`、`icc_set_bw`）。**perfetto 这边如实记一条负面结论**：配置与产物只能用
+   `/data/misc/perfetto-configs` 与 `/data/misc/perfetto-traces`，而且 **MIUI 的 SELinux 不让 `traced_probes` 读 vendor 事件的 `format`**（`debugfs_tracing_debug`）
+   ⇒ **kgsl 那一族原子在这台机上拿不到**（perfetto 对不存在的原子名也不报错，所以"没报错"不能当证据；判据要看 logcat 的 avc）。
+   **下一步的第一刀因此换成了「九」第 5 项（贴图上传改常驻上传环）** —— 本轮唯一"我方主动做成了几百次驱动级电源 / 总线投票"的地方。细节见「M3-3a」。
 3. ~~**「九」第 2 项 `HOST_CACHED`**~~ —— **已取证、已否掉（2026-10-15，「M3-2q」）**：类型 6 上导出 fd / `mmap`
    到指定地址 / 双向都**能**（256 MB、512 MB、3968 MB 都过了），但同机 A/B 里 **CPU 时间没有可测差异**（同峰配对
    <3%，轮间波动 ±100%），而用它要**越过缓冲声明的可用类型位**（外部缓冲 `0x13` 里没有类型 6，属规范外用法），
@@ -692,6 +700,18 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
   （`【黄】表满…`）—— **凡是有上限的表，都要把"满了"写进读数**。另一个同源的小现象：同一个地址会用两种印法
   （`pc=libc.so+0xd7b88` vs `lr=ioctl+0xa0`，其实同一个地址 —— `dladdr` 能命名 `ioctl`、命不了 libc 里的 syscall 桩）。
 
+- **要看"谁在等、谁在跑、等的是哪个内核函数"，这台机上最便宜的仪器是 `atrace`，不是 perfetto**（「M3-3a」）：`atrace --async_start -b 32768 -c sched freq sync`
+  → 命中后 `--async_stop -o /data/local/tmp/x.txt`，**输出是文本**，带 `prev_state`、`sched_blocked_reason: pid=… caller=…`、`cpu_frequency`、`clk_set_rate`、`dma_fence_signaled`，
+  开头那条 `tracing_mark_write: trace_event_clock_sync: realtime_ts=…` 能把 trace 时钟对到墙钟。**shell 读不了 `tracefs` 的 `enable` / `available_events` 与
+  `/sys/class/kgsl/*`，但 shell 在 `readtracefs` 组里、而 atrace 走的是它自己有权限的那条路** ⇒ 别在"直接抓 ftrace"上放弃。抓取配方（环状缓冲 + "最近 4 条心跳出图数相同且 >0"当扳机）
+  已落成 `.work\trace\stall-ftrace.ps1`（**纯 ASCII**，避免 `.ps1` 的 BOM 问题）。
+- **perfetto 在这台机上的三条硬约束**（「M3-3a」）：① **配置只能放 `/data/misc/perfetto-configs/`、产物只能写 `/data/misc/perfetto-traces/`** —— perfetto 自己的 SELinux 域
+  读不了 `/data/local/tmp` 的配置、也写不了那儿的输出（`errno 13`）；② `compression_type: COMPRESSION_TYPE_NONE` **不是合法枚举**（只有 `UNSPECIFIED` / `DEFLATE`），
+  写了直接判"配置非法"，要"不压缩"就**整行不写**；**pbtxt 不能带 UTF-8 BOM**（带 BOM 报 `1:1 error: Unexpected character`）；③
+  **perfetto 对"根本不存在的原子名"也不报错**（负对照实测）⇒ **"配置没报错"不能当"原子可用"的证据**，要判得看 logcat 里 `traced_probes` 的
+  `avc: denied { read } … name="format" … tcontext=u:object_r:debugfs_tracing_debug:s0` —— 这台机上**kgsl 那一族原子就是被它挡住的**。
+- **改"站点名"这类只动日志的改动，保留被分出去的那一侧的旧串**（「M3-3a」）：把「一次性提交等空闲」分成"读回 / 对照"与"上传"时，读回那侧**一个字都没改**，
+  于是新旧日志可直接比、读它的脚本也不用动（"改日志正文等于改统计口径"那条坑的正面用法）。
 - 顺带：MIUI 上 `adb install -r` 会被拦（`INSTALL_FAILED_USER_RESTRICTED`），改用设备端 `pm install -r` 即可。
 
 ---
@@ -2069,6 +2089,84 @@ shell 没有 `WRITE_SETTINGS`，所以"钉住刷新率"这个实验做不了。�
 4. 若要动"用法"侧：第一刀建议切**前端那条自己的队列**（`vk_device.c:526` 无条件
    `vkGetDeviceQueue(g_dev, g_qfi, 1, &g_queue_win)`，没有开关）—— 退回共用队列看那 ~10 秒是否消失；
    代价是会走那条"实测两边互相堵死"的加锁回退路径（见 `vk_win.c:217-225`），要小心。
+
+---
+
+### M3-3a：把「读回 / 上传」分开 + 停顿窗口里的 ftrace —— 那 ~10 秒是**整条 GPU/显示通路一起睡、一起被 GMU 中断放出来**（2026-10-15 真机）
+
+**一、先做的那一刀（只动日志）：「一次性提交」的两条路各自报名字**
+- `vk_tex.c` 的 `one_end_on(cb, up)`：三处名字按路分开 —— 队列锁注释、提交站点、等空闲站点（**六个常量串**，因为账本只存指针，见 `crash.c:253`）；`one_end()` 传 0（读回 / 对照），`ent_upload` 传 1（上传）。**读回那侧旧串一字未改**
+  （「一次性提交等空闲（读回 / 对照，等驱动，可能跑在客体线程上）」），上传那侧是新串「一次性提交等空闲（上传，等驱动，可能跑在客体线程上）」
+  ⇒ 新旧日志可比，读它的脚本不用改（`ab-run.ps1` 的站点解析本来就是"抓到什么打什么"）。
+- 读数：
+  - **arm D（viewer 与扫描都关，一次读回都没有）**：D3 r2 `10005 ms`、D4 r1 `10262 ms`（外层「客体：排队提交命令」）、PT1 `11993 ms` —— **全部落在「上传」**；同刻前端线程在
+    「上屏：等上一帧的栅栏」（10032 / 10282 / 12009 ms）。⇒ **arm D 里那 10 秒就是上传**，「M3-2y」/「M3-2z」的猜测**成立**。
+  - **arm A（两路诊断都开）**：A4 r1 = 「上传」`10029 ms`；**A4 r2 =「读回：等队列空闲（等驱动做完在飞提交）」`10800 ms`**（读回锁同时持有了 10642 ms）。
+  - ⇒ **两条路都会中**：谁在等队列，谁就吃到那 10 秒。**"读回是罪魁"这条方向正式作罢**，顺带把「M3-2z」第五节第 4 条（前端队列退回共用）的优先级降下去 —— 与"谁的队列、谁在等"无关。
+  - 顺带复查：**同一份 arm D conf 连着三轮 = 病、病、健康**（r3：976 帧 / 14.0 帧/秒、零长等），而这几轮 **`VkResult -4` 全 0 条** ⇒ 再次确认"那 10 秒不需要设备丢失就能出现"。
+
+**二、换仪器：`atrace` 在这台机上能吐**文本** ftrace（比 perfetto 好用）**
+- 仪器事实：`/system/bin/atrace` 在 shell 下可跑；`atrace --async_start -b 32768 -c sched freq sync` → 命中后 `--async_stop -o /data/local/tmp/x.txt`，
+  输出是**文本**，带 `prev_state`、`sched_blocked_reason: pid=… caller=…`、`cpu_frequency`、`clk_set_rate`、`dma_fence_signaled`，开头还有一条
+  `tracing_mark_write: trace_event_clock_sync: realtime_ts=…` 可把 trace 时钟对到墙钟（本轮就是靠它把窗口对起来的）。`tracefs` 的 `enable` / `available_events`
+  与 `/sys/class/kgsl/*` 对 shell 仍是 `Permission denied` —— **能走通的原因是 shell 在 `readtracefs` 组里（`id` 里的 3012），而 atrace 走的是它自己有权限的那条路**。
+- 抓取配方（可复用，已落成 `.work\trace\stall-ftrace.ps1`，纯 ASCII）：环状缓冲 + **"最近 4 条心跳的出图数完全相同且 >0"当扳机**，命中后立刻 `--async_stop -o`。
+  本轮一次命中（启动后约 28 秒），拿到 171 MB / 110 万条、覆盖 29.9 秒的原文。
+- 窗口：两次 ~10 秒停摆 = `22:14:01.67 → 11.69` 与 `22:14:11.95 → 21.98`（与 app 日志的心跳断口一致）。
+
+**三、决定性读数（同一份 171 MB 原文，四条）**
+1. **我方两个线程各有一个 ~10 秒的"离 CPU"间隔，落在同一窗口、同一瞬间结束**：`tid 19581` = 10.028 s + 10.030 s（前端线程，就是「上屏：等上一帧的栅栏」，
+   也是写心跳的那条）、`tid 19592` = 10.006 s（客体线程，「一次性提交等空闲（上传）」）。
+2. **同刻整条 GPU/显示通路一起睡、一起醒**（结束时刻都落在 `22:14:11.69±0.02`）：`kgsl-events` 10.035 s、`crtc_commit:205` 9.998、`crtc_event:205` 9.995、
+   `mFrameBuffer` 10.091、`DISP_EVENT_SUBJ` 10.004、`binder:1780_5` 10.081、`com.miui.daemon` 10.016、`blastAsyncWork` 10.014；第二轮同形（`kgsl_hwsched` 6.03、
+   `gmu_f2h` 6.03、SystemUI 的 `SystemUIBg-3..7` 各 6.08、`crtc_*` 9.99）。⇒「M3-2z」从 logcat 看到的"SystemUI 也卡 10 秒"在**调度层面**得到同一条读数，
+   而且**多了驱动自己的内核线程**（kgsl-events / kgsl_hwsched / gmu_f2h）。
+3. **状态全是 S（可中断），全 trace 没有一条 >0.5 秒的 D 态阻塞**（唯一的 D 在起点那一瞬：`crtc_commit:205` 与我们的 19592 以 D 离开 CPU，之后都是 S）；
+   CPU 在这 10 秒里**大部分 idle**（app 只占 1.075 CPU-秒 / 10 秒，其余多是 `swapper/*`），**CPU 频率全程在 556 MHz~1.99 GHz 之间来回、既没塌到最小也没钉在最大**
+   ⇒ 不是热 / 省电 / 降频、也不是我方烧 CPU，更不是"内核不可中断地挂住"。
+4. **恢复瞬间的形状 = GPU/GMU 通路重编程**：`22:14:11.674–11.679` 的原文是 `gmu_f2h`（GMU 固件→主机中断线程）被唤醒 → `kgsl_hwsched` 运行 →
+   **`clk_set_rate: gpu_cc_pll0 1000000000` / `gpu_cc_pll0_out_even 500000000` / `gpu_cc_gmu_clk_src 500000000` / `gpu_cc_gx_gmu_clk 500000000` /
+   `gpu_cc_cx_gmu_clk 500000000`**；第二次恢复（`22:14:21.966`）里 `kgsl_hwsched` 阻塞在 **`icc_set_bw`**（总线带宽投票）⇒ 形状是
+   "**GPU/GMU 掉了约 10 秒，回来时做了整套时钟 / 带宽重编程**"，由 GMU 中断收场 —— 不是某个进程自己卡住。
+
+**四、我方在起点做了什么（本轮唯一"像原因"的东西）**
+- 起点 `22:14:01.641–01.642` 的原文：`dma_fence_signaled: sde_fence:crtc205:85908` → **`dma_fence_signaled: driver=kgsl-timeline timeline=kgsl-3d0_24-ai.d2rm.dm(15947)-a … seqno=560`**
+  （**我们自己上下文的时间线 fence 被信号**）→ 我们的 19592 **以 D 离开 CPU**，`gmu_f2h` / `kgsl_hwsched` / `kgsl-events` 一起睡下去。
+- 我方线程在驱动里等什么（`caller=` 全 trace 统计）：`folio_wait_bit_common` 1050、**`rpmh_write_batch [qcom_rpmh]` 579**、**`rpm_resume` 106**、
+  `gpu_cc_cx_smmu_gdsc [gpucc_sun]` 13、`icc_set_bw` 6、`adreno_hwsched_wait_ack_completion [msm_kgsl]` 4、`gmu_core_timed_poll_check [msm_kgsl]` 2、
+  `kgsl_iopgtbl_map [msm_kgsl]` 1 —— **且这些几乎全挤在启动那 4.8 秒**（`boot/normal` 窗口：rpmh 441、rpm_resume 93、gdsc 13、icc 6），停摆窗口里掉到个位数。
+  系统侧同一套 caller 也在（`gmu_core_timed_poll_check` 195、`icc_set_bw` 190、`adreno_hwsched_wait_ack_completion` 123、
+  **`gen8_hfi_send_cmd_wait_inline` 57（等 GMU 固件回 ack）**、`adreno_hwsched_poll_msg_queue_write_index` 32）。
+- ⇒ **第一条有证据的因果链假设**：我们"**每次上传都新建 `VkBuffer` / `VkDeviceMemory` / 视图**"（「九」第 5 项）在驱动里落成**成百次功率域 / 总线投票 + 每次分配都做 IOMMU 映射**，
+  某次 GPU 电源 / GMU 状态切换没能按时回来，整条通路等 ~10 秒后由 GMU 中断 + 时钟重编程收场。
+  **这把「九」第 5 项（贴图上传改常驻上传环）从"性能优化"提升为"可能与停摆同源"** —— 下一轮该做的第一刀就是它（**先做成 A/B 第五臂，别直接改**）。
+- 两个小复查：① 病轮里 app 起手就是**极高频 S↔R 切换**（`pre` 窗口 4.19 秒里我方 `tid 19602` 被调度 19284 次；整进程吃 5.571 CPU-秒 > 4.19 秒墙钟），
+  是客体协作式调度"睡一下看一眼"的形状，不是新问题；② 本轮 trace 里**没有 `VkResult -4`**。
+
+**五、perfetto：能用，但在这台机上拿不到 kgsl 的原子（如实记下来）**
+- 能用的部分：`/system/bin/perfetto`（v49）在 shell 下可跑（`-c … --txt -o …`）；但**配置必须放 `/data/misc/perfetto-configs/`、产物必须写 `/data/misc/perfetto-traces/`** ——
+  perfetto 自己的 SELinux 域**读不了 `/data/local/tmp` 的配置、也写不了那儿的输出**（`errno 13`；`adb push` 配置进 `perfetto-configs` 实测可以）。
+- 三个新坑：① `compression_type: COMPRESSION_TYPE_NONE` **不是合法枚举**（只有 `UNSPECIFIED` / `DEFLATE`），写了会被判"配置非法"；要不压缩就**整行不写**。
+  ② pbtxt **不能带 UTF-8 BOM**，带 BOM 直接 `1:1 error: Unexpected character ''`（这次用编辑器生成的一份配置就带了一个 BOM，剥掉即可）。
+  ③ **perfetto 对"根本不存在的原子名"也不报错**（负对照：`kgsl/no_such_atom_xyz` 照样跑完并出 trace）⇒ **"配置没报错"不能当"原子可用"的证据**。
+- 判"原子有没有真被打开"要看 logcat 里 `traced_probes` 的 avc：本轮出现
+  `avc: denied { read } for name="format" dev="tracefs" … scontext=u:r:traced_probes:s0 tcontext=u:object_r:debugfs_tracing_debug:s0 permissive=0`（8 条，同一 inode）
+  + `name="current_tracer"` 1 条 ⇒ **MIUI 的 SELinux 不让 `traced_probes` 读 vendor 事件的 `format`**，而 perfetto 要靠 `format` 才能解析事件 ⇒
+  **kgsl 那一族原子在这台机上不可用**（具体被挡下几个分不出来，按"不可用"记）。
+- 留档：`.work\trace\stall.pftrace`（7.1 MB，arm D 的一次 ~12 秒停摆窗口，含 `sched/*` + 那些 kgsl 原子名）—— 在**有 `trace_processor` 的机器**上可直接复核
+  （本机无外网、`pip` 装不了 `perfetto` 包）。
+
+**六、没做 / 做不了**
+- **换设备 / 换驱动对照（任务 3）没做**：本机 `adb devices` 只有 `8b1f1e50` 一台。
+- **任务 4（前端队列退回共用）没做**：本轮读数已把它的优先级降下去（那 10 秒与"谁的队列、谁在等"无关）。
+- kgsl 计数器读不了（`/sys/class/kgsl/kgsl-3d0/` → `Permission denied`），与"GPU 频率节点读不了"同源。
+- 顺带一条老现象：D3 r1 是**已知的偶发启动崩溃**（`CRASH sig=11 … pc=libc.so+0xd6b18`，与 `.work\logs\run-fixed-lock.log` 里那份签名一致），
+  本轮 8 次启动里 1 次，**与本次改动无关**。
+
+**七、下一步**
+1. **第一刀：贴图上传改常驻上传环**（「九」第 5 项，加 `DM_UP_RING` 开关，做成 A/B 第五臂）—— 理由见第四条第 3 点。
+2. 有 `trace_processor` 的机器上读 `.work\trace\stall.pftrace`；或换一台 Adreno / 换一版驱动跑同一配方（分辨力最强）。
+3. 若还要正面看"谁让 GPU 掉下去"：这台机上**只有驱动内部（未导出）能看到** —— adb shell 的权限到此为止，别再在这上面花时间。
 
 ---
 

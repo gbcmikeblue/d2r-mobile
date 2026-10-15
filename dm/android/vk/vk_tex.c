@@ -488,16 +488,35 @@ static int one_begin_on(VkCommandBuffer *slot) {
       if (br != VK_SUCCESS) { step_fail("vkBeginCommandBuffer 返回 %d", (int)br); return 0; } }
     return 1;
 }
-static int one_end_on(VkCommandBuffer cb) {
+// ---------- M3-3a：一次性提交的**两条路各自报名字**（只动日志，一行逻辑都没改） ----------
+// 为什么：「M3-2y」的 arm D（viewer 与扫描都关）里那 ~10 秒长等落在客体线程的「一次性提交等空闲」上，而
+// **读回 / 对照**（`one_end`）与**上传**（`ent_upload`）当时**共用**这一段、站点名也只有一个写法，于是"这 10 秒
+// 是谁等的"分不出来（「M3-2z」第五节第 1 条）。这里给 `one_end_on` 加一个 `up` 标签，把三处名字（队列锁注释、
+// 提交站点、等空闲站点）按路分开。
+// 注意：账本只存指针、不拷贝（`crash.c:253` 那句注释），所以下面这六个**必须是常量串**（字面量或指向字面量的
+// 常量指针都行，别用栈上的 buf）。
+// M3-3a: the two paths through the one-off submit **name themselves** (log only, not a line of logic changed).
+// Why: in "M3-2y" arm D (viewer and scan both off) the ~10 s wait sat at the guest thread's "one-off submit + wait idle",
+// but **readback / control clear** (`one_end`) and **upload** (`ent_upload`) shared that section and its site name, so
+// "whose 10 seconds is it" could not be read off ("M3-2z", part five, item 1). `one_end_on` gets an `up` tag and the three
+// names (queue-lock note, submit site, idle-wait site) split per path.
+// Note: the ledger stores the pointer, it does not copy (`crash.c:253`), so these six **must be constant strings**.
+static const char *const ONE_NOTE_RB   = "一次性提交 + 等空闲（读回 / 对照）";
+static const char *const ONE_NOTE_UP   = "一次性提交 + 等空闲（上传）";
+static const char *const ONE_SUBMIT_RB = "vk：一次性提交（读回 / 对照）";
+static const char *const ONE_SUBMIT_UP = "vk：一次性提交（上传）";
+static const char *const ONE_IDLE_RB   = "一次性提交等空闲（读回 / 对照，等驱动，可能跑在客体线程上）";
+static const char *const ONE_IDLE_UP   = "一次性提交等空闲（上传，等驱动，可能跑在客体线程上）";
+static int one_end_on(VkCommandBuffer cb, int up) {
     { VkResult er = vkEndCommandBuffer(cb);
       if (er != VK_SUCCESS) { step_fail("vkEndCommandBuffer 返回 %d", (int)er); return 0; } }
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
     // 提交与"等队列空闲"是一件事（一次性命令缓冲的语义），整段拿队列锁（见 vk_device.h）
     // The submit and the queue-idle wait are one thing for a one-off command buffer, so the whole span takes the
     // queue lock (see vk_device.h)
-    vk_queue_note("一次性提交 + 等空闲");
+    vk_queue_note(up ? ONE_NOTE_UP : ONE_NOTE_RB);
     vk_queue_lock();
-    dm_waitled_enter("vk：一次性提交（读回 / 对照）");
+    dm_waitled_enter(up ? ONE_SUBMIT_UP : ONE_SUBMIT_RB);
     VkResult sr = vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE);
     dm_waitled_leave();
     if (sr != VK_SUCCESS) { step_fail("vkQueueSubmit 返回 %d", (int)sr); vk_queue_unlock(); return 0; }
@@ -506,7 +525,10 @@ static int one_end_on(VkCommandBuffer cb) {
     // M3-2w: readback / control clear go through this "one-off submit + wait idle", and it **can run on a guest thread**
     // ("M3-2u" sample PC: `vk_tex_view <- mtl_exec <- dm_gfx_suspend`), which makes it a prime suspect for the "polling
     // wait" -- so it is recorded.
-    dm_waitled_enter("一次性提交等空闲（读回 / 对照，等驱动，可能跑在客体线程上）");
+    // M3-3a：**上传**也走这里（`ent_upload` 的 `g_cb_up`），同一条路上客体线程一样会久等 —— 所以站点名分两路。
+    // M3-3a: **uploads** come through here too (`ent_upload`'s `g_cb_up`) and the guest thread waits just as long, so the
+    // site name splits per path.
+    dm_waitled_enter(up ? ONE_IDLE_UP : ONE_IDLE_RB);
     VkResult r = vkQueueWaitIdle(vk_queue());
     dm_waitled_leave();
     vk_queue_unlock();
@@ -514,7 +536,7 @@ static int one_end_on(VkCommandBuffer cb) {
     return 1;
 }
 static int one_begin(void) { return one_begin_on(&g_cb); }        // 读回 / 对照清除 | readback / control clear
-static int one_end(void) { return one_end_on(g_cb); }
+static int one_end(void) { return one_end_on(g_cb, 0); }
 
 // ---------- 建 / 上传 ----------
 static int ent_build(const tex_t *t, ent_t *e) {
@@ -670,7 +692,7 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
-    int done = ok && one_end_on(g_cb_up);
+    int done = ok && one_end_on(g_cb_up, 1);   // M3-3a：1 = 上传（站点名与读回分开）| M3-3a: 1 = upload (site name split from readback)
 
     vkUnmapMemory(vk_dev(), sm);
     vkDestroyBuffer(vk_dev(), stg, NULL);
