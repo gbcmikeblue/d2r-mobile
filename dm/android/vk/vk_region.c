@@ -25,6 +25,18 @@ static struct {
 static int g_nreg;
 static uint64_t g_bytes;
 
+// 零拷贝内存类型要不要优先带 HOST_CACHED（「九」第 2 项）：DM_ZC_CACHED=1 开，缺省关 ——
+// 缺省关是因为用它越过了缓冲声明的可用类型位（真机 0x13 里没有它），属于规范外用法，
+// 先做 A/B，赢了再翻默认。
+// Whether the zero-copy type should prefer HOST_CACHED (item 2 of "section nine"): DM_ZC_CACHED=1 turns it on and
+// it is off by default -- off because using it steps outside the buffer's declared allowed types (0x13 on the real
+// device does not include it), which is outside the spec, so the A/B comes first and the default is flipped only
+// if it wins.
+static int zc_cached_wanted(void) {
+    const char *e = getenv("DM_ZC_CACHED");
+    return e && *e && *e != '0';
+}
+
 // 这片「专属」缓冲只是导出句柄的载体：这种句柄标了 DEDICATED_ONLY，规范要求一份分配专属一块缓冲，
 // 而不链它的话 vkGetMemoryFdKHR 会直接失败（探针里实测过）。池子的真身是后面按偏移绑进来的那些缓冲。
 // 用法只给传输位：这载体不会被真的读写，而带上 STORAGE_BUFFER 会撞上驱动的 maxStorageBufferRange 上限
@@ -76,8 +88,21 @@ size_t vk_region_overlay(void *at, size_t size, const char *what) {
             LOG("【红】%s 内存换轨：建载体缓冲失败（%llu MB）", what, (unsigned long long)(try >> 20));
             return 0;
         }
-        uint32_t mi = vk_memory_type(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bits);
+        // 「九」第 2 项：DM_ZC_CACHED=1 时优先要"带 HOST_CACHED 的零拷贝类型"（真机上类型 6），客体每一次读写
+        // 都走主机侧缓存。它不在缓冲声明的可用类型位里，所以分配失败要**回退类型 4**，而不是像撞上限那样退一档
+        // 尺寸。不设这个开关时行为与原来完全一致。
+        // Item 2 of "section nine": with DM_ZC_CACHED=1, prefer the zero-copy type that has HOST_CACHED (type 6 on
+        // the real device), so every guest access goes through the host-side cache. It is not among the buffer's
+        // declared allowed types, so an allocation failure must **fall back to type 4** rather than stepping the size
+        // down (that step-down is only for hitting the size limit). Unset, the behaviour is exactly as before.
+        uint32_t mi_std = vk_memory_type(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bits);
+        uint32_t mi = mi_std;
+        int cached_used = 0;
+        if (zc_cached_wanted()) {
+            uint32_t c = vk_zero_copy_cached_type();
+            if (c != UINT32_MAX && c != mi_std) { mi = c; cached_used = 1; }
+        }
         VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk_dev(), owner, &mr);
 
         VkMemoryDedicatedAllocateInfo ded = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = owner };
@@ -87,6 +112,12 @@ size_t vk_region_overlay(void *at, size_t size, const char *what) {
                                      .allocationSize = mr.size, .memoryTypeIndex = mi };
         VkDeviceMemory mem = VK_NULL_HANDLE;
         VkResult r = vkAllocateMemory(vk_dev(), &mai, NULL, &mem);
+        if (r != VK_SUCCESS && cached_used && mi_std != UINT32_MAX) {
+            LOG("【黄】%s 内存换轨：类型 %u（带 HOST_CACHED）分配失败 VkResult %d，回退类型 %u",
+                what, mi, (int)r, mi_std);
+            mi = mi_std; cached_used = 0; mai.memoryTypeIndex = mi;
+            r = vkAllocateMemory(vk_dev(), &mai, NULL, &mem);
+        }
         if (r != VK_SUCCESS) {
             vkDestroyBuffer(vk_dev(), owner, NULL);
             if (try > MIN_USEFUL) continue;             // 顶到上限：退 128 MB 再试 | hit the limit: step down and retry
@@ -115,11 +146,13 @@ size_t vk_region_overlay(void *at, size_t size, const char *what) {
         g_reg[g_nreg].mem = mem; g_reg[g_nreg].owner = owner;
         g_nreg++; g_bytes += try;
         if (try < size)
-            LOG("【黄】%s 内存换轨：只换成 %llu MB（要 %llu MB）——顶到单次分配上限，报给客体的上限已相应下调",
-                what, (unsigned long long)(try >> 20), (unsigned long long)(size >> 20));
+            LOG("【黄】%s 内存换轨：只换成 %llu MB（要 %llu MB）——顶到单次分配上限，报给客体的上限已相应下调%s",
+                what, (unsigned long long)(try >> 20), (unsigned long long)(size >> 20),
+                cached_used ? "；用的是带 HOST_CACHED 的类型（越过缓冲声明的可用类型位）" : "");
         else
-            LOG("【绿】%s 内存换轨：%llu MB 已是 GPU 直接可见（%p，类型 %u）",
-                what, (unsigned long long)(try >> 20), at, mi);
+            LOG("【绿】%s 内存换轨：%llu MB 已是 GPU 直接可见（%p，类型 %u%s）",
+                what, (unsigned long long)(try >> 20), at, mi,
+                cached_used ? "，带 HOST_CACHED（越过缓冲声明的可用类型位）" : "");
         return (size_t)try;
     }
     LOG("【红】%s 内存换轨：连 %llu MB 都要不到", what, (unsigned long long)(MIN_USEFUL >> 20));

@@ -205,9 +205,11 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
    「M3-2g」）；判据按"多轮里它在干什么"读，别拿偶发那轮当基准。它盖住的面最大：画面没找到之前就停了。
 2. **那条偶发的设备丢失**（**与第 1 条可能同源，做第 1 条时顺带看**）——下一个候选是"**先丢的是谁**"。要量的：
    丢的那一刻队列上还有什么、设备是否已被客体那边先弄丢、`vkQueueSubmit` 的返回值与前后文。
-3. **「九」优化清单第 2 项**（零拷贝内存类型优先 `HOST_CACHED`）——与卡点无关，随时可做：**先验"类型 6 能不能
-   导出 fd"**，能导出再单独立一次 A/B。（第 1 项已落地，见「M3-2p」；"启动到 `nnMain` 的时间"那条 A/B 等第 1 条
-   有进展再补。）
+3. ~~**「九」优化清单第 2 项**（零拷贝内存类型优先 `HOST_CACHED`）~~ —— **已取证、已否掉（2026-10-15，「M3-2q」）**：
+   类型 6 **能**导出 fd（256 MB / 512 MB / 3968 MB 都过，`mmap` 到指定地址、双向也通），但要**越过缓冲声明的可用
+   类型位**（外部缓冲是 `0x13`，里面没有类型 6 —— 属规范外用法、靠驱动宽容），而 A/B 里 CPU 时间**没有可测差异**
+   （同峰配对 <3%，轮间波动 ±100%）：收益看不到，风险就别付，**维持类型 4**；`DM_ZC_CACHED=1` 开关留着（默认关），
+   换设备 / 换驱动时一条命令可复验。（第 1 项已落地，见「M3-2p」；"启动到 `nnMain` 的时间"那条 A/B 等第 1 条有进展再补。）
 
 ### 怎么跑一轮（新机器上的最小闭环）
 
@@ -236,7 +238,7 @@ Start-Sleep -Seconds 50
 ```
 DM_WIN_SRC=28          # 贴图查看器的源序号（0 = 关，回测试图）
 DM_WIN_LEVEL=1         # 读第几级 mip（第 0 级全零、第 1 级也全零，见上）
-DM_WATCH_STALL=0       # 看门狗只记不杀（不设就完全不看）
+DM_WATCH_STALL=0       # 注意：这不是"只记不杀"！值 ≤ 0 会被回落到 15 秒（crash.c:347-354），停住 15 秒就判死退出
 DM_NVN_SHOT_SCAN=50,54,57:/sdcard/Android/data/ai.d2rm.dm/files/scan/
 DM_PASS_AREA=1         # 渲染区取证（只读；=2 改成用附件尺寸做对照）
 ```
@@ -277,3 +279,11 @@ adb 要经 `run-as` 才看得到（`adb shell run-as ai.d2rm.dm ls -l files`）�
   管线缓存就是这么发现并改成**前台每秒定期写**的（「M3-2p」）。另外 `adb shell input keyevent` 也会被拒
   （`SecurityException: requires INJECT_EVENTS`），要让 app 退到后台得显式启动桌面：
   `adb shell am start -n com.miui.home/.launcher.Launcher`。
+- **`DM_WATCH_STALL=0` 不是"只记不杀"**（上面 `dm.conf` 里那句注释就是错的，本轮真踩了）：`crash.c:347-354` 是
+  `g_watch_stall = stall && atoi(stall) > 0 ? (unsigned)atoi(stall) : 15` —— 值 ≤ 0 **回落到 15 秒**，所以写 0 的效果是
+  "停在原地 15 秒 → 判死 → 打完现场转储 `_exit`"（「M3-2q」的 A/B 里进程在停住后十几秒消失就是这个，**不是崩溃、
+  也不是 MIUI 杀的**：日志尾巴正好是"等待点"和那份线程转储）。要**完全不看**看门狗只能**整行不写**
+  （`if (watch || stall)` 才起线程）；要长跑观察就给它一个足够大的值。
+- **MIUI 上 `adb install -r` 会被拦**：报 `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`（手机端确认弹窗
+  被取消或权限没开），而 `install_apk.cmd` 用的就是它。改用**设备端**安装立刻成功：
+  `adb push .work\apk-build\dm.apk /data/local/tmp/dm.apk` + `adb shell pm install -r /data/local/tmp/dm.apk`。

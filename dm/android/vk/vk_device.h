@@ -97,6 +97,15 @@ uint32_t vk_memory_type(VkMemoryPropertyFlags want, uint32_t need_bits);
 // GPU share the same physical memory; it is type 4 on the real device. UINT32_MAX when there is none.
 uint32_t vk_zero_copy_type(void);
 
+// 零拷贝内存类型中"另外带 HOST_CACHED"的那一份（真机上是类型 6）：客体每次读写走主机侧缓存路径，
+// 而不是像类型 4 那样的非缓存路径。**它不在缓冲声明的可用类型位里**，用它是越过规范声明（「九」第 2 项），
+// 所以换轨处默认不用它，只在 DM_ZC_CACHED=1 时优先取它、且分配失败要回退类型 4。找不到返回 UINT32_MAX。
+// The zero-copy type that additionally has HOST_CACHED (type 6 on the real device): every guest access goes through
+// the host-side cache instead of the uncached path of type 4. It is **not among the buffer's declared allowed types**,
+// so using it steps outside the spec (item 2 of "section nine"); the overlay path therefore leaves it off by default
+// and only prefers it, falling back to type 4 on allocation failure, under DM_ZC_CACHED=1. UINT32_MAX when absent.
+uint32_t vk_zero_copy_cached_type(void);
+
 // 这一段设备是否开了某个扩展 | whether this device enabled a given extension
 int vk_have_ext(const char *name);
 

@@ -210,9 +210,13 @@ Three old rules:
 2. **That sporadic device loss** (**likely the same source as item 1; watch for it while doing item 1**) -- the next
    candidate is "**who loses it first**". What to measure: what else was on the queue at that moment, whether the device
    had already been lost on the guest's side, and the `vkQueueSubmit` return value with its context.
-3. **Item 2 of the "9. Optimisation list"** (preferring `HOST_CACHED` for the zero-copy memory type) -- blocker-independent,
-   doable whenever: **first verify "can type 6 export an fd"**, and only if it can, run one A/B on its own. (Item 1 has
-   landed, see "M3-2p"; the "time to `nnMain`" A/B waits until item 1 has moved.)
+3. ~~**Item 2 of the "9. Optimisation list"** (preferring `HOST_CACHED` for the zero-copy memory type)~~ -- **measured and
+   ruled out (2026-10-15, "M3-2q")**: type 6 **can** export an fd (256 MB / 512 MB / 3968 MB all pass, `mmap` at the chosen
+   address and both directions too), but it means **stepping outside the buffer's declared allowed types** (an external
+   buffer reports `0x13`, which excludes type 6 -- outside the spec, tolerated by the driver), and the A/B shows **no
+   measurable CPU-time difference** (under 3% within the same mode, against a +-100% run-to-run spread), so **type 4 stays**
+   and the `DM_ZC_CACHED=1` switch is kept (off by default) for a one-command re-check elsewhere. (Item 1 has landed, see
+   "M3-2p"; the "time to `nnMain`" A/B waits until item 1 has moved.)
 
 ### How to run one round (the smallest loop on a new machine)
 
@@ -241,7 +245,7 @@ it and restarting the app is enough -- no reinstall.** The current one:
 ```
 DM_WIN_SRC=28          # the viewer's source serial (0 = off, back to the test pattern)
 DM_WIN_LEVEL=1         # which mip level to read (level 0 is all zero, and so is level 1; see above)
-DM_WATCH_STALL=0       # watchdog logs without killing (unset means it does not look at all)
+DM_WATCH_STALL=0       # NB: this is NOT "log without killing" -- a value <= 0 falls back to 15 s (crash.c:347-354), so a 15 s stall is declared dead and exits
 DM_NVN_SHOT_SCAN=50,54,57:/sdcard/Android/data/ai.d2rm.dm/files/scan/
 DM_PASS_AREA=1         # render-area trace (measure only; =2 swaps in the attachment size as a control)
 ```
@@ -288,3 +292,13 @@ dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
   cache was found out and moved to a **one-second foreground write** ("M3-2p"). Note also that
   `adb shell input keyevent` is refused (`SecurityException: requires INJECT_EVENTS`); to background the app, start the
   launcher explicitly: `adb shell am start -n com.miui.home/.launcher.Launcher`.
+- **`DM_WATCH_STALL=0` is *not* "log without killing"** (the comment in `dm.conf` above is wrong, and this round hit it for
+  real): `crash.c:347-354` computes `g_watch_stall = stall && atoi(stall) > 0 ? (unsigned)atoi(stall) : 15`, so a value
+  <= 0 **falls back to 15 seconds** -- writing 0 means "stalled for 15 s -> declared dead -> full dump -> `_exit`" (that is
+  why the process vanished during the A/B in "M3-2q": **not a crash and not MIUI**, the log ends on the "wait points" line
+  plus that thread dump). To turn the watchdog off entirely, **leave the line out** (`if (watch || stall)` is what starts
+  it); to observe a longer run, give it a large value.
+- **MIUI refuses `adb install -r`**: it reports `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user` (the on-device
+  confirmation is cancelled or the permission is off), and `install_apk.cmd` uses exactly that. Installing from the device
+  side works at once: `adb push .work\apk-build\dm.apk /data/local/tmp/dm.apk` then
+  `adb shell pm install -r /data/local/tmp/dm.apk`.

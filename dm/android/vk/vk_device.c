@@ -35,6 +35,7 @@ static VkQueue g_queue;
 static uint32_t g_qfi;
 static VkPhysicalDeviceMemoryProperties g_mem;
 static uint32_t g_zero_copy = UINT32_MAX;
+static uint32_t g_zero_copy_cached = UINT32_MAX;
 static int g_tried;
 static int g_dyn_render;                       // 动态渲染可用（回放层开通道的前提）| dynamic rendering available (the replay layer's precondition for opening passes)
 static int g_fill_non_solid;                   // 非实心多边形模式（线框等）| non-solid polygon modes (wireframe and such)
@@ -293,6 +294,7 @@ int vk_queue_lock_state(char *buf, size_t cap) {
 }
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void) { return &g_mem; }
 uint32_t vk_zero_copy_type(void) { return g_zero_copy; }
+uint32_t vk_zero_copy_cached_type(void) { return g_zero_copy_cached; }
 
 void vk_device_set_window(void *w) { g_window = w; }
 // 窗口换代（TERM_WINDOW 之后再 INIT_WINDOW）：旧的 surface 必须销毁，否则第二次拿到的窗口和旧 surface 对不上。
@@ -547,6 +549,18 @@ void vk_device_init(void) {
     g_zero_copy = vk_memory_type(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
 
+    // 「九」第 2 项：另记一份"也带 HOST_CACHED 的零拷贝类型"（真机上是类型 6）。它**不在缓冲声明的可用
+    // 类型位里**（真机 0x13，即类型 0/1/4），用它是越过规范声明、靠驱动宽容 —— 所以默认不用，DM_ZC_CACHED=1
+    // 才用（选择在 vk_region.c 的换轨处）。need_bits=0 时 vk_memory_type 第一轮就按 want 全含匹配，
+    // 命中的是类型 6 而不是类型 0。
+    // Item 2 of "section nine": also remember the zero-copy type that additionally has HOST_CACHED (type 6 on the
+    // real device). It is **not among the buffer's declared allowed types** (0x13 on the real device, i.e. 0/1/4),
+    // so using it steps outside the spec and relies on the driver being lenient -- hence off by default and on with
+    // DM_ZC_CACHED=1 (the choice sits in vk_region.c's overlay path). With need_bits=0, vk_memory_type matches on
+    // want in its first pass, so it lands on type 6 rather than type 0.
+    g_zero_copy_cached = vk_memory_type(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+
     if (g_zero_copy == UINT32_MAX)
         LOG("【绿】Vulkan 设备就绪：%s（Vulkan %u.%u.%u）队列族 %u；零拷贝内存类型：无；扩展 fd=%s",
             p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
@@ -558,4 +572,7 @@ void vk_device_init(void) {
             g_dyn_render && dm_vkCmdBeginRendering ? "有" : "无", g_fill_non_solid ? "有" : "无",
             g_attr_divisor ? (g_attr_divisor_zero ? "有（含 0）" : "有") : "无", "");
     if (g_zero_copy == UINT32_MAX) LOG("【红】没有 DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT 的内存类型：零拷贝内存池做不了");
+    if (g_zero_copy_cached != UINT32_MAX && g_zero_copy_cached != g_zero_copy)
+        LOG("零拷贝内存类型另有一份带 HOST_CACHED 的：类型 %u（不在缓冲声明的可用位里；DM_ZC_CACHED=1 才用它，见「九」第 2 项）",
+            g_zero_copy_cached);
 }

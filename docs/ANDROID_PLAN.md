@@ -669,11 +669,12 @@ merged, the blocker-independent items from section nine are moved in, and this r
    next candidate is "**who loses it first**", the guest's own commands or this one one-shot submit of ours. What to
    measure: what else was on the queue at that moment, whether the queue family / device had already been lost on the
    guest's side, and the `vkQueueSubmit` return value with its context.
-3. **Item 2 of section nine, `HOST_CACHED`** (low risk, blocker-independent, **doable whenever**) -- the 3.7 GB guest heap
-   sits on host-uncached memory, so every guest read/write goes down an uncached path (the evidence in item 2 of section
-   nine). **First verify "can type 6 export an fd via `vkGetMemoryFdKHR`"** (the probe has already shown type 4 can); only
-   if it can, run one A/B on its own (change only this one place, same scene and duration, comparing CPU time / frame rate
-   / time-to-join).
+3. ~~**Item 2 of section nine, `HOST_CACHED`**~~ -- **measured and ruled out (2026-10-15, "M3-2q")**: exporting an fd on
+   type 6, `mmap`-ing it at a chosen address and both directions all **work** (256 MB, 512 MB and 3968 MB alike), but the
+   same-device A/B shows **no measurable difference in CPU time** (under 3% within the same mode, while the run-to-run
+   spread is +-100%), and using it means **stepping outside the buffer's declared allowed types** (0x13 does not include
+   type 6, so it is outside the spec) -- so **type 4 stays** and the `DM_ZC_CACHED=1` switch is kept (off by default) for
+   a re-check on another device or driver.
 4. **Items 4 / 5 / 6 / 7 of section nine** (decide once the frame budget is measured) -- the per-draw repeated work (70.5%
    of the ops are pure state binding); texture uploads on a resident upload ring (same source as item 2); the hand-rolled
    pipeline tables being small (lower priority now that the `VkPipelineCache` has landed); folding pure state into the
@@ -682,13 +683,18 @@ merged, the blocker-independent items from section nine are moved in, and this r
    `.work/recon/pending_rm.md` (waiting for one "execute the deletion list"); the "time to `nnMain`" A/B left open by
    M3-2p (**only after item 1 has moved**, or the stall masks the number).
 
-**Two constraints this round brought out that apply to everything later** (recorded in "M3-2p", restated here so they are
-not forgotten):
+**Three constraints brought out so far that apply to everything later** (the first two recorded in "M3-2p", the third in
+"M3-2q", restated here so they are not forgotten):
 - **MIUI SIGKILLs on backgrounding**: `TERM_WINDOW` / `DESTROY` / `atexit` never run -- **any "persist on exit" design does
   not work on this machine**; to persist, write **periodically in the foreground** (that is exactly how the pipeline cache
   landed).
 - **`adb shell input keyevent` is refused** (`SecurityException: INJECT_EVENTS`) -- to background the app, start the
   launcher explicitly: `adb shell am start -n com.miui.home/.launcher.Launcher`.
+- **`DM_WATCH_STALL=0` does *not* mean "only log, never kill"**: in `crash.c:347-354` a value <= 0 **falls back to 15
+  seconds**, so writing 0 is the same as "stalled for 15 s -> declared dead, full dump written, `_exit`" (that is what made
+  the process vanish during this round's A/B, not a crash); to turn the watchdog off entirely, **leave the line out**.
+- Also: MIUI refuses `adb install -r` (`INSTALL_FAILED_USER_RESTRICTED`); installing from the device side
+  (`pm install -r`) works.
 
 ---
 
@@ -1445,6 +1451,66 @@ host uses `<DM_ROOT>/pipecache.bin`). For a cold-compile comparison use `DM_PIPE
 easier to reproduce than deleting the file), or delete that file; to move it, hand over a path (a line in `dm.conf` works
 too, since the config is loaded before the device is created).
 
+### M3-2q: item 2 of section nine (`HOST_CACHED`) measured and **ruled out** (2026-10-15, device)
+
+What item 2 left to verify was "**can `vkGetMemoryFdKHR` export type 6**". The probe first gained three things
+(`vk_fdmap_probe.c`: it prints **every** memory type, `DM_FD_MEM_TYPE=<index>` names the type to try, `DM_FD_FORCE=1`
+tries it even where it is excluded, `DM_FD_SIZE=<MB>` sets the size, plus a "plain versus external buffer" type-bit
+readout), and then the A/B ran on **one single binary**.
+
+**1. Probe readings** (Redmi K90 / Adreno 830):
+
+| Question | Reading |
+|---|---|
+| Allowed types of an external (exportable) buffer | `0x13` -> types 0 / 1 / **4**; **type 6 is not among them** |
+| A **plain** buffer of the same size and usage | `0x41` -> types 0 and **6** (so type 6 can back a buffer) |
+| Allocating on type 6 (`DM_FD_MEM_TYPE=6 DM_FD_FORCE=1`) | 256 MB / 512 MB / 3968 MB **all succeeded**; fd taken, `mmap(MAP_FIXED)` landed at the chosen address, buffer bound, both directions **pass** |
+| Same, in pool style (a second buffer bound at an offset in the same allocation) | succeeded; both directions at the offset pass too |
+
+=> **it can export**, but this is **outside what `vkGetBufferMemoryRequirements` declares**: the spec wants
+`memoryTypeIndex` to be one of the buffer's allowed types, and type 6 is not in `0x13` -- tolerated by the driver, i.e.
+**undefined usage**.
+
+**2. A/B** (one binary, only `DM_ZC_CACHED` changes; each run sampled `utime+stime` from `/proc/<pid>/stat` at a fixed
+**10-second** wall clock):
+
+| Run | zero-copy type | presents | draws (with target) | CPU ticks |
+|---|---|---|---|---|
+| A1 | 4 | 52 | 3,154 | 778 |
+| B1 | 6 | 170 | 59,430 | 1,805 |
+| A2 | 4 | 56 | 4,671 | 920 |
+| B2 | 6 | 59 | 3,574 | 888 |
+| A3 | 4 | 169 | 59,610 | 1,804 |
+| B3 | 6 | 52 | 3,154 | 770 |
+
+**Conclusion: no measurable gain, so the item is ruled out and type 4 stays.** CPU ticks simply track the amount of work:
+about 3,154 draws ~ 780 ticks and 59,600 draws ~ 1,805 ticks, on both sides alike; **within the same mode the difference
+is under 3%** (early-stall mode: A median 849 / B median 829; running mode: 1,804 / 1,805), while the **run-to-run spread
+is +-100%** (this device's old habit: stalling at present 50 versus reaching 170+). The wall-clock time to "present 50"
+also varies a lot (3.5 s versus 14.5 s) while the CPU time barely moves -- that difference is **waiting** (GPU
+synchronisation / I/O), unrelated to these two memory types. No gain to be had while a real risk (undefined usage) is
+paid, so it is not changed.
+
+**What is left**: the overlay path **explicitly** prefers the zero-copy type with `HOST_CACHED` and **falls back to type 4**
+when it is missing or the allocation fails (`vk_region.c`), under `DM_ZC_CACHED=1` (**off by default**, so the default
+behaviour is exactly as before); the probe keeps the switches above for a one-command re-check on another device or driver.
+
+**3. Traps hit this round (written down so they are not walked into again)**:
+
+- **`vk_memory_type`'s fallback rung lands on type 0.** Changing to "prefer `HOST_CACHED`" by only adding a bit to `want`
+  makes the second pass of `vk_memory_type` (`vk_device.c:370-378`, "take the first type allowed by `need_bits`") return
+  **type 0 (pure `DEVICE_LOCAL`)** -- zero-copy breaks on the spot. The correct shape, which the overlay path now uses, is
+  to take the `HOST_CACHED` **zero-copy** type explicitly and fall back to type 4.
+- **MIUI refuses `adb install -r`**: it reports `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user` (the on-device
+  confirmation is cancelled or the permission is off), which is exactly what `install_apk.cmd` uses. Installing from the
+  device side works at once: `adb push .work\apk-build\dm.apk /data/local/tmp/dm.apk` then
+  `adb shell pm install -r /data/local/tmp/dm.apk`.
+- **`DM_WATCH_STALL=0` is *not* "only log, never kill"** (the comment in `dm.conf` is wrong): `crash.c:347-354` computes
+  `g_watch_stall = stall && atoi(stall) > 0 ? atoi(stall) : 15`, so a value <= 0 **falls back to 15 seconds** -- writing 0
+  means "stalled for 15 s -> declared dead -> dump -> `_exit`". That is why the process vanished during this round's A/B
+  (not a crash, not MIUI). To turn the watchdog off entirely, leave the line out (`if (watch || stall)` is what starts it);
+  to observe a longer run, give it a large value.
+
 ---
 
 ## 9. Optimisation list (**for confirmation**, recorded 2026-10-14)
@@ -1458,7 +1524,7 @@ The order is by value for money (gain over risk), not by effort.
 | # | Item | In one line | Risk | When |
 |---|---|---|---|---|
 | 1 | Create a `VkPipelineCache` and persist it (**done**, see "M3-2p") | No pipeline cache at all today, so every launch compiles from scratch | Low | landed 2026-10-15 |
-| 2 | Ask for `HOST_CACHED` for the zero-copy type | The 3.7 GB guest heap sits on **host-uncached** memory | Low-medium | alongside 1 |
+| 2 | Ask for `HOST_CACHED` for the zero-copy type (**measured, and ruled out**) | Type 6 can export an fd, but there is no measurable CPU-time difference and it steps outside the buffer's declared types | -- | closed ("M3-2q") |
 | 3 | `renderArea` (**measured, and ruled out**) | 16384 pass opens on the device: the main scene agrees on all three, so the blocker is not here | -- | closed ("M3-2m") |
 | 4 | The per-draw repeated work | Pipeline lookup + two descriptor sets + a full rewrite + rebinding | Medium | after the blocker is measured |
 | 5 | Texture uploads on a resident upload ring | "One-off submit plus a queue-idle wait", and it has already shown `DEVICE_LOST` | Medium | with item 3 of "next steps" |
@@ -1488,24 +1554,32 @@ nothing".
 (`DM_PIPE_CACHE=0` versus warm). What is established today is only that the cache is reused (part 3 of "M3-2p"); the time
 A/B waits until the usual stall has moved.
 
-### 2. Ask for `HOST_CACHED` for the zero-copy memory type
+### 2. Ask for `HOST_CACHED` for the zero-copy memory type (**measured, and ruled out**, 2026-10-15, see "M3-2q")
 
-**Evidence**: `vk_device.c:326-327` asks for `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`, and `vk_memory_type`
+**Original evidence**: `vk_device.c:326-327` asks for `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`, and `vk_memory_type`
 (`vk_device.c:154-162`) **returns the first match** -> type 4. The project's own probe (M2 step 1) recorded
-type 6 = `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`.
+type 6 = `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`. Had it been usable, the 3.7 GB guest heap plus the 512 MB
+alias region would have left the uncached path (game logic, vertex/constant building and texture uploads all live there)
+and matched Apple's cacheable `MTLResourceStorageModeShared`.
 
-**What it costs**: the whole 3.7 GB guest heap plus the 512 MB alias region sit on **host-uncached** memory, so every
-guest access takes the uncached path (game logic, vertex/constant building and texture uploads all live there). Apple's
-`MTLResourceStorageModeShared` is cacheable on Apple silicon, so the two sides are not equivalent.
+**Measurement (device)**: on type 6 exporting an fd **works**, `mmap` lands at the chosen address and both directions pass
+(256 MB / 512 MB / 3968 MB all did), **but type 6 is not among the buffer's declared allowed types** (an external buffer
+reports `0x13`: types 0 / 1 / 4, while a plain buffer of the same size and usage reports `0x41`, which includes type 6) --
+so using it is **outside the spec**, tolerated by the driver.
 
-**Suggestion**: ask for `...|HOST_CACHED` first and fall back to the current set (which needs one more rung in
-`vk_memory_type`).
+**A/B (device)**: same machine, same scene, CPU time (`utime+stime`) sampled at a fixed 10-second wall clock, type 6 versus
+type 4 shows **no measurable difference** (under 3% within the same mode, against a +-100% run-to-run spread; CPU time
+simply tracks the number of draws). **No gain to be had, a real risk (undefined usage) to be paid => ruled out, type 4
+stays.**
 
-**How to measure**: change only this one place and A/B it -- same scene, same duration, CPU time / frame rate / time into
-a game.
+**What is left behind**: the overlay path **explicitly** prefers the zero-copy type with `HOST_CACHED` and **falls back to
+type 4** when it is missing or the allocation fails (`vk_region.c`), controlled by `DM_ZC_CACHED=1` (**off by default**, so
+the default behaviour is exactly as before); the probe gained `DM_FD_MEM_TYPE` / `DM_FD_FORCE` / `DM_FD_SIZE` plus the
+plain-versus-external type-bit readout.
 
-**To verify first**: whether `vkGetMemoryFdKHR` works on type 6 (the probe verified type 4, not type 6) -- settle that
-before changing anything.
+**How to re-check** (another device or driver):
+`DM_FD_SIZE=3968 DM_FD_MEM_TYPE=6 DM_FD_FORCE=1 vk_fdmap_probe` (can it export) plus one run with `DM_ZC_CACHED=1`
+comparing CPU time (is there a gain).
 
 ### 3. Stop deriving `renderArea` from the viewport (top suspect for the blocker)
 

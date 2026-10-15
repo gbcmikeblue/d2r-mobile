@@ -14,6 +14,11 @@
 //   ① 列出所有名字含 external 的设备扩展（不管认不认识，先看清楚有什么）
 //   ② 对 dma-buf 与不透明 fd 两种句柄，用 vkGetPhysicalDeviceExternalBufferProperties **在分配前**问支持情况
 //   ③ 支持的话真做一遍：分配可导出内存 → 取 fd → mmap 到指定地址 → 验 CPU / GPU 双向
+//   ④ 用哪一份内存类型可以由 DM_FD_MEM_TYPE=<索引> 指定（不设就沿用自动选择：第一个零拷贝类型）——
+//      「九」第 2 项要验的正是"类型 6（带 HOST_CACHED）能不能导出 fd"，而自动选择命中的是类型 4；
+//      若指定的类型不在这块缓冲的可用类型位里，再加 DM_FD_FORCE=1 就照样硬试一次（问的是驱动认不认）
+//   ⑤ 试多大由 DM_FD_SIZE=<MB> 指定（不设 256 MB）：真实换轨是 3.7 GB 堆 + 512 MB 别名区，
+//      「真实尺寸上类型 6 还成不成立」得能试到那个尺寸
 //
 // M2's fourth capability probe: can Vulkan memory be exported as an fd and mmap'd by the host at a
 // **chosen address**?
@@ -37,6 +42,13 @@
 //       **before allocating anything**
 //   (3) if supported, actually do it: allocate exportable memory, get the fd, mmap it at a chosen address,
 //       and verify both directions
+//   (4) which memory type is tried can be named with DM_FD_MEM_TYPE=<index> (unset keeps the automatic
+//       choice, the first zero-copy type) -- item 2 of "section nine" is exactly "can type 6, the one with
+//       HOST_CACHED, be exported as an fd", and the automatic choice lands on type 4; if the named type is
+//       not among the buffer's allowed types, DM_FD_FORCE=1 still tries it once (the question is whether the
+//       driver accepts it)
+//   (5) how much to try is named by DM_FD_SIZE=<MB> (unset: 256 MB): a real overlay is a 3.7 GB heap plus a
+//       512 MB alias area, and "does type 6 still hold at the real size" has to reach that size
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +69,19 @@ static void feat_name(VkExternalMemoryFeatureFlags f, char *out, size_t n) {
     if (f & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)       strncat(out, "EXPORTABLE|", n - strlen(out) - 1);
     if (f & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)       strncat(out, "IMPORTABLE|", n - strlen(out) - 1);
     if (!out[0]) strncat(out, "（都不支持）", n - strlen(out) - 1);
+}
+
+// 内存类型属性的名字（「九」第 2 项要拿类型 6 与类型 4 对照，别再靠记忆认编号）
+// Names of a memory type's property flags (item 2 of "section nine" compares type 6 against type 4, so the
+// numbering is no longer read from memory)
+static void mem_flags_name(VkMemoryPropertyFlags f, char *out, size_t n) {
+    out[0] = 0;
+    if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)  strncat(out, "DEVICE_LOCAL|", n - strlen(out) - 1);
+    if (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)  strncat(out, "HOST_VISIBLE|", n - strlen(out) - 1);
+    if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) strncat(out, "HOST_COHERENT|", n - strlen(out) - 1);
+    if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)   strncat(out, "HOST_CACHED|", n - strlen(out) - 1);
+    if (f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) strncat(out, "LAZILY_ALLOCATED|", n - strlen(out) - 1);
+    if (!out[0]) strncat(out, "（无）", n - strlen(out) - 1);
 }
 
 int main(void) {
@@ -133,7 +158,18 @@ int main(void) {
 
     // ---- ③ 真做一遍：可导出内存 → fd → 指定地址 mmap → 双向验 | (3) do it for real ----
     // 先占住想要的那段地址（模拟客体 heap 该在的位置）| first take the address we want (simulating where the guest heap should be)
-    const size_t wsz = 256 * 1024 * 1024;   // 先拿 256 MB 试，方案成立再上 4 GB | try 256 MB first, scale to 4 GB once the approach holds
+    // 试多大：DM_FD_SIZE=<MB> 指定。真实换轨是 3.7 GB 堆 + 512 MB 别名区，所以大尺寸必须够得着 ——
+    // 「九」第 2 项要问的正是"真实尺寸上类型 6 还成不成立"；不设仍是 256 MB。
+    // How much to try: DM_FD_SIZE=<MB> names it. A real overlay is a 3.7 GB heap plus a 512 MB alias area, so
+    // large sizes have to be reachable -- item 2 of "section nine" asks exactly whether type 6 still holds at
+    // the real size; unset stays at 256 MB.
+    size_t wsz = 256 * 1024 * 1024;
+    const char *sz_env = getenv("DM_FD_SIZE");
+    if (sz_env && *sz_env) {
+        long long mb = atoll(sz_env);
+        if (mb <= 0) { fprintf(stderr, "【红】DM_FD_SIZE=%s 不像是 MB 数\n", sz_env); return 1; }
+        wsz = (size_t)mb << 20;
+    }
     void *want = mmap(NULL, wsz, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (want == MAP_FAILED) { perror("mmap 预留"); return 1; }
     printf("预留地址 %p（%zu MB），下面要把 Vulkan 内存摆到这里\n", want, wsz >> 20);
@@ -154,12 +190,68 @@ int main(void) {
     printf("缓冲要求 size %llu MB / alignment %llu、可用内存类型位 %#x\n",
            (unsigned long long)(mr.size >> 20), (unsigned long long)mr.alignment, mr.memoryTypeBits);
 
-    uint32_t mi = UINT32_MAX;
+    // 对照：**不带 external** 的同样缓冲，可用类型位是多少？
+    // 这一问决定结论落在哪：普通缓冲也不含类型 6 ⇒ 类型 6 在这台设备上根本不能做缓冲，「九」第 2 项就此结案；
+    // 普通缓冲含类型 6 而外部缓冲不含 ⇒ 是"外部分配把类型 6 排除掉了"，那是另一件事。
+    // Control: the same buffer **without external** -- which types does it allow?
+    // This decides where the conclusion lands: a plain buffer that also lacks type 6 means type 6 simply cannot back
+    // a buffer on this device and item 2 of "section nine" is closed; a plain one that has type 6 while the external
+    // one does not means external allocation is what excludes it, which is a different matter.
+    VkBufferCreateInfo pbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = wsz,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer pb = VK_NULL_HANDLE; VKOK(vkCreateBuffer(dev, &pbci, NULL, &pb));
+    VkMemoryRequirements pmr; vkGetBufferMemoryRequirements(dev, pb, &pmr);
+    vkDestroyBuffer(dev, pb, NULL);
+    printf("对照：同一尺寸/用途的普通缓冲（不带 external）可用类型位 %#x（外部缓冲是 %#x）\n",
+           pmr.memoryTypeBits, mr.memoryTypeBits);
+
+    // 先把这台设备的全部内存类型打出来：哪种是类型 6 由输出说话，不靠记忆（「九」第 2 项要拿它和类型 4 对照）
+    // First print every memory type of this device: which one is type 6 is what the output says, not memory
+    // (item 2 of "section nine" compares it against type 4)
+    printf("=== 这台设备的内存类型 ===\n");
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
-        if (!(mr.memoryTypeBits & (1u << i))) continue;
-        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
-        if ((f & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-            (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { mi = i; break; }
+        char fn[160];
+        mem_flags_name(mp.memoryTypes[i].propertyFlags, fn, sizeof fn);
+        printf("  类型 %u：%s heap %u，这张缓冲%s可用\n", i, fn, mp.memoryTypes[i].heapIndex,
+               (mr.memoryTypeBits & (1u << i)) ? "" : "不");
+    }
+
+    // 试哪一份内存类型：DM_FD_MEM_TYPE=<索引> 点一个；不设则沿用原来的自动选择（第一个零拷贝类型，真机上是类型 4）
+    // Which memory type to try: DM_FD_MEM_TYPE=<index> names one; unset keeps the original automatic choice
+    // (the first zero-copy type, which is type 4 on the real device)
+    const char *mt_env = getenv("DM_FD_MEM_TYPE");
+    uint32_t mi = UINT32_MAX;
+    if (mt_env && *mt_env) {
+        long v = strtol(mt_env, NULL, 10);
+        if (v < 0 || (uint32_t)v >= mp.memoryTypeCount) {
+            fprintf(stderr, "【红】DM_FD_MEM_TYPE=%s 越界：这台设备共 %u 个内存类型\n", mt_env, mp.memoryTypeCount);
+            return 1;
+        }
+        mi = (uint32_t)v;
+        if (!(mr.memoryTypeBits & (1u << mi))) {
+            // 不在这块缓冲的可用类型位里也不一定就放弃：DM_FD_FORCE=1 时照样试一次 —— 问的正是"驱动认不认"
+            // Not being among the buffer's allowed types is not necessarily a dead end: with DM_FD_FORCE=1 it is
+            // tried anyway -- the question is exactly "does the driver accept it"
+            const char *force = getenv("DM_FD_FORCE");
+            if (force && *force && *force != '0') {
+                printf("【黄】类型 %u 不在这块缓冲可用的类型里（%#x），DM_FD_FORCE 已设：照样试一次\n",
+                       mi, mr.memoryTypeBits);
+            } else {
+                fprintf(stderr, "【红】类型 %u 不在这块缓冲可用的类型里（%#x）：这一份分配上试不了它"
+                                "（要硬试就设 DM_FD_FORCE=1）\n", mi, mr.memoryTypeBits);
+                return 1;
+            }
+        }
+        char fn[160];
+        mem_flags_name(mp.memoryTypes[mi].propertyFlags, fn, sizeof fn);
+        printf("按 DM_FD_MEM_TYPE 指定类型 %u：%s\n", mi, fn);
+    } else {
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+            if (!(mr.memoryTypeBits & (1u << i))) continue;
+            VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+            if ((f & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { mi = i; break; }
+        }
     }
     if (mi == UINT32_MAX) { fprintf(stderr, "【红】这块缓冲没有零拷贝内存类型\n"); return 1; }
 
