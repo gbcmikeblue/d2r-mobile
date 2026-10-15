@@ -43,11 +43,27 @@ Android 侧最小工具集（版本是当前实测能用的那一套）：
 
 Python 环境：`python -m venv .venv`，再 `.venv\Scripts\pip install pillow numpy lz4 capstone unicorn`。
 
-### 装完必改的硬编码路径
+### 工具链路径：**不要**改文件
 
-`dm\android\apk\build_apk.cmd:22-27` 和 `dm\android\apk\install_apk.cmd:13` 里写死了上一台机器的绝对路径（NDK / JDK / build-tools / CMake / ninja / android.jar / adb），换机器必须改这两段。`.work\apk-build`、`.work\apk-keys` 是相对脚本自身推导的，不用动。
+**正常情况下不用改**：`dm\android\apk\build_apk.cmd` 与 `dm\android\apk\install_apk.cmd` 都不再写死任何工具路径 —— 全部交给
+`dm\android\apk\toolchain.cmd` **一处**决定，它按下面的顺序发现（谁先说话算数）：
 
-**实测（第二台机器）**：要改的只有 **JDK 一行**（`build_apk.cmd:23`）——NDK / build-tools / CMake / android.jar 只要按上面那张表装到 `C:\Android\Sdk`，就与文档里写的一致；`install_apk.cmd:13` 的 adb 路径同理。改完直接 `build_apk.cmd` 出包通过。
+1. `DM_SDK_ROOT` / `DM_NDK` / `DM_BUILD_TOOLS` / `DM_CMAKE` / `DM_PLATFORM` / `DM_JDK` 显式覆盖
+2. 机器自己声明的 `JAVA_HOME` / `ANDROID_SDK_ROOT` / `ANDROID_HOME`
+3. 已知落点里**取最新的一版**（JDK 优先 `jdk-21*`，再退到任意 `jdk-*`）
+4. 兜底：Android Studio 自带的 `jbr`，最后是 `PATH` 上的 `java`
+
+**装到别处**就用上面那些 `DM_*` 或 `ANDROID_HOME` 指过去（任选一个），**不必改仓库里的任何文件**。选中哪一条会在构建
+开头打出来（"结论不该靠记忆"）。
+
+`.work\apk-build`、`.work\apk-keys` 是相对脚本自身推导的，本来就不用动。
+
+**为什么 JDK 单独值得这条规则**：Adoptium 把目录名从 `jdk-21.0.12.1+1` 改成 `jdk-21.0.12.101-hotspot` ——**主版本没变、
+目录名会变**——于是"按文档装同一版 JDK"也会得到不一样的路径。SDK 侧那些版本号是 SDK Manager 起的，按文档装就一致。
+
+**历史**（这次重构之前的状态，仅作记录）：`build_apk.cmd:22-27` 和 `install_apk.cmd:13` 写死了 NDK / JDK / build-tools /
+CMake / ninja / android.jar / adb 七条绝对路径，前两台机器实测都只动了 JDK 一行（Adoptium 目录改名那一次）；现在这七条
+全部走 `toolchain.cmd`，仓库里再没有任何"上一台机器的路径"。
 
 ### 三个由游戏文件生成的头文件（不在上面那张表里）
 
@@ -164,7 +180,7 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
-> **这一节会过期。** 记于 2026-10-14，对应提交 `ea71aab`；进度细节与结论以
+> **这一节会过期。** 记于 2026-10-15（基线提交 `0033dc9`，另含本轮**未提交**的管线缓存落盘改动）；进度细节与结论以
 > [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 的「七、下一步」与「八、进度记录」为准。
 
 ### 现在停在哪
@@ -172,6 +188,9 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 - **M1 完成**：宿主在安卓上装载改写产物、接管服务层、跑完 SDK 初始化、进 `nnMain`。
 - **渲染链路的告警已清空**：描述符的空白（UBO 名字号 −3、SSBO 由 `cb_offset` 反推、缓冲区贴图）与顶点属性的那条判据
   （两个独立的错，见「M3-2k」「M3-2l」）。
+- **「九」优化清单第 1 项已落地（2026-10-15）**：图形与计算共用一个 `VkPipelineCache`、落盘、下次启动载回
+  （「M3-2p」）。真机四轮读数：无缓存→写出 0.6 MB；有缓存→载入 636 KB 并继续追加；坏文件与"假设备号"两份都被挡住。
+  **它顺带照出一条真机事实**：MIUI 把这个包当游戏，退到后台直接 SIGKILL —— 想持久化就得**前台定期写**（见下面「坑」）。
 - **卡点**：绘制在发（每轮约 40 万次、图形管线 78~84 条、零失败），但**渲染目标读出来是全零**。
   `DM_NVN_SHOT_SCAN` 现在**逐级**读（第 0/1/2 级各一次），在够得着的帧（50/54/57）上**每张都是 `亮度 均值 0.0`**
   （「M3-2m」第六节）。也就是说：**画面还没有被写到能读的地方**，或者"读"这一侧还有没照到的问题。
@@ -186,6 +205,8 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
    要量的东西：丢的那一刻队列上还有什么、设备是否已被客体那边先弄丢、`vkQueueSubmit` 的返回值与前后文。
 2. **继续找画面**：逐级扫已就位，但只在够得着的帧上；要拿更晚的帧，得先弄清"为什么停在这里"（上面那条常态）。
 3. **「九」优化清单**第 1/2 项（`VkPipelineCache` 落盘、零拷贝内存类型优先 `HOST_CACHED`）——与卡点无关，随时可做。
+   **第 1 项已落地**（2026-10-15，「M3-2p」），只剩"启动到 `nnMain` 的时间"那条 A/B 待补；下面能做的就是**第 2 项**
+   （先验"类型 6 能不能导出 fd"，再单独立一次 A/B）。
 
 ### 怎么跑一轮（新机器上的最小闭环）
 
@@ -220,7 +241,12 @@ DM_PASS_AREA=1         # 渲染区取证（只读；=2 改成用附件尺寸做�
 ```
 
 其余可用开关在 `dm/android/` 里搜 `getenv`（`DM_NVN_SHOT`、`DM_NVN_SHOT_ALL`、`DM_GFX_PROBE`、`DM_NO_DEPTH_TEST`、
-`DM_NO_TEXEL`、`DM_NVN_SPV_DIR`、`DM_NVN_FACTS`、`DM_ROOT/DM_ROMFS/DM_SAVE`）。
+`DM_NO_TEXEL`、`DM_NVN_SPV_DIR`、`DM_NVN_FACTS`、`DM_ROOT/DM_ROMFS/DM_SAVE`、`DM_PIPE_CACHE`）。
+
+**管线缓存**（2026-10-15 起）：落盘位置是 **app 内部目录** `/data/user/0/ai.d2rm.dm/files/pipecache.bin`，
+adb 要经 `run-as` 才看得到（`adb shell run-as ai.d2rm.dm ls -l files`）；控制台宿主则用 `<DM_ROOT>/pipecache.bin`。
+想从零编译做对照就加一行 `DM_PIPE_CACHE=0`（或在配置里给一个别的路径）。写盘**走的是前台每秒心跳**那一跳，
+不是"退出时"——原因见下面「坑」里那一条。
 
 产物落在：
 
@@ -229,6 +255,7 @@ DM_PASS_AREA=1         # 渲染区取证（只读；=2 改成用附件尺寸做�
 | `/sdcard/Android/data/ai.d2rm.dm/files/logs/latest.log` | 本轮日志（上一轮是 `prev.log`） |
 | `/sdcard/Android/data/ai.d2rm.dm/files/scan/` | 逐级扫描里"有内容"才落盘的 PNG |
 | `/data/local/tmp/dm/` | 运行时数据（`patched` / `spv` / `romfs`），**只读**，见第五节 |
+| `/data/user/0/ai.d2rm.dm/files/pipecache.bin` | 管线缓存（app 内部目录，`run-as` 可见；见上面那段） |
 
 **手机截屏**落 PNG 时**别在 PowerShell 里用 `>`**（写成 UTF-16 就废了）——写一个 `.cmd` 用 cmd 的重定向，规矩同第六节。
 
@@ -243,3 +270,9 @@ DM_PASS_AREA=1         # 渲染区取证（只读；=2 改成用附件尺寸做�
   真机表现是"**启动就停住、出图 0 次**"（看门狗只报 `拍 0`），看着像游戏卡死。上传现在有**自己的命令缓冲**
   （`g_cb_up`，「M3-2o」），不需要那把锁。
 - **加锁前先列"谁持着什么调进来"**：上面那条死锁就是这么来的，判据是"撤掉那一处，出图立刻恢复常态"。
+- **这台机上"退到后台"等于"被杀"**：MIUI 把这个包按游戏处理（logcat `ANDR-PWR-OPT: GAMEPOWEROPT: isGame()`），
+  按 HOME 之后系统直接 `libc: kill: send 9`（SIGKILL），**`TERM_WINDOW` / `DESTROY` / `atexit` 一个都跑不到**
+  （两轮实测：pid 在退到后台 6 秒内消失，日志里没有 `窗口那一套已拆`）。所以"靠退出时落盘"的设计在本机不成立 ——
+  管线缓存就是这么发现并改成**前台每秒定期写**的（「M3-2p」）。另外 `adb shell input keyevent` 也会被拒
+  （`SecurityException: requires INJECT_EVENTS`），要让 app 退到后台得显式启动桌面：
+  `adb shell am start -n com.miui.home/.launcher.Launcher`。

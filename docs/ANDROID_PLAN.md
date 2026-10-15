@@ -624,6 +624,22 @@ The port is currently being driven from a Windows machine. These are the traps a
   `JAVA_HOME`; the key is made with `keytool` and kept under `.work` only). With `android:hasCode="false"` in the
   manifest **no dex is needed**, so the whole chain needs no Java source at all. Scripts: `dm/android/apk/build_apk.cmd`
   and `install_apk.cmd`.
+- **Toolchain paths** are decided in **one** place, `dm/android/apk/toolchain.cmd` (called by the two scripts above):
+  `JAVA_HOME` / `ANDROID_SDK_ROOT` / `ANDROID_HOME` / `DM_SDK_ROOT` / `DM_NDK` / `DM_BUILD_TOOLS` / `DM_CMAKE` /
+  `DM_PLATFORM` / `DM_JDK` -- any one of them overrides. **A new machine needs no edit of any file in the repo.** See
+  section 2 of `docs/CROSS_MACHINE.md`.
+
+### cmd script discipline (each of these bit when writing toolchain.cmd)
+
+- In `if cond set A & set B` the `&` **escapes the if** and B runs unconditionally -> always write `if cond (set A & set B)`.
+- **A `rem` line is not pure comment**: the `&`, pipe, `>` and `<` inside it are treated as separators and redirection
+  -> none of them appear in the comments here.
+- **Never** use substring substitution `%VAR:STR=REPL%` or position syntax `%VAR~n,m%` **inside an `if` condition**: cmd's
+  `%` matching on an `if` line is greedy and boundary-guessing, and once it tangles with `==` it misreads (the visible
+  symptoms are "syntax incorrect" or an echo that shows the parts concatenated). **Set into a temp first, then compare
+  plain variable names.**
+- **Never** put `for /f ... 2^>nul` inside a parenthesised block `( ... )`: parsing inside the block differs from the top
+  level and the error is again "syntax incorrect". Keep `for /f` at the top level or in a subroutine.
 
 ## 7. Next step
 
@@ -635,7 +651,10 @@ attribute test ("M3-2l": two independent faults, one of them caught by a probe).
 reading level 0 texture by texture gives **all zero**, and going **level by level** is still **all zero** (33 level reads
 at frame 50, **0 with content**). The "the viewer reads content at level 1" found in between was stale heap bytes read at
 a **wrong pitch**, and with the pitch fixed both sides agree (part six of "M3-2m") -- **step 14's conclusion stands**;
-what changed is that the instrument is now trustworthy. What follows is ordered by value:
+what changed is that the instrument is now trustworthy. **Item 1 of section nine (persisting the pipeline cache) landed
+on 2026-10-15** ("M3-2p"): it is unrelated to the blocker, so the five items below keep their order, and the device fact
+it brought out (MIUI SIGKILLs on backgrounding, so the hooks never run) is recorded there too. What follows is ordered by
+value:
 
 1. **Chase that device loss** (part two of "M3-2o" and part six of "M3-2l") -- `【红】一次性提交等待失败 VkResult -4` is
    still **sporadic** (about once per run), followed by a hundred-plus `贴图上传失败` lines. Uploads **are already** off
@@ -1343,6 +1362,70 @@ tally was still counting the old string `上传命令等待失败` -- so the fir
 record "not fixed" as "fixed". **Changing a log line's text changes the measuring stick**: the script that reads it has to
 change too, or count both strings before concluding.
 
+### M3-2p: the pipeline cache lands on disk -- item 1 of section nine is done (2026-10-15, device)
+
+Item 1 of section nine (one `VkPipelineCache` **shared** by graphics and compute, persisted and loaded back on the next
+launch) is done and verified on a Redmi K90 / Adreno 830. This section records three things: **where it lands**, **why the
+blob needs a header**, and **a device fact worth more than the cache itself** (the backgrounding route does not work here
+at all).
+
+**1. Where it lands** (three places):
+
+| Where | What it does |
+|---|---|
+| `vk_device.c` | creation, loading and writing all live in this layer: `pcache_boot` (`vk_device.c:134`, called once the device exists), `vk_device_pcache_save` (`185`), `vk_device_pcache_tick` (`246`), `vk_dev_pcache` / `_lock` / `_unlock` (from `103`); the call inside `vk_device_init` is at `543` |
+| `vk_pipe.c` | both `vkCreate*Pipelines` calls take `vk_dev_pcache()` instead of `VK_NULL_HANDLE`: compute `287-289`, graphics `668-670` |
+| `main_apk.c` | `DM_PIPE_CACHE` defaults to the app's **internal** directory (`609-617`; `/data/local/tmp` is read-only for the APK); `vk_device_pcache_tick()` runs in the one-second heartbeat (`683`); TERM_WINDOW (`549`) and DESTROY (`555`) each write once |
+
+Why the **device layer** rather than the pipeline layer: where the blob came from has to be checked against the device and
+driver, and the path depends on which process is running (the APK may only write its internal directory) -- the device layer
+knows both. **Pipeline creation must be serialised by the caller** (Vulkan requires external synchronisation on a
+`VkPipelineCache`), hence the lock, which the write-back path shares -- which is why those two sites in `vk_pipe.c` are
+`lock / vkCreate / unlock` rather than a single line.
+
+**2. Why a header sits in front of the blob**: what `vkGetPipelineCacheData` returns is **tied to the driver and the
+device**, and after a driver change the whole thing must be dropped (both the official sample and zeux.io's "Robust
+pipeline cache serialization" call this out). The header carries vendor / device / driver / api plus
+`VkPhysicalDeviceProperties::pipelineCacheUUID` (`vk_device.c:83`); a mismatch means the blob is **not used at all** --
+compiling from scratch beats a stale cache. Both negative tests were exercised on the device (C1 / C2 below).
+
+**3. Device readings** (four runs, `DM_WIN_SRC=28`, `DM_WIN_LEVEL=1`):
+
+| Run | Cache at start | Log (`logs/latest.log`) |
+|---|---|---|
+| A | none | `管线缓存：没有可用的旧缓存…从零编译` then `写入 0.0 MB` (first pipeline) then `0.6 MB` |
+| B | 651 KB | `【绿】管线缓存：载入 636.0 KB`, then growing to `743.1 KB` while reused (appended onto the old one) |
+| C1 | 4 KB of random bytes | `【黄】管线缓存的头不认得：丢弃，从零编译` |
+| C2 | 64 B, valid header, fake device id | `【黄】管线缓存的来历与这台设备对不上（设备 0x0000→0x44050001、驱动 1→2150760519）：丢弃` |
+
+Where the file lands: `/data/user/0/ai.d2rm.dm/files/pipecache.bin` (visible through
+`adb shell run-as ai.d2rm.dm ls -l files`, around 641 KB). C2 incidentally brought out two numbers for this machine:
+`deviceID = 0x44050001` and `driverVersion = 2150760519`.
+(Runs A / C1 / C2 still used the version that printed everything in MB, so the first pipeline reads `0.0 MB`; anything
+below 1 MB is now printed in KB -- `0.0 MB` cannot be told apart between "one pipeline just went in" and "the cache is
+nearly empty", which is why that was changed on the way.)
+
+**4. The device fact this round brought out (worth more than the cache itself)**: **the backgrounding route does not work
+on this machine**. On going home, MIUI classifies this package as a game (logcat:
+`ANDR-PWR-OPT: GAMEPOWEROPT: isGame() ai.d2rm.dm is Game = 1`) and immediately **`libc: kill: send 9` (SIGKILL)**: the
+`TERM_WINDOW` never reaches us, the log holds no `窗口那一套已拆`, and `atexit` never runs either. Two runs agree (the pid
+disappears within 6 seconds of going to the background). So on this machine the "exit / background" hooks **never fire
+once** -- what actually gets the blob onto disk is the **foreground periodic write-back** (`vk_device_pcache_tick`: once a
+second, writing only when the data has grown, rate-limited to every 10 seconds). It costs little: new pipelines cluster
+around startup and the first scene, so the writes do too; it is a 0.6 MB blob, a `.tmp` file plus a rename (so a SIGKILL
+never leaves half a file).
+
+**5. What has not been measured yet** ("how to measure" in item 1 of section nine): **time to `nnMain` and the first-scene
+hitch** need a cold-versus-warm A/B on one device, and the usual stall from "M3-2o" (a stall at `CharacterCreate:Hover:
+Barbarian` a dozen seconds in) would mask that number, so that A/B waits until the stall has moved. What is established
+today is that the cache really is reused: in run B, after loading 636 KB the file **kept growing** to 743 KB, which is
+appending onto the old cache.
+
+**6. How to use it / how to turn it off**: it is automatic by default (the APK uses its internal directory, the console
+host uses `<DM_ROOT>/pipecache.bin`). For a cold-compile comparison use `DM_PIPE_CACHE=0` (turning the whole path off is
+easier to reproduce than deleting the file), or delete that file; to move it, hand over a path (a line in `dm.conf` works
+too, since the config is loaded before the device is created).
+
 ---
 
 ## 9. Optimisation list (**for confirmation**, recorded 2026-10-14)
@@ -1355,7 +1438,7 @@ The order is by value for money (gain over risk), not by effort.
 
 | # | Item | In one line | Risk | When |
 |---|---|---|---|---|
-| 1 | Create a `VkPipelineCache` and persist it | No pipeline cache at all today, so every launch compiles from scratch | Low | first |
+| 1 | Create a `VkPipelineCache` and persist it (**done**, see "M3-2p") | No pipeline cache at all today, so every launch compiles from scratch | Low | landed 2026-10-15 |
 | 2 | Ask for `HOST_CACHED` for the zero-copy type | The 3.7 GB guest heap sits on **host-uncached** memory | Low-medium | alongside 1 |
 | 3 | `renderArea` (**measured, and ruled out**) | 16384 pass opens on the device: the main scene agrees on all three, so the blocker is not here | -- | closed ("M3-2m") |
 | 4 | The per-draw repeated work | Pipeline lookup + two descriptor sets + a full rewrite + rebinding | Medium | after the blocker is measured |
@@ -1363,22 +1446,28 @@ The order is by value for money (gain over risk), not by effort.
 | 6 | The hand-rolled pipeline tables are small and destroy on evict | `GPSO_TAB 192` / `CPSO_TAB 256` | Low | after 1 |
 | 7 | 70.5% of the op stream is pure state binding | State is carried twice (record and replay) | High (largest surface) | M3/M4 |
 
-### 1. Create a `VkPipelineCache` and persist it (biggest gain, lowest risk)
+### 1. Create a `VkPipelineCache` and persist it (biggest gain, lowest risk) -- **done (2026-10-15, see "M3-2p")**
 
-**Evidence**: both pipeline creations pass `VK_NULL_HANDLE` (`vk_pipe.c:284`, `vk_pipe.c:660`), and there is no
-`vkCreatePipelineCache` anywhere in the tree.
+**Where it landed**: `pcache_boot` / `vk_device_pcache_save` / `vk_device_pcache_tick` in `vk_device.c` (one cache shared
+by graphics and compute); both `vkCreate*Pipelines` calls take `vk_dev_pcache()` instead of `VK_NULL_HANDLE`
+(`vk_pipe.c:287-289`, `668-670`); the path comes from `DM_PIPE_CACHE` (the app defaults to its internal directory).
+**The trap in the original test still holds**: the blob is tied to the driver and device and must be dropped after a
+driver change (the header carries vendor/device/driver/api plus `pipelineCacheUUID`, and both negative tests were
+exercised on the device). One device fact changed the original design: **the backgrounding route does not work under
+MIUI** (SIGKILL on going to the background, part 4 of "M3-2p"), so the main path to disk is the **foreground periodic
+write-back**, not the exit / background hooks.
+
+**The original evidence (before the change)**: both pipeline creations passed `VK_NULL_HANDLE` (`vk_pipe.c:284`,
+`vk_pipe.c:660`), and there was no `vkCreatePipelineCache` anywhere in the tree.
 
 **What it costs**: no driver-level dedup inside a run, and a from-scratch compile on every run. Android compiles the
 SPIR-V **at runtime** (there is no iOS-style "offline metallib" path), so this item is exactly the Android counterpart of
 the iOS advantage "every shader is translated offline and compiled ahead of time, so entering a new scene compiles
 nothing".
 
-**Suggestion**: one `VkPipelineCache` shared by graphics and compute; `vkGetPipelineCacheData` to app-private storage on
-exit and on backgrounding, loaded back through `VkPipelineCacheCreateInfo::pInitialData` on the next launch. **The blob
-must be stored together with the driver version and the device identity** and discarded when either changes -- the trap
-named by both the official sample and zeux.io's "Robust pipeline cache serialization".
-
-**How to measure**: time to `nnMain` and the first-scene hitch, on one device, two runs (cold cache versus warm).
+**How to measure (**still to do**)**: time to `nnMain` and the first-scene hitch, on one device, two runs
+(`DM_PIPE_CACHE=0` versus warm). What is established today is only that the cache is reused (part 3 of "M3-2p"); the time
+A/B waits until the usual stall has moved.
 
 ### 2. Ask for `HOST_CACHED` for the zero-copy memory type
 
@@ -1471,6 +1560,6 @@ state into the shadow **at record time** so it never enters the stream at all (o
 
 1. Item 1 of "next steps" (the re-scan) plus item 3 here as a **measurement** -- parallel, zero risk, and it answers
    "where the blocker is" directly;
-2. item 1 (`VkPipelineCache` + persistence) -- lowest risk, the direct counterpart of iOS's "compiled ahead of time";
+2. ~~item 1 (`VkPipelineCache` + persistence)~~ -- **done** ("M3-2p"); only the "time to `nnMain`" A/B is left;
 3. item 2 (`HOST_CACHED`) -- verify "can type 6 export an fd" first, then A/B it on its own;
 4. items 4 / 5 / 6 / 7 once the frame budget has been measured.

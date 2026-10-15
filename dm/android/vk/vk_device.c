@@ -20,10 +20,13 @@
 #include <android/native_window.h>   // ANativeWindow（surface 的窗口类型）| ANativeWindow, the surface's window type
 #include "vk_device.h"
 #include "dm.h"
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>   // 定期写回的限频（见 vk_device_pcache_tick）| for the tick's rate limit
 
 static VkInstance g_inst;
 static VkPhysicalDevice g_phys;
@@ -41,6 +44,219 @@ static VkExtensionProperties *g_exts; static uint32_t g_nexts;
 static void *g_window;                         // 窗口（M3）：有它才开 surface / 交换链 / 呈现队列 | the window (M3): with it, surface, swapchain and the present queue are enabled
 static VkSurfaceKHR g_surf;
 static int g_present_fam = -1;                 // 能呈现的队列族；-1 = 没有 | the queue family that can present; -1 = none
+
+// ---------- 管线缓存（VkPipelineCache，图形与计算共用）----------
+// 为什么要有（docs/ANDROID_PLAN「九」第 1 项）：安卓是**运行时**编译 SPIR-V（没有 iOS 那条"离线编好 metallib"的路），
+// 而本仓建管线一直传 VK_NULL_HANDLE —— 进程内没有驱动级去重，跨进程每次都从零编译。建一个图形与计算**共用**的缓存，
+// 把 blob 落到可写目录，下次启动用 pInitialData 载回：这就是 iOS"预先编好、进场景不现编"的安卓对应物。
+// blob 什么时候写：**前台定期**（vk_device_pcache_tick，真机上这条是主力）+ 切后台（TERM_WINDOW）+ 退出
+// （atexit / DESTROY）。为什么不能只靠后两条：MIUI 把这个包按游戏处理，退到后台直接 SIGKILL，那些回调一次都跑不到
+// （实测记录见 vk_device_pcache_tick 上面那段）。
+// 三条约束决定了下面的形状：
+//   ① blob **与驱动/设备绑定**（换驱动后必须丢弃）：所以文件前面压一个头，带上 vendor/device/driver/api 与
+//      PPhysicalDeviceProperties::pipelineCacheUUID；对不上直接不用（宁可从零编译，也不要一份脏缓存）；
+//   ② 对 VkPipelineCache 的访问**必须由调用方串行化**（建管线与取数据都碰它）：所以配一把锁，建管线前后要配
+//      vk_dev_pcache_lock/unlock（见 vk_pipe.c 的两处）；
+//   ③ 路径由 **DM_PIPE_CACHE** 给；没给就退回 <DM_ROOT>/pipecache.bin（控制台宿主在 shell 下可写）。APK 侧由
+//      main_apk.c 指到 app 的**内部**目录 —— /data/local/tmp 对 APK 只读（SELinux），写在那儿只会静默失败。
+//      DM_PIPE_CACHE=0 表示整体关掉（做"清缓存 / 带缓存"的 A/B 用）。
+// ---------- The pipeline cache (shared by graphics and compute) ----------
+// Why it exists (item 1 of section "nine" in docs/ANDROID_PLAN): Android compiles SPIR-V **at run time** (there is no
+// offline-metallib route like iOS's) while this repo has always passed VK_NULL_HANDLE when creating pipelines -- no
+// driver-level dedup inside the process and a from-scratch compile across processes. One cache **shared** by graphics
+// and compute, its blob written to a writable directory on exit and background, and loaded back through pInitialData on
+// the next start, is the Android counterpart of iOS's "precompiled, nothing compiled when entering a scene".
+// Three constraints shape what follows:
+//   1. the blob is **tied to the driver and device** (it must be dropped after a driver change), so a header carrying
+//      vendor/device/driver/api plus VkPhysicalDeviceProperties::pipelineCacheUUID sits in front of it; a mismatch means
+//      it is not used at all (compiling from scratch beats a stale cache);
+//   2. access to a VkPipelineCache **must be serialised by the caller** (both creating pipelines and reading the data
+//      touch it), hence the lock and the vk_dev_pcache_lock/unlock pairs at the two sites in vk_pipe.c;
+//   3. the path comes from **DM_PIPE_CACHE**, falling back to <DM_ROOT>/pipecache.bin (writable for the console host
+//      under adb shell). On the APK side main_apk.c points it at the app's **internal** directory -- /data/local/tmp is
+//      read-only for the APK (SELinux) and a write there would fail silently. DM_PIPE_CACHE=0 disables it outright
+//      (for the "clear / keep" A/B).
+#define PC_MAGIC 0x43504d44u        // "DMPC"（小端读出）| "DMPC" as read little-endian
+#define PC_HDR_VER 1u               // 头的版本：以后改字段就加这个号 | header version, bumped when fields change
+#define PC_MAX (256u << 20)         // 上限 256 MB：超过就当文件坏了或串了味，宁可不用 | cap at 256 MB; beyond that the file is treated as corrupt or foreign and not used
+
+typedef struct {
+    uint32_t magic, hdr_ver;
+    uint32_t vendor_id, device_id, driver_version, api_version;
+    uint8_t uuid[VK_UUID_SIZE];     // VkPhysicalDeviceProperties::pipelineCacheUUID
+    uint32_t blob_size;
+    uint32_t reserved;
+} pcache_hdr;
+
+static VkPipelineCache g_pcache;
+static pthread_mutex_t g_pcache_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_pcache_off;            // DM_PIPE_CACHE=0：整体关掉 | cache turned off outright
+static int g_pcache_atexit;         // 写回钩子只登记一次 | the write-back hook is registered once
+static char g_pcache_path[512];
+// 定期写回（见 vk_device_pcache_tick）：上一次成功写出的字节数与时刻
+// Periodic write-back (see vk_device_pcache_tick): the size and time of the last successful write
+static size_t g_pcache_saved_n;
+static double g_pcache_last_save;
+
+void vk_dev_pcache_lock(void) { pthread_mutex_lock(&g_pcache_mu); }
+void vk_dev_pcache_unlock(void) { pthread_mutex_unlock(&g_pcache_mu); }
+VkPipelineCache vk_dev_pcache(void) { return g_pcache; }
+
+// 字节数按可读单位打：一律用 MB 的话，"0.0 MB"分不出是"刚建了一条管线"还是"缓存几乎是空的"
+// A readable unit for a byte count: always printing MB turns "0.0 MB" into something that cannot be told apart
+// between "one pipeline just went in" and "the cache is nearly empty"
+static void pc_size(char *buf, size_t cap, size_t n) {
+    if (n >= (1u << 20)) snprintf(buf, cap, "%.1f MB", (double)n / 1048576.0);
+    else if (n >= 1024) snprintf(buf, cap, "%.1f KB", (double)n / 1024.0);
+    else snprintf(buf, cap, "%zu B", n);
+}
+
+static const char *pcache_path(void) {
+    const char *e = getenv("DM_PIPE_CACHE");
+    if (e && *e) {
+        if (!strcmp(e, "0")) { g_pcache_off = 1; return NULL; }
+        snprintf(g_pcache_path, sizeof g_pcache_path, "%s", e);
+        return g_pcache_path;
+    }
+    const char *root = getenv("DM_ROOT");
+    snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipecache.bin", (root && *root) ? root : ".");
+    return g_pcache_path;
+}
+
+// 进程退出时写回：APK 正常退出与控制台宿主 return 都走它（切后台另有一条显式调用，见 main_apk.c）
+// Write back on process exit: both the APK's normal exit and the console host's return go through it (the background
+// case has an explicit call, see main_apk.c)
+static void pcache_exit_save(void) { vk_device_pcache_save("进程退出"); }
+
+// 建缓存：有可用的旧 blob 就载入，没有就建一个空的。**必须在设备建好之后调**（要设备属性来核对来历）。
+// Create the cache: load a usable old blob when there is one, otherwise create an empty one. **Call it only after the
+// device exists** (the device properties are needed to check where the blob came from).
+static void pcache_boot(const VkPhysicalDeviceProperties *p) {
+    const char *path = pcache_path();
+    if (g_pcache_off) { LOG("管线缓存：DM_PIPE_CACHE=0，本次不用缓存（每次都现编）"); return; }
+    void *blob = NULL;
+    size_t n = 0;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        pcache_hdr h;
+        if (fread(&h, sizeof h, 1, f) != 1 || h.magic != PC_MAGIC || h.hdr_ver != PC_HDR_VER) {
+            LOG("【黄】管线缓存的头不认得（%s）：丢弃，从零编译", path);
+        } else if (h.vendor_id != p->vendorID || h.device_id != p->deviceID || h.driver_version != p->driverVersion ||
+                   h.api_version != p->apiVersion || memcmp(h.uuid, p->pipelineCacheUUID, VK_UUID_SIZE)) {
+            // 换驱动 / 换设备：官方样例与 zeux.io《Robust pipeline cache serialization》都点名这条必须自己挡
+            // A driver or device change: both the official samples and zeux.io's "Robust pipeline cache serialization"
+            // call this out as something the caller has to catch
+            LOG("【黄】管线缓存的来历与这台设备对不上（设备 0x%04x→0x%04x、驱动 %u→%u）：丢弃，从零编译",
+                h.device_id, p->deviceID, h.driver_version, p->driverVersion);
+        } else if (h.blob_size == 0 || h.blob_size > PC_MAX) {
+            LOG("【黄】管线缓存的大小不合（%u 字节）：丢弃", h.blob_size);
+        } else if (!(blob = malloc(h.blob_size))) {
+            LOG("【黄】管线缓存读不进来：%u 字节的缓冲分配不出", h.blob_size);
+        } else if (fread(blob, 1, h.blob_size, f) != h.blob_size) {
+            LOG("【黄】管线缓存只有半截（%s）：丢弃", path);
+            free(blob); blob = NULL;
+        } else {
+            n = h.blob_size;
+        }
+        fclose(f);
+    }
+    VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    if (n) { ci.initialDataSize = n; ci.pInitialData = blob; }
+    VkResult r = vkCreatePipelineCache(g_dev, &ci, NULL, &g_pcache);
+    if (r != VK_SUCCESS) {
+        LOG("【黄】建 VkPipelineCache 失败：VkResult %d（管线照常建，只是每次都现编）", (int)r);
+        g_pcache = VK_NULL_HANDLE;
+    } else if (n) {
+        char sz[32];
+        pc_size(sz, sizeof sz, n);
+        LOG("【绿】管线缓存：载入 %s（%s）——本次启动的管线编译可复用", sz, path);
+    } else {
+        LOG("管线缓存：没有可用的旧缓存（%s）——这次从零编译，退出时写一份", path);
+    }
+    free(blob);
+    if (!g_pcache_atexit) { g_pcache_atexit = 1; atexit(pcache_exit_save); }
+}
+
+// 取数据并写回。**先写 .tmp 再改名**：进程被系统直接杀掉时（ANR/OOM）不会留下一份半截的缓存，下次启动照着它建
+// 缓存只会把错误带进下一轮。切后台（TERM_WINDOW）与退出（DESTROY/atexit）各调一次。
+// Fetch the data and write it back. It goes to a .tmp file first and is renamed: when the system kills the process
+// outright (ANR/OOM) no half-written cache is left behind, which would otherwise carry the damage into the next run.
+// It is called on background (TERM_WINDOW) and on exit (DESTROY/atexit).
+void vk_device_pcache_save(const char *why) {
+    if (!g_dev || !g_pcache || g_pcache_off) return;
+    const char *path = pcache_path();
+    if (!path) return;
+    vk_dev_pcache_lock();
+    size_t n = 0;
+    VkResult r = vkGetPipelineCacheData(g_dev, g_pcache, &n, NULL);
+    if (r != VK_SUCCESS || n == 0 || n > PC_MAX) {
+        vk_dev_pcache_unlock();
+        LOG("管线缓存：取出数据为空（%zu 字节，VkResult %d；%s）——还没建过管线就退了？", n, (int)r, why);
+        return;
+    }
+    void *blob = malloc(n);
+    if (!blob) { vk_dev_pcache_unlock(); LOG("【黄】管线缓存取不出来：%zu 字节的缓冲分配不出", n); return; }
+    r = vkGetPipelineCacheData(g_dev, g_pcache, &n, blob);
+    vk_dev_pcache_unlock();
+    if (r != VK_SUCCESS) { free(blob); LOG("【黄】管线缓存取不出来：VkResult %d（%s）", (int)r, why); return; }
+
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(g_phys, &p);
+    pcache_hdr h;
+    memset(&h, 0, sizeof h);
+    h.magic = PC_MAGIC; h.hdr_ver = PC_HDR_VER;
+    h.vendor_id = p.vendorID; h.device_id = p.deviceID;
+    h.driver_version = p.driverVersion; h.api_version = p.apiVersion;
+    memcpy(h.uuid, p.pipelineCacheUUID, VK_UUID_SIZE);
+    h.blob_size = (uint32_t)n;
+
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { free(blob); LOG("【黄】管线缓存写不进 %s：%s", tmp, strerror(errno)); return; }
+    int ok = fwrite(&h, sizeof h, 1, f) == 1 && fwrite(blob, 1, n, f) == n && fflush(f) == 0;
+    fclose(f);
+    free(blob);
+    if (!ok) { LOG("【黄】管线缓存写了一半（%s）：丢掉，不留半截", tmp); remove(tmp); return; }
+    if (rename(tmp, path) != 0) { LOG("【黄】管线缓存落位失败（%s → %s）：%s", tmp, path, strerror(errno)); remove(tmp); return; }
+    g_pcache_saved_n = n;
+    char sz[32];
+    pc_size(sz, sizeof sz, n);
+    LOG("【绿】管线缓存：写出 %s 到 %s（%s）", sz, path, why);
+}
+
+// 前台定期写回：每秒调一次，**数据长过就写**（没长过就什么都不做），且限频 10 秒。
+// 为什么必须有这条：真机上"切后台"这条路走不通 —— MIUI 把这个包按「游戏」处理（logcat 里
+// `ANDR-PWR-OPT: GAMEPOWEROPT: isGame() ai.d2rm.dm is Game = 1`），退到后台时系统直接
+// `kill: send 9`（SIGKILL），`TERM_WINDOW` 送不到我们手里，所以退出/切后台那两个钩子一次都不会跑
+// （实测两轮都是：pid 在 6 秒内消失、日志里没有 `窗口那一套已拆`）。前台定期写回是唯一能落盘的时机。
+// 代价：每次写几 MB（`.tmp` + 改名），限频 10 秒、且只在"新管线建过"时才写 —— 管线主要在启动与首次
+// 进场景时新增，所以实际写入很集中，不会一直写盘。
+// Periodic write-back while in the foreground: called once a second, it writes **only when the data has grown**
+// (otherwise it does nothing) and at most once every 10 seconds.
+// Why it is mandatory: on the real device the "background" route does not work -- MIUI classifies this package as a
+// game (`ANDR-PWR-OPT: GAMEPOWEROPT: isGame() ai.d2rm.dm is Game = 1` in logcat) and kills it outright with
+// `kill: send 9` (SIGKILL) when it goes to the background, so `TERM_WINDOW` never reaches us and neither exit nor
+// background hook ever runs (measured twice: the pid disappears within 6 seconds and the log holds no
+// "窗口那一套已拆"). The foreground tick is the only chance to get the blob onto disk.
+// What it costs: a few MB per write (a `.tmp` file plus a rename), rate-limited to once every 10 seconds and only
+// when new pipelines have appeared -- new pipelines cluster around startup and the first scene, so the writes stay
+// concentrated rather than continuous.
+#define PC_SAVE_MIN_INTERVAL 10.0
+void vk_device_pcache_tick(void) {
+    if (!g_dev || !g_pcache || g_pcache_off) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    if (now - g_pcache_last_save < PC_SAVE_MIN_INTERVAL) return;
+    vk_dev_pcache_lock();
+    size_t n = 0;
+    VkResult r = vkGetPipelineCacheData(g_dev, g_pcache, &n, NULL);
+    vk_dev_pcache_unlock();
+    if (r != VK_SUCCESS || n == 0 || n == g_pcache_saved_n) return;   // 没长过 = 没建新管线，不必写 | unchanged means no new pipeline: nothing to write
+    g_pcache_last_save = now;
+    vk_device_pcache_save("前台新建了管线");
+}
 
 VkInstance vk_instance(void) { return g_inst; }
 VkDevice vk_dev(void) { return g_dev; }
@@ -320,6 +536,11 @@ void vk_device_init(void) {
         g_dyn_render = 0;
         LOG("【黄】取不到 vkCmdBeginRendering / vkCmdEndRendering：渲染通道退回只记状态");
     }
+
+    // 管线缓存：设备已经在了，可以按这台设备/这个驱动的来历去核对旧 blob（见本文件上面那段说明）
+    // Pipeline cache: the device exists now, so an old blob can be checked against this device/driver's identity
+    // (see the note further up in this file)
+    pcache_boot(&p);
 
     // 零拷贝内存类型：DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT（真机上是类型 4，heap 0 有 15 GB）
     // Zero-copy memory type: DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT (type 4 on the real device, whose heap 0 has 15 GB)

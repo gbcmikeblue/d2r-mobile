@@ -63,6 +63,30 @@ void vk_queue_note(const char *phase);
 int vk_queue_lock_state(char *buf, size_t cap);   // 写一行"持有者 tid / 在做什么"；返回 1 = 有人持有 | Writes one line "holder tid / what for"; 1 = held
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void);
 
+// ---------- 管线缓存（VkPipelineCache，图形与计算共用；说明见 vk_device.c 里那一整段）----------
+// 为什么在设备层：它的来历要与设备/驱动核对，落盘路径也要与"哪个进程在跑"有关（APK 只能写 app 内部目录）。
+// 用法就是一句话：把 vk_dev_pcache() 传给 vkCreate*Pipelines 的 cache 参数，**外面套一对 lock/unlock**
+// （Vulkan 要求对 VkPipelineCache 的访问由调用方串行化，写盘那条路也走同一把锁）。
+// ---------- The pipeline cache (shared by graphics and compute; the full note is in vk_device.c) ----------
+// Why it lives in the device layer: where the blob came from has to be checked against the device and driver, and the
+// path depends on which process is running (the APK may only write its internal directory). In use it is one line:
+// hand vk_dev_pcache() to the cache parameter of vkCreate*Pipelines, **wrapped in a lock/unlock pair** (Vulkan requires
+// the caller to serialise access to a VkPipelineCache, and the write-back path takes the same lock).
+VkPipelineCache vk_dev_pcache(void);             // 设备没起来或没建成为 VK_NULL_HANDLE | VK_NULL_HANDLE when the device is down or creation failed
+void vk_dev_pcache_lock(void);
+void vk_dev_pcache_unlock(void);
+// 切后台 / 退出时写回（先 .tmp 再改名，被 SIGKILL 不会留半截）。可重复调用（第二次起只是再写一遍）。
+// Write back on background / exit (via a .tmp file then rename, so a SIGKILL leaves no half-written file). Safe to call
+// repeatedly (a second call simply writes again).
+void vk_device_pcache_save(const char *why);
+
+// 前台每秒调一次：数据长过就写（限频 10 秒，见 vk_device.c 里那段说明）。**真机上这条是主力**：
+// MIUI 把这个包当游戏，退到后台直接 SIGKILL，切后台/退出那两个钩子都不会跑。
+// Call it once a second while in the foreground: it writes when the data has grown (rate-limited to 10 seconds; see the
+// note in vk_device.c). **On the real device this is the main path**: MIUI treats this package as a game and SIGKILLs it
+// on backgrounding, so neither the background nor the exit hook ever runs.
+void vk_device_pcache_tick(void);
+
 // 在满足 need_bits 的类型里找属性最贴近 want 的一个；找不到返回 UINT32_MAX。
 // Find the type that satisfies need_bits and whose properties best match want; UINT32_MAX when there is none.
 uint32_t vk_memory_type(VkMemoryPropertyFlags want, uint32_t need_bits);

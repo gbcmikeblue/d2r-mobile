@@ -281,7 +281,13 @@ static VkResult make_compute(const vk_shader *cs, VkPipelineLayout lay, VkPipeli
         .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs->mod, .pName = "main" };
     VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                        .stage = st, .layout = lay };
-    return vkCreateComputePipelines(vk_dev(), VK_NULL_HANDLE, 1, &ci, NULL, out);
+    // 走那个图形与计算共用的管线缓存（见 vk_device.c 里那段说明）：建管线要外部串行化，所以套一对锁
+    // Through the pipeline cache shared by graphics and compute (see the note in vk_device.c); pipeline creation needs
+    // external serialisation, hence the lock pair
+    vk_dev_pcache_lock();
+    VkResult r = vkCreateComputePipelines(vk_dev(), vk_dev_pcache(), 1, &ci, NULL, out);
+    vk_dev_pcache_unlock();
+    return r;
 }
 
 VkPipeline vk_pipe_compute(const vk_shader *cs) {
@@ -657,7 +663,11 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
         .pColorBlendState = &cbs, .pDynamicState = &dsi, .layout = lay };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(vk_dev(), VK_NULL_HANDLE, 1, &ci, NULL, &p);
+    // 同计算管线：走共用的管线缓存（建管线要外部串行化，套一对锁）
+    // Same as the compute path: through the shared pipeline cache (creation needs external serialisation, hence the lock)
+    vk_dev_pcache_lock();
+    VkResult r = vkCreateGraphicsPipelines(vk_dev(), vk_dev_pcache(), 1, &ci, NULL, &p);
+    vk_dev_pcache_unlock();
     if (r != VK_SUCCESS) {
         g_n_fail++;
         LOG("【红】建图形管线失败：VkResult %d（顶点 %s 片元 %s，属性 %u 条、流 %u 条、目标 %u 个、拓扑 %d）",

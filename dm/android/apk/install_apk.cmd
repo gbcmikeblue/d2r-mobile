@@ -10,7 +10,10 @@ set "APKDIR=%~dp0"
 pushd "%APKDIR%..\..\.."
 set "REPO=%CD%"
 popd
-set "ADB=C:\Android\Sdk\platform-tools\adb.exe"
+rem 路径同样由 toolchain.cmd 一处决定（装到别处时设 DM_SDK_ROOT / ANDROID_HOME 即可，不必改本文件）
+rem Paths likewise come from one place, toolchain.cmd (installed elsewhere? set DM_SDK_ROOT / ANDROID_HOME, no edit here)
+call "%APKDIR%toolchain.cmd" || exit /b 2
+if not exist "%ADB%" ( echo [红] 缺 adb：%ADB%（platform-tools 没装；装别处就设 DM_SDK_ROOT/ANDROID_HOME）& exit /b 2 )
 set "APK=%REPO%\.work\apk-build\dm.apk"
 if not exist "%APK%" ( echo [红] 没有 %APK%，先跑 build_apk.cmd & exit /b 2 )
 

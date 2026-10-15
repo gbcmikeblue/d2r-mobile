@@ -543,11 +543,16 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
             }
             break;
         case APP_CMD_TERM_WINDOW:
+            // 切后台：趁设备还在，把管线缓存写回（下次启动直接复用；不写就得等下一次切后台或退出）
+            // Backgrounded: write the pipeline cache back while the device is still alive (the next start reuses it;
+            // otherwise it waits for the next background or exit)
+            vk_device_pcache_save("切后台 TERM_WINDOW");
             vk_win_shutdown();
             vk_device_drop_surface();
             LOGI("窗口那一套已拆（TERM_WINDOW）");
             break;
         case APP_CMD_DESTROY:
+            vk_device_pcache_save("活动结束 DESTROY");
             LOGI("活动结束，退出");
             break;
         default:
@@ -592,6 +597,25 @@ void android_main(struct android_app *app) {
     log_pipe_start();   // 先接日志：它之后的宿主输出全部进 logcat | route the log first: every host line after this reaches logcat
     LOGI("启动（NativeActivity + app_glue；上屏走宿主那一个设备）");
     conf_load();
+    // 管线缓存落盘的位置：app 的**内部**目录（native 侧可写）。不指的话 vk_device.c 会退回 <DM_ROOT>/pipecache.bin，
+    // 而 /data/local/tmp 对 APK 只读（SELinux：壳数据是 shell_data_file）——写在那儿只会静默失败，缓存等于没有。
+    // 放在这里（而不是 on_cmd 里那段 setenv）是因为设备在 INIT_WINDOW 时就建了，那会儿缓存路径已经要定下来；
+    // dm.conf 里若也写了 DM_PIPE_CACHE，以它为准（配置先加载）。
+    // Where the pipeline cache blob goes: the app's **internal** directory (writable from native code). Without this
+    // vk_device.c falls back to <DM_ROOT>/pipecache.bin, and /data/local/tmp is read-only for the APK (SELinux: shell
+    // data is shell_data_file) -- writing there fails silently and there is effectively no cache. It is done here rather
+    // than in the setenv block of on_cmd because the device is created at INIT_WINDOW, by which time the cache path must
+    // already be settled; a DM_PIPE_CACHE in dm.conf wins (the config is loaded first).
+    if (!getenv("DM_PIPE_CACHE")) {
+        const char *in = (app->activity && app->activity->internalDataPath) ? app->activity->internalDataPath
+                                                                           : "/data/data/ai.d2rm.dm/files";
+        char pc[512];
+        snprintf(pc, sizeof pc, "%s/pipecache.bin", in);
+        setenv("DM_PIPE_CACHE", pc, 1);
+        LOGI("管线缓存：%s（切后台与退出时写回）", pc);
+    } else {
+        LOGI("管线缓存：DM_PIPE_CACHE=%s（配置给的）", getenv("DM_PIPE_CACHE"));
+    }
     // 启动头：时间、进程号、构建时间、以及真正生效的开关（"结论不该靠记忆"，这一行让每次日志自带参数）
     // The startup header: time, pid, build time and the switches actually in effect (a conclusion should not rest on
     // memory, so every log carries its own parameters)
@@ -634,6 +658,7 @@ void android_main(struct android_app *app) {
         while (ALooper_pollOnce(timeout, NULL, &events, (void **)&src) >= 0) {
             if (src) src->process(app, src);
             if (app->destroyRequested) {
+                vk_device_pcache_save("退出 destroyRequested");
                 vk_win_shutdown();
                 free(g_img);
                 LOGI("退出");
@@ -650,6 +675,12 @@ void android_main(struct android_app *app) {
             static double last_hb;
             if (now - last_hb >= 1.0) {
                 last_hb = now;
+                // 管线缓存定期写回（限频 10 秒、只在新建过管线时写）。**这条是主力**：MIUI 把本包当游戏，
+                // 退到后台直接 SIGKILL，TERM_WINDOW / DESTROY 都送不到，只有前台这一刻能落盘。
+                // Periodic write-back of the pipeline cache (at most once every 10 s, only when new pipelines
+                // appeared). **This is the main path**: MIUI treats this package as a game and SIGKILLs it on
+                // backgrounding, so TERM_WINDOW / DESTROY never arrive and only the foreground can reach disk.
+                vk_device_pcache_tick();
                 uint64_t p = vk_present_count();
                 static char dl[640];
                 vk_diag_line(dl, sizeof dl);

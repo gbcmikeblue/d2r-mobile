@@ -41,11 +41,30 @@ dotnet 10 is needed only to regenerate `.work/spv`. Xcode, spirv-cross and xcode
 
 Python environment: `python -m venv .venv`, then `.venv\Scripts\pip install pillow numpy lz4 capstone unicorn`.
 
-### Hardcoded paths that must be edited after installing
+### Toolchain paths: **do not** edit a file
 
-`dm\android\apk\build_apk.cmd:22-27` and `dm\android\apk\install_apk.cmd:13` hardcode the previous machine's absolute paths (NDK / JDK / build-tools / CMake / ninja / android.jar / adb), so both blocks have to be edited on a new machine. `.work\apk-build` and `.work\apk-keys` are derived relative to the scripts themselves and need no change.
+**Normally nothing needs editing.** `dm\android\apk\build_apk.cmd` and `dm\android\apk\install_apk.cmd` no longer hard-code any
+tool path -- everything is decided in **one** place, `dm\android\apk\toolchain.cmd`, which discovers in this order (first match
+wins):
 
-**Measured (second machine)**: only the **JDK line** had to change (`build_apk.cmd:23`) -- install the NDK / build-tools / CMake / android.jar under `C:\Android\Sdk` as the table above says and they land exactly where the document points; the adb path in `install_apk.cmd:13` likewise. With that one edit, `build_apk.cmd` produced a package straight away.
+1. an explicit override: `DM_SDK_ROOT` / `DM_NDK` / `DM_BUILD_TOOLS` / `DM_CMAKE` / `DM_PLATFORM` / `DM_JDK`
+2. what the machine itself declares: `JAVA_HOME` / `ANDROID_SDK_ROOT` / `ANDROID_HOME`
+3. the **newest** version under the known install roots (JDK prefers `jdk-21*`, then any `jdk-*`)
+4. fallbacks: the `jbr` that ships with Android Studio, then `java` on `PATH`
+
+**Installed elsewhere?** Use any of `DM_*` or `ANDROID_HOME` to point at it; **no file in the repo needs editing.** What was
+chosen is printed at the top of the build ("a conclusion should not rest on memory").
+
+`.work\apk-build` and `.work\apk-keys` are derived relative to the scripts themselves and never needed editing.
+
+**Why the JDK deserves this rule by itself**: Adoptium renamed its directory from `jdk-21.0.12.1+1` to
+`jdk-21.0.12.101-hotspot` -- **same major version, different directory name** -- so "install the JDK the doc names" still
+yields an inconsistent path. The SDK-side version names come from the SDK Manager, so following the doc keeps them identical.
+
+**History** (state before this refactor, recorded for the record): `build_apk.cmd:22-27` and `install_apk.cmd:13` hard-coded
+the seven absolute paths (NDK / JDK / build-tools / CMake / ninja / android.jar / adb); on the first two machines only the
+JDK line ever had to change (the one time Adoptium renamed the directory). All seven now go through `toolchain.cmd`, and the
+repo no longer carries "the previous machine's path".
 
 ### The three headers generated from the game files (not in the table above)
 
@@ -156,13 +175,19 @@ Three old rules:
 
 ## 7. Where things stand and what comes next (hand-over: start here)
 
-> **This section goes stale.** Written 2026-10-14 against commit `ea71aab`; for the detail and the conclusions, the
-> authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its "7. Next step" and "8. Progress log".
+> **This section goes stale.** Written 2026-10-15 against commit `0033dc9` plus this round's **uncommitted** pipeline-cache
+> change; for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its "7. Next step" and
+> "8. Progress log".
 
 ### Where it stops
 
 - **M1 is done**: the host loads the patched artifact on Android, takes over the service layer, finishes SDK
   initialisation and reaches `nnMain`.
+- **Item 1 of the "9. Optimisation list" landed (2026-10-15)**: one `VkPipelineCache` shared by graphics and compute,
+  written to disk and loaded back on the next launch ("M3-2p"). Four device runs: with no cache it writes 0.6 MB; with one
+  it loads 636 KB and keeps appending; a corrupt file and one with a fake device id were both rejected. **It also brought
+  out a device fact**: MIUI treats this package as a game and SIGKILLs it on backgrounding -- persisting anything means
+  writing **periodically in the foreground** (see the traps below).
 - **The rendering chain's warnings are cleared**: the descriptor blanks (UBO name number minus 3, the storage buffer
   derived from `cb_offset`, buffer textures) and the vertex-attribute test (two independent faults; see "M3-2k" and
   "M3-2l").
@@ -184,7 +209,9 @@ Three old rules:
 2. **Keep hunting the picture**: the level-by-level scan is in place but only on reachable frames; reaching a later frame
    first needs "why does it stop here" answered (the normal thing above).
 3. **Items 1 and 2 of the "9. Optimisation list"** (persisting a `VkPipelineCache`, preferring `HOST_CACHED` for the
-   zero-copy memory type) -- unrelated to the blocker, doable whenever.
+   zero-copy memory type) -- unrelated to the blocker, doable whenever. **Item 1 is done** (2026-10-15, "M3-2p"); only the
+   "time to `nnMain`" A/B is left. What is actionable below is therefore **item 2** (verify "can type 6 export an fd"
+   first, then A/B it on its own).
 
 ### How to run one round (the smallest loop on a new machine)
 
@@ -219,7 +246,13 @@ DM_PASS_AREA=1         # render-area trace (measure only; =2 swaps in the attach
 ```
 
 The other switches are whatever `getenv` picks up in `dm/android/` (`DM_NVN_SHOT`, `DM_NVN_SHOT_ALL`, `DM_GFX_PROBE`,
-`DM_NO_DEPTH_TEST`, `DM_NO_TEXEL`, `DM_NVN_SPV_DIR`, `DM_NVN_FACTS`, `DM_ROOT/DM_ROMFS/DM_SAVE`).
+`DM_NO_DEPTH_TEST`, `DM_NO_TEXEL`, `DM_NVN_SPV_DIR`, `DM_NVN_FACTS`, `DM_ROOT/DM_ROMFS/DM_SAVE`, `DM_PIPE_CACHE`).
+
+**The pipeline cache** (since 2026-10-15) lands in the app's **internal** directory,
+`/data/user/0/ai.d2rm.dm/files/pipecache.bin`; adb only sees it through `run-as`
+(`adb shell run-as ai.d2rm.dm ls -l files`), while the console host uses `<DM_ROOT>/pipecache.bin`. For a cold-compile
+comparison add a `DM_PIPE_CACHE=0` line (or point it somewhere else in the config). It is written by the **one-second
+foreground heartbeat**, not "on exit" -- the reason is one of the traps below.
 
 Where the output lands:
 
@@ -228,6 +261,7 @@ Where the output lands:
 | `/sdcard/Android/data/ai.d2rm.dm/files/logs/latest.log` | this run's log (the previous one is `prev.log`) |
 | `/sdcard/Android/data/ai.d2rm.dm/files/scan/` | PNGs the level-by-level scan wrote (only ones with content) |
 | `/data/local/tmp/dm/` | the run-time data (`patched` / `spv` / `romfs`), **read-only**, see section 5 |
+| `/data/user/0/ai.d2rm.dm/files/pipecache.bin` | the pipeline cache (app-internal, visible through `run-as`; see above) |
 
 **Device screenshots**: when a PNG has to land on disk, **do not use PowerShell's `>`** (you get UTF-16 and the file is
 dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
@@ -246,3 +280,10 @@ dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
   hung game. Uploads now have **their own command buffer** (`g_cb_up`, "M3-2o") and need no lock.
 - **Before adding a lock, list who holds what when they call in**: that deadlock came from skipping this, and the check
   that settled it was "revert that one site and presents return to normal immediately".
+- **"Going to the background" means "being killed" on this machine**: MIUI treats this package as a game (logcat
+  `ANDR-PWR-OPT: GAMEPOWEROPT: isGame()`) and sends `libc: kill: send 9` (SIGKILL) right after HOME, so **`TERM_WINDOW` /
+  `DESTROY` / `atexit` never run once** (measured twice: the pid disappears within 6 seconds and the log holds no
+  `窗口那一套已拆`). Any design that persists "on exit" therefore does not work here -- this is exactly how the pipeline
+  cache was found out and moved to a **one-second foreground write** ("M3-2p"). Note also that
+  `adb shell input keyevent` is refused (`SecurityException: requires INJECT_EVENTS`); to background the app, start the
+  launcher explicitly: `adb shell am start -n com.miui.home/.launcher.Launcher`.

@@ -19,19 +19,26 @@ pushd "%APKDIR%..\..\.."
 set "REPO=%CD%"
 popd
 
-set "NDK=C:\Android\Sdk\ndk\30.0.16248370"
-set "JDK=C:\Program Files\Eclipse Adoptium\jdk-21.0.12.1+1"
-set "BT=C:\Android\Sdk\build-tools\36.0.0"
-set "CMAKEX=C:\Android\Sdk\cmake\3.31.6\bin\cmake.exe"
-set "NINJAX=C:\Android\Sdk\cmake\3.31.6\bin\ninja.exe"
-set "ANDROIDJAR=C:\Android\Sdk\platforms\android-36\android.jar"
+rem 外部工具的路径由 toolchain.cmd **一处**决定（NDK / JDK / build-tools / CMake / ninja / android.jar / adb）：
+rem 它先用 JAVA_HOME / ANDROID_HOME，再按已知落点取最新版，DM_* 随时可覆盖 —— 换机器不必改本文件。
+rem Every external tool path is decided in one place, toolchain.cmd (NDK / JDK / build-tools / CMake / ninja /
+rem android.jar / adb): it prefers JAVA_HOME / ANDROID_HOME, then picks the newest version under the known roots, and
+rem DM_* always overrides -- so a new machine needs no edit here.
+call "%APKDIR%toolchain.cmd" || exit /b 2
+
 set "WORK=%REPO%\.work\apk-build"
 set "KEYS=%REPO%\.work\apk-keys"
 
-if not exist "%ANDROIDJAR%" (
-  echo [红] 找不到 %ANDROIDJAR%（aapt2 需要它做框架资源表）
-  exit /b 2
-)
+rem 本脚本需要什么就自己查什么（toolchain.cmd 只负责"发现 + 报告"，不替调用方决定谁必需），缺哪一件说清怎么补
+rem This script checks what it needs itself (toolchain.cmd only discovers and reports), naming the fix for each gap
+if not exist "%NDK%\build\cmake\android.toolchain.cmake" ( echo [红] 缺 NDK：%NDK%（用 DM_NDK 指版本，或按 docs/CROSS_MACHINE 装）& exit /b 2 )
+if not exist "%CMAKEX%" ( echo [红] 缺 CMake：%CMAKEX%（用 DM_CMAKE 指版本）& exit /b 2 )
+if not exist "%NINJAX%" ( echo [红] 缺 ninja：%NINJAX%（跟 CMake 同一个包）& exit /b 2 )
+if not exist "%ANDROIDJAR%" ( echo [红] 缺 %ANDROIDJAR%（aapt2 要它做框架资源表；用 DM_PLATFORM 指平台）& exit /b 2 )
+if not exist "%JDK%\bin\java.exe" ( echo [红] 缺 JDK：%JDK%（设 JAVA_HOME 或用 DM_JDK 指一个 JDK 目录）& exit /b 2 )
+if not exist "%BT%\aapt2.exe" ( echo [红] 缺 build-tools：%BT%（用 DM_BUILD_TOOLS 指版本）& exit /b 2 )
+if not exist "%BT%\zipalign.exe" ( echo [红] 缺 %BT%\zipalign.exe & exit /b 2 )
+if not exist "%BT%\apksigner.bat" ( echo [红] 缺 %BT%\apksigner.bat & exit /b 2 )
 if not exist "%WORK%" mkdir "%WORK%"
 if not exist "%KEYS%" mkdir "%KEYS%"
 
@@ -58,6 +65,7 @@ echo == 4/5 zipalign（-p：不压缩的 .so 按页对齐）==
 
 echo == 5/5 签名（第一次会用 keytool 生成调试密钥，只放在 .work 里，不进仓库）==
 if not exist "%KEYS%\debug.keystore" (
+  if not exist "%JDK%\bin\keytool.exe" ( echo [红] 首次要生成调试密钥，但 %JDK%\bin\keytool.exe 不在；换一个完整 JDK（DM_JDK）& exit /b 9 )
   "%JDK%\bin\keytool.exe" -genkeypair -keystore "%KEYS%\debug.keystore" -alias dm ^
     -keyalg RSA -keysize 2048 -validity 10000 -storepass dmdmdm -keypass dmdmdm ^
     -dname "CN=dm-android-port, O=dm, C=CN" || exit /b 9
