@@ -77,6 +77,9 @@ typedef struct thr {
     uint64_t stack_low, stack_high; uint64_t bt_off[10]; int bt_n; uint64_t bt_at;
     uint64_t wait_at_ns;      // 进入当前等待的时刻（转储里打「已等 X 秒」：判「等太久」用它）| when the current wait began (the dump prints "waiting X s": how to tell "way too long")
     uint64_t tg_this;         // 主线程等在"任务图完成位图"里时，该位图所属的对象（取自 [x29-8] = 函数序言保存的 x19）| when the main thread waits on the task-graph completion bitmap, the object owning it (taken from [x29-8] = the x19 saved by that function's prologue)
+    uint64_t jb_this;         // 正在跑任务时，任务包装器（main+0x15f0ce4）那张调用帧里的 x19 = 该作业所属的任务图；jb_idx = x21 = 任务序号
+                              // While a task is running: the task wrapper's (main+0x15f0ce4) frame holds x19 = the graph this job belongs to, and x21 = the task index
+    uint64_t jb_idx; int jb_frame;
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
     mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
@@ -492,6 +495,15 @@ static int peek64(uint64_t a, uint64_t *out) {
     return 1;
 }
 
+// 同上，4 字节版：任务记录里的依赖掩码在 +0x18/+0x1c（后者不是 8 字节对齐），要用它读
+// Same as above, 4-byte flavour: the task records' dependency masks live at +0x18/+0x1c and the latter is not
+// 8-byte aligned, so peek64 cannot be used
+static int peek32(uint64_t a, uint32_t *out) {
+    if ((a & 3) || a < 0x10000ull || a > 0x7fffffffffffull) return 0;
+    *out = *(volatile uint32_t *)a;
+    return 1;
+}
+
 static void bt_sample(thr_t *t, uint64_t fp) {
     t->bt_n = 0; t->bt_at = now_ns();
     for (int i = 0; i < 60 && t->bt_n < (int)(sizeof t->bt_off / sizeof *t->bt_off); i++) {
@@ -507,6 +519,18 @@ static void bt_sample(thr_t *t, uint64_t fp) {
             uint64_t off = (uint64_t)ret - (uint64_t)m->base;
             if (off >= 0x15ee800 && off < 0x15eea40 && fp - 8 >= t->stack_low)
                 t->tg_this = *(volatile uint64_t *)(fp - 8);
+        }
+        // 任务包装器（main+0x15f0ce4 起）的帧：序言是 str x25,[sp,#-0x50]! + 五对 stp + add x29,sp,#0x40，
+        // 所以 [x29-8] = 保存的 x19（该作业的任务图）、[x29-0x18] = 保存的 x21（任务序号）。
+        // The task-wrapper frame (from main+0x15f0ce4): its prologue is str x25,[sp,#-0x50]! + five stp pairs +
+        // add x29,sp,#0x40, hence [x29-8] = saved x19 (the graph this job belongs to) and [x29-0x18] = saved x21 (its index).
+        if (!t->jb_this && m && !strcmp(m->name, "main") && fp - 0x18 >= t->stack_low) {
+            uint64_t off = (uint64_t)ret - (uint64_t)m->base;
+            if (off >= 0x15f0ce4 && off < 0x15f0e98) {
+                t->jb_this = *(volatile uint64_t *)(fp - 8);
+                t->jb_idx = *(volatile uint64_t *)(fp - 0x18);
+                t->jb_frame = i;
+            }
         }
         if (m && !strcmp(m->name, "main")) t->bt_off[t->bt_n++] = (uint64_t)ret - (uint64_t)m->base;
         if (next <= fp) break;                       // 必须向上递增，否则判为坏链 | must walk upwards, otherwise the chain is broken
@@ -564,6 +588,21 @@ void svc_thread_dump(void) {
             }
             fprintf(stderr, "[dm]   %#x svc 环: %s\n", t->handle, rb);
         }
+        {   // 最近一次 ArbitrateLock（svc 0x1a）的现场：它期望的持有人（x0）与那个地址上现在的锁字。
+            // 「主线程等一把工人持有的锁、工人等一把主线程持有的锁」这种互等环，这一行给的就是环的另一半。
+            // The most recent ArbitrateLock (SVC 0x1a): the owner it expected (x0) and the lock word at that address
+            // right now. For a mutual-wait cycle this line is the other half of the ring.
+            uint32_t n = t->ring_i < 16 ? t->ring_i : 16;
+            for (uint32_t k = 0; k < n; k++) {
+                uint32_t j = (t->ring_i - 1 - k) & 15;
+                if (t->ring_num[j] != 0x1a) continue;
+                uint32_t w = 0; int ok = peek32(t->ring_x1[j], &w);
+                fprintf(stderr, "[dm]   %#x 最近一次 ArbitrateLock：地址 %#llx 的锁字 %s%#x（期望持有人 %#x%s）\n",
+                        t->handle, (unsigned long long)t->ring_x1[j], ok ? "" : "(读不到) ", w, (uint32_t)t->ring_x0[j],
+                        ok && (w & ~WAITERS_BIT) == (uint32_t)t->ring_x0[j] ? "：一致，确实在等它" : "：不一致");
+                break;
+            }
+        }
         if (t->bt_n) {   // 落在 main 的调用链（最近一次 svc 时采的）| the call chain landing in main (sampled at the most recent svc)
             char bb[400]; int q = 0;
             for (int k = 0; k < t->bt_n; k++) q += snprintf(bb + q, sizeof bb - q, "%smain+%#llx", k ? " " : "", (unsigned long long)t->bt_off[k]);
@@ -577,6 +616,39 @@ void svc_thread_dump(void) {
             uint64_t bm = 0, mask = 0; int ok1 = peek64(t->tg_this + 0x3328, &bm), ok2 = peek64(t->tg_this + 0x3100, &mask);
             fprintf(stderr, "[dm]   %#x 任务图 %#llx：完成位图 %s%#llx、等待掩码 %s%#llx\n", t->handle, (unsigned long long)t->tg_this,
                     ok1 ? "" : "(读不到) ", (unsigned long long)bm, ok2 ? "" : "(读不到) ", (unsigned long long)mask);
+            // 另外两张位图与每条任务的依赖掩码：「22 位一个都没置上」是"没派发"还是"派了没完成"，这一行分开。
+            // 反汇编依据（main.patched.bin）：派发器 main+0x15ee598 要求位图 +0x3324 的位，并查记录的 +0x18（对已完成 +0x3328）
+            // 与 +0x1c（对 +0x3320）；置位只在任务包装器 main+0x15f0ce4 末尾（ldxr/orr/stlxr 写 +0x3328）。
+            // The other two bitmaps plus every task record's dependency masks: that is what tells "never dispatched" from
+            // "dispatched but never finished". From the disassembly of main.patched.bin: the dispatcher at main+0x15ee598
+            // needs a bit in +0x3324 and checks the record's +0x18 against the completed bitmap +0x3328 and +0x1c against
+            // +0x3320; the only setter is the tail of the task wrapper at main+0x15f0ce4 (ldxr/orr/stlxr on +0x3328).
+            uint32_t done32 = 0, pend32 = 0, ready32 = 0, ndep = 0, npend = 0;
+            peek32(t->tg_this + 0x3328, &done32); peek32(t->tg_this + 0x3324, &pend32);
+            peek32(t->tg_this + 0x3320, &ready32);
+            peek32(t->tg_this + 0x3470, &ndep); peek32(t->tg_this + 0x3488, &npend);   // 两个"在飞作业"表的长度 | lengths of the two in-flight job lists
+            fprintf(stderr, "[dm]   %#x 位图三张：已完成 %#x、待派发 %#x、依赖源 %#x（在飞作业表 %u / %u）\n",
+                    t->handle, done32, pend32, ready32, ndep, npend);
+            if (mask > 0 && mask <= 32) {   // 每条任务：依赖 A / 依赖 B / 标志（+0x18/+0x1c/+0x58）| per task: dep A / dep B / flags
+                char db[512]; int q = 0;
+                for (uint64_t i = 0; i < mask && q < (int)sizeof db - 32; i++) {
+                    uint32_t d0 = 0, d1 = 0, fl = 0; uint64_t rec = t->tg_this + i * 0x188;
+                    peek32(rec + 0x18, &d0); peek32(rec + 0x1c, &d1); peek32(rec + 0x58, &fl);
+                    q += snprintf(db + q, sizeof db - q, "%s%llu:%#x/%#x/%#x", i ? " " : "", (unsigned long long)i, d0, d1, fl);
+                }
+                fprintf(stderr, "[dm]   %#x 任务记录（序号:依赖A/依赖B/标志）: %s\n", t->handle, db);
+            }
+        }
+        if (t->jb_this) {   // 这个线程正跑在某张任务图的某个任务里（包装器帧）：哪张图、哪个序号、那张图的位图是什么
+                            // This thread is running a task of some graph (the wrapper frame): which graph, which index,
+                            // and what that graph's bitmaps hold
+            uint32_t b11 = 0, b12 = 0, b13 = 0, b1c = 0, b1d = 0;
+            peek32(t->jb_this + 0x3328, &b11); peek32(t->jb_this + 0x3324, &b12); peek32(t->jb_this + 0x3320, &b13);
+            peek32(t->jb_this + 0x3100, &b1c); peek32(t->jb_this + 0x3470, &b1d);
+            fprintf(stderr, "[dm]   %#x 正在跑作业：任务图 %#llx、任务序号 %llu（帧 %d）%s；该图：任务数 %u、已完成 %#x、待派发 %#x、依赖源 %#x、在飞作业表 %u\n",
+                    t->handle, (unsigned long long)t->jb_this, (unsigned long long)t->jb_idx, t->jb_frame,
+                    t->jb_this == t->tg_this ? "（与本线程所等的图是同一个）" : "（**不是**本线程所等的图）",
+                    b1c, b11, b12, b13, b1d);
         }
 #if defined(__ANDROID__)
         { char tg[24]; snprintf(tg, sizeof tg, "%#x", t->handle); proc_thread_line(tg, t->tid); }   // 安卓：/proc 三样（状态 / 内核等待点 / 系统调用与 PC）| Android: the three /proc items (state / kernel wait point / syscall and PC)
