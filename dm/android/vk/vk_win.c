@@ -33,6 +33,32 @@ static VkDeviceMemory g_simgmem;
 static uint32_t g_sw, g_sh;
 static VkImageLayout g_simg_lay = VK_IMAGE_LAYOUT_UNDEFINED;
 
+// ---------- M3-3c：取证开关 `DM_WIN_NOSUB`（缺省关）----------
+// 为什么要有它：「M3-3a」的现场里，"前端线程等自己那一帧的栅栏"与"客体线程等上传的一次性提交"是**同时**中招的两条路
+// （同一 20 毫秒内一起醒），而那一刻整条 GPU/显示通路都在睡。要分"谁把它带下去的"，最便宜的一刀就是把**前端这条上屏路
+// 上的驱动调用整个摘掉**：`DM_WIN_NOSUB=1` 时 `vk_win_present_rgba` 只把像素写进中转缓冲就返回 —— 不 `vkWaitForFences`、
+// 不 `vkAcquireNextImageKHR`、不 `vkQueueSubmit`、不 `vkQueuePresentKHR`（交换链本身还在，建的时候那条路没变）。
+// 于是下一轮能二选一：**停顿消失 ⇒ 触发点在前端这条上屏路；照旧 ⇒ 在客体那条提交路（或驱动自己）**。
+// 老规矩（与「M3-3b」说的"破坏性取证"同一句）：**它只为分辨，不是为了用** —— 画面不会更新。
+// M3-3c: the `DM_WIN_NOSUB` forensics switch (off by default). In the "M3-3a" scene the front end (waiting on its own
+// frame's fence) and the guest (waiting for an upload's one-off submit) are hit **at the same instant**, while the whole
+// GPU/display path is asleep. The cheapest way to tell who dragged it down is to take the driver calls out of the front
+// end's present path entirely: with `DM_WIN_NOSUB=1` `vk_win_present_rgba` writes the staging buffer and returns -- no
+// `vkWaitForFences`, no `vkAcquireNextImageKHR`, no `vkQueueSubmit`, no `vkQueuePresentKHR` (the swapchain itself is
+// untouched). Next round then splits it two ways: **stalls gone => the front end's present path is the trigger; unchanged
+// => the guest's submit path (or the driver itself) is**. Same old rule as the other destructive-forensics arms: it exists
+// to bisect, not to ship -- the screen will not update.
+static int win_nosub(void) {
+    static int once = -1;
+    if (once < 0) {
+        const char *e = getenv("DM_WIN_NOSUB");
+        once = (e && *e && *e != '0') ? 1 : 0;
+        if (once) LOG("【黄】窗口：DM_WIN_NOSUB=1 —— 上屏只写中转缓冲，不提交 / 不取图 / 不呈现（取证用，画面不会更新）");
+        else LOG("窗口：上屏走完整路径（DM_WIN_NOSUB=0）");
+    }
+    return once;
+}
+
 static int sc_build(void) {
     VkSurfaceKHR surf = vk_dev_surface();
     // vk_device.c 没有暴露物理设备，这里从实例取一次（真机上只有一个）| vk_device.c does not expose the physical
@@ -207,6 +233,11 @@ int vk_win_present_rgba(const uint8_t *rgba, uint32_t w, uint32_t h) {
     if (wmr != VK_SUCCESS) return 0;
     memcpy(p, rgba, (size_t)w * h * 4);
     vkUnmapMemory(vk_dev(), g_smem);
+
+    // M3-3c：取证开关 —— 到这里为止（映射 + 拷贝 + 解映射）都不碰 GPU，之后就全是驱动调用，一律跳过（见上面的说明）。
+    // M3-3c: forensics switch -- everything up to here (map + copy + unmap) avoids the GPU; from here on it is all driver
+    // calls, so they are all skipped (see the note above).
+    if (win_nosub()) return 1;
 
     // M3-2w：上屏前等上一帧的栅栏（无上限）—— 前端线程上的一处宿主等待，记账（驱动内部同样是 1 毫秒一睡轮询）。
     // M3-2w: waiting for the previous frame's fence (no timeout) before presenting -- a host wait on the front-end thread,
