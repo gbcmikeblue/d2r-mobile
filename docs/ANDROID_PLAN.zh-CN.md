@@ -1875,7 +1875,8 @@ bt: … mtl_wait+0x214  ←  h_nvnSyncWait（dm/gfx/nvn/hle_nvn.c:383）  ←  �
 - 修正后的四轮采样：`pc=nanosleep+0xc lr=usleep+0x54` 只出现在**我们自己的宿主线程**上 —— 看门狗
   （栈：`libc… ← libdm.so+0x95398`，符号化 = `watchdog_main`）与音频（`libdm.so+0x11bc94` = `null_sink+0x88`）；
   客体线程的 `nanosleep` 都落在 `svc_thread ← SleepThread`。
-- 「M3-2v」那一轮主线程**确实**被采到在 `usleep` 里，而**当时账本是"0 层"**
+- **修正前**那一轮（表还没放开，`w_c1`）主线程**确实**被采到在 `usleep` 里
+  （`STALLSAMPLE #1 thr=0x1001 pc=nanosleep+0xc lr=usleep+0x54`），而**当时账本是"0 层"**
   （`账本槽 tid 21393 = 客体线程 0x1001 … 现在 0 层，最后等完的是「客体：出图」`）⇒ 我们记过账的等待一处都不在
   ⇒ **那只可能是驱动内部**的轮询（`nvn_vk.c:166-170` 早记下：驱动在 `vkWaitForFences` 里"1 毫秒一睡再看"）。
   **⇒ 不是我们的 `usleep`、也不是客体的 `SleepThread`：是驱动自己在轮询，我们只是发起者。**
