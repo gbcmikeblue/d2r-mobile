@@ -44,6 +44,10 @@ int vk_tex_list(uint64_t *ser, uint32_t *ws, uint32_t *hs, uint32_t *lvs, int ca
 // The two used by the heartbeat / report (also declared locally): the present count and one line of host-side counters
 uint64_t vk_present_count(void);
 int vk_diag_line(char *buf, size_t cap);
+// 宿主的"按需导出现场"（crash.c）：各线程在等什么 + 图形侧等待点，**不退出**。就地声明，理由同上。
+// The host's on-demand state dump (crash.c): what each thread waits on plus the graphics wait points, **without
+// exiting**. Declared locally for the same reason as the two above.
+void crash_dump_now(const char *why);
 
 // 宿主那套的环境准备与 dm_main 的交接（dm/android/main_android.c）：**与 APK 必须完全一致**，所以那边只留一个实现，
 // 这里直接调它，而不是把环境准备抄一遍（抄一遍就会漂）。
@@ -690,6 +694,17 @@ void android_main(struct android_app *app) {
                      (unsigned long long)g_view_skip, g_hb_stall_s ? "出图没有推进" : "出图在推进");
                 if (g_hb_stall_s == 8)
                     LOGE("卡死报告：连续 8 秒没有新出图（上面最后一条心跳即现场；客体线程现场见宿主的看门狗转储）");
+                // 按需现场导出（**不退出**）：安卓侧原来没有触发口 —— iOS 有 DM_LOG_PORT，这里只有看门狗那条"导完就 _exit"
+                // 的路，而"停住"是间歇的、要盯很久才出现，一跳就自杀会把观察打断。所以给一个文件触发口，每秒查一次：
+                //   adb shell touch /sdcard/Android/data/ai.d2rm.dm/files/dump.trigger
+                // 见到就删掉它、导一份（与看门狗同一份内容），进程继续跑；要连导几次就再建一次。
+                // On-demand state dump (**without exiting**): Android had no trigger -- iOS has DM_LOG_PORT, and here the
+                // only route was the watchdog's "dump then _exit", which cuts an observation short exactly when the
+                // intermittent stall finally shows up. So: a file trigger, checked once a second (command above); when
+                // seen it is removed and one dump is taken (the same content the watchdog prints) while the process
+                // keeps running. Create the file again for another dump.
+                { static const char *tp = "/sdcard/Android/data/ai.d2rm.dm/files/dump.trigger";
+                  if (access(tp, F_OK) == 0) { remove(tp); crash_dump_now("按需触发 dump.trigger"); } }
             }
         }
         if (vk_win_live()) {

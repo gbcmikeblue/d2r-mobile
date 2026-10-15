@@ -668,14 +668,16 @@ merged, the blocker-independent items from section nine are moved in, and this r
    presenting is the one with the **device loss** (`提交失败 VkResult -4` plus a hundred-plus upload failures, then
    `TERM_WINDOW` and the log ends); and at the stall the main thread's **current PC sits in our own host layer**
    (`vk_tex_view` / `vk_tex_grab_ser` / `mtl_wait`) while the graph keeps changing. Details and the three runs: "M3-2t".
-2. **Host-side read-back / queue waits** (**the real lead from item 1 -- do this first**) -- who waits on whom along
-   `vk_tex_view` (viewer read-back), `vk_tex_grab_ser` (gamma conversion included; in t3 its PC sat in `powf`) and
-   `mtl_wait`; known shared points are `g_one_mu` (the viewer and the present/scan paths read back at the same time) and
-   the one-shot submit. What to measure: which lock the main thread holds along its host frame chain at the stall, which
-   queue / fence it is waiting on, and -- for the sporadic **device loss** (`【红】提交失败 VkResult -4` plus a hundred-plus
-   `贴图上传失败` once per run) -- "**who loses it first**", the guest's own commands or our one-shot submit
-   (`vkQueueSubmit`'s return value and context, what else was on the queue). Uploads **are already** off the shared command
-   buffer ("M3-2o") and it did not go away, so the cause lies elsewhere.
+2. **Host-side read-back / queue waits** (**the real lead from item 1; "M3-2u" reproduced the stall and narrowed it to
+   this path**) -- the three arms: viewer + level-complete scan **both** on the path => presents freeze within ~20 s;
+   **either one alone** => 60-80 s clean (21.5 / 14.4 presents/s). At the stall the main thread is blocked on a
+   **host-side lock / futex** and stops issuing SVCs, the worker's lock is held by the main thread, and the read-back /
+   view building runs on the guest thread while it executes the command stream (`mtl_exec`; the sampled PC symbolises to
+   `nvnth_378` / `vk_tex_view <- mtl_exec <- dm_gfx_suspend`). Next: a **lock ledger for the read-back path**
+   (`vk_tex_grab_ser` / `grab_ser_locked` / `stg_get` / `one_begin` / `vk_queue_lock` / `vk_tex_view`: enter/exit plus the
+   holder), dumped on demand, to name **which** lock is waited on. The sporadic **device loss**
+   (`【红】提交失败 VkResult -4` plus a hundred-plus `贴图上传失败` once per run) is still open on the same path --
+   "**who loses it first**"; uploads are already off the shared command buffer ("M3-2o") and it did not go away.
 3. ~~**Item 2 of section nine, `HOST_CACHED`**~~ -- **measured and ruled out (2026-10-15, "M3-2q")**: exporting an fd on
    type 6, `mmap`-ing it at a chosen address and both directions all **work** (256 MB, 512 MB and 3968 MB alike), but the
    same-device A/B shows **no measurable difference in CPU time** (under 3% within the same mode, while the run-to-run
@@ -1863,6 +1865,83 @@ first version latched only the first one and lost the trail after 7.5 s in run 2
    "the graph is running", and the graph is now proven to finish; revisit it once item 2 has a conclusion.
 
 Roughly 20 lines changed, a 40-second incremental build, ~25 seconds per device run.
+
+---
+
+### M3-2u: the stall was caught in the act, and it is tied to **our own read-back diagnostics** (2026-10-15, device, five runs, three arms A/B/C)
+
+With "M3-2t" having replaced the stall criterion (heartbeat present count + the front end's stall report), this round first
+did "**identify the stall**" and then a single-variable A/B/C. The result is cleaner than expected: the stall reproduces
+reliably and happens **only when the viewer read-back and the level-complete scan read-back are both on the path**. It also
+added an instrument that was overdue (an on-demand state dump that does not exit).
+
+**1. New instrument: the on-demand dump (`dump.trigger`)**
+
+Android had no trigger for "take a state dump now": iOS has `DM_LOG_PORT`'s `dump`, and here the only route was the
+watchdog's **dump-then-`_exit`**, which cuts an observation short exactly when the intermittent stall finally appears.
+(Sending `SIGALRM` to the process is worse -- it goes through `on_crash`, which has no "let the log drain" wait and its
+dump came out **with the tail cut off**.) Now:
+
+```bat
+adb shell touch /sdcard/Android/data/ai.d2rm.dm/files/dump.trigger
+```
+
+`main_apk.c` checks that file once a second, removes it and takes one dump (what each thread waits on + the graphics wait
+points, the same content the watchdog prints) **while the process keeps running**; create it again for another dump. The
+watchdog can therefore be given a large value (this round `DM_WATCH_STALL=600`) and the *moment* of the dump is chosen by
+hand.
+
+**2. The three arms** (`DM_TG_SERIES=0`, `DM_WATCH_STALL=600`, everything else byte-identical; one switch apart)
+
+| arm | viewer `DM_WIN_SRC` | scan `DM_NVN_SHOT_SCAN` | present trace | result |
+|---|---|---|---|---|
+| **A** `u_a1` / `u_a2` | **28 on** | on (50/54/57) | 52 -> frozen; 55->57 -> frozen | **stalled** (both runs) |
+| **B** `u_b1` / `u_b2` | 0 off | on | 67->1704 (80 s, **21.5/s**); 67->1247 (60 s) | **no stall** |
+| **C** `u_c1` | 28 on | **off** | 70->1077 (70 s, **14.4/s**) | **no stall** |
+
+=> (1) the viewer costs throughput (21.5 -> 14.4 presents/s, about -33%) but does **not** wedge; (2) the stall needs the
+viewer and the scan reading back **at the same time** (run A froze at 52-57 presents, and 50/54/57 are exactly the scan
+frames); (3) arms B and C -- "scan only" and "viewer only" -- both ran the whole observation window cleanly.
+
+**3. The scene at the stall (arm A, on-demand dump)**
+
+- `心跳：出图 52 (55/57)` frozen for tens of seconds and `绘制 有目标 4431 / 无目标 1227` frozen too => the guest stopped
+  advancing entirely, together with the front end's `卡死报告：连续 8 秒没有新出图`.
+- Main thread `0x1001`: `调用链（32.1 秒前）` = the pump -> poll -> run-graph entry -> render code, its SVC ring all
+  `SleepThread(-1)`, and **no SVC at all for the following 32 seconds** with `/proc` state `R` and `syscall running`
+  => it is stuck in **user space** (guest or host) and no longer goes through any gate.
+- `卡住采样：在用户态空转的线程 0 个` -- the sampler caught nothing, so **every guest thread is inside a syscall**, which
+  together with "the main thread is R" can only mean a **host-side futex / lock** (the short spin phase of a futex wait is
+  exactly that R).
+- Worker `0x1005` (priority 28): `等:锁 addr=0x7c29693818 持有者 0x1001` -- **the lock it waits on is held by the main
+  thread** (the same shape as "M3-2r"); `0x1004` waits on a condition variable (the pool's normal wait).
+- Graphics wait point: `在飞槽 1/8（栅栏 …）`, `提交 1228 / 出图 1224`, `队列锁 无人持有`.
+
+**4. Two readings corrected**
+
+1. **"one slot in flight, submits four ahead of presents" is not the stall signature**: arm C **never stalled** and reads
+   the same shape (in flight 1/8, 1228/1224). The signature is those counters being **frozen** (arm A sat at 61/57) plus
+   **the main thread no longer issuing SVCs** (the call chain's age says it: `（32.1 秒前）`).
+2. **The read-back runs on the guest thread while it executes the command stream** (which is why the guest thread is what
+   wedges): symbolising the host PCs captured at the stall gives `libdm.so+0x152950` = **`nvnth_378`**
+   (`nvn_thunks.S:3818`, an NVN gate) for t3, and for t1 the chain `vk_tex_view+0x28 <- mtl_exec+0x2fc0 <-
+   dm_gfx_suspend` (`hle_nvn.c:774`) `<- guest main+0x17443dc` => the viewer/scan read-back and view building happen
+   **inside `mtl_exec`** (the command-stream interpreter), i.e. on the guest thread itself, so when it blocks the whole
+   present path freezes.
+
+**5. Next: a lock ledger for the read-back path**
+
+The stall now has a reproduction recipe, so the next step is a small **ledger on the read-back path** (measurement only):
+record enter/exit plus the current holder at `vk_tex_grab_ser` / `grab_ser_locked` / `stg_get` / `one_begin` /
+`vk_queue_lock` / `vk_tex_view`, and dump it on demand => it names **which** lock is being waited on (today we only know
+"blocked on a host-side lock/futex"). The known shared surface (`g_one_mu` serialising the two read-back callers, the
+`one_mu -> g_mu` order, uploads on their own command buffer) is documented in `vk_tex.c:320-404`; the ledger is meant to
+name the edge between them that is **not** covered yet.
+
+**Reproduction recipe (use it directly next time)**: `DM_WATCH_STALL=600` + `DM_WIN_SRC=28` +
+`DM_NVN_SHOT_SCAN=50,54,57:...` + `DM_TG_SERIES=0` => presents freeze within about 20 s; watch the heartbeat's present
+count and, 15 s after it freezes, `adb shell touch .../files/dump.trigger` (the process keeps running, so a second dump
+remains possible).
 
 ---
 

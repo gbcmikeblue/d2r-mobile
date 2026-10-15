@@ -175,8 +175,8 @@ Three old rules:
 
 ## 7. Where things stand and what comes next (hand-over: start here)
 
-> **This section goes stale.** Written 2026-10-15 against commit `1c5c8c3` (the M3-2s English doc sync; this round's real
-> work is "M3-2t"); for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its
+> **This section goes stale.** Written 2026-10-15 against commit `133dbfe` (M3-2t; this round's real work is "M3-2u");
+> for the detail and the conclusions, the authority is [ANDROID_PLAN.md](ANDROID_PLAN.md), its
 > "7. Next step" and "8. Progress log".
 
 ### Where it stops
@@ -214,6 +214,17 @@ Three old rules:
   presenting is the one with the **device loss**; (c) at a stall the main thread's **current PC sits in our own host layer**
   (`vk_tex_view` / `vk_tex_grab_ser` / `mtl_wait`) while the graph keeps changing => look at the host side. Readings and the
   disassembly corrections are in "M3-2t".
+- **The stall reproduces reliably and is tied to our own read-back diagnostics (2026-10-15, "M3-2u")**: three arms (A/B/C)
+  differing by one switch -- **the viewer (`DM_WIN_SRC=28`) and the level-complete scan (`DM_NVN_SHOT_SCAN`) both on the
+  path** => presents freeze within about 20 s (both runs); **either one alone** => 60-80 s clean (21.5 / 14.4 presents/s).
+  At the freeze: presents and draws both frozen, the main thread **issues no SVC for 32 s** and sits on a host-side
+  lock / futex (`在用户态空转的线程 0 个` = every guest thread is inside a syscall), the lock worker `0x1005` waits on is
+  held by the main thread, and symbolising the host PC shows the read-back / view building running on the guest thread
+  **while it executes the command stream** (`nvnth_378` / `vk_tex_view <- mtl_exec <- dm_gfx_suspend`). Two readings were
+  corrected too: "one slot in flight, submits four ahead of presents" is **not** the signature (a run that never stalled
+  reads the same), and the signature is "counters frozen + the main thread stops issuing SVCs". **Recipe**:
+  `DM_WATCH_STALL=600` + `DM_WIN_SRC=28` + `DM_NVN_SHOT_SCAN=50,54,57:...` + `DM_TG_SERIES=0`, then
+  `adb shell touch .../files/dump.trigger` for an on-demand dump (no exit). Next: a lock ledger for the read-back path.
 - **One sporadic thing**: about once per run, `【红】提交失败 VkResult -4` (`VK_ERROR_DEVICE_LOST`), followed by a
   hundred-plus `贴图上传失败` lines. **Unrelated to command-buffer sharing** (ruled out; "M3-2o"); in t2 of "M3-2t" it was
   followed by the window being torn down and the log ending, so it is probably the same line as the stall.
@@ -224,13 +235,14 @@ Three old rules:
    bitmaps ran three times on the device and separated "armed zero bits" from "completed then cleared" -- **zero bits is
    ruled out, completed-then-cleared holds** (max to-dispatch `0x3fffff`, max completed `0x3fffff`, then cleared by the
    next arming). The machinery is sound and the blocker is not here.
-2. **Host-side read-back / queue waits** (**the real lead from item 1 -- do this first**) -- at a stall the main thread's
-   current PC sits in our own host layer (`vk_tex_view` / `vk_tex_grab_ser` / `mtl_wait`) while the graph keeps changing;
-   the sporadic **device loss** (`【红】提交失败 VkResult -4` plus a hundred-plus `贴图上传失败`, which in t2 was followed by
-   the window being torn down) is likely the same line. What to measure: which lock the main thread holds along its host
-   frame chain at the stall (the known shared points are `g_one_mu` and the one-shot submit), which queue / fence it waits
-   on, and "**who loses it first**" -- the guest's own commands or our one-shot submit (`vkQueueSubmit`'s return value and
-   context, what else was on the queue). Details in "M3-2t".
+2. **A lock ledger for the read-back path** (**first**; "M3-2u" reproduced the stall and narrowed it to "viewer and scan
+   reading back at the same time") -- record enter/exit plus the current holder at `vk_tex_grab_ser` / `grab_ser_locked` /
+   `stg_get` / `one_begin` / `vk_queue_lock` / `vk_tex_view` (including the `shot_take` branch in `nvn_vk.c`) and dump it
+   on demand => it names **who waits on whom**. The known shared surface is documented in `vk_tex.c:320-404`
+   (`g_one_mu` serialising the two read-back callers, the `one_mu -> g_mu` order, uploads on `g_cb_up` without
+   `g_one_mu`); the ledger is for the edge between them that is **not** covered yet. The sporadic **device loss**
+   (`【红】提交失败 VkResult -4` plus a hundred-plus `贴图上传失败`, in t2 followed by the window being torn down) is still
+   open on the same path -- "**who loses it first**". Details in "M3-2u".
 3. ~~**Item 2 of the "9. Optimisation list"** (preferring `HOST_CACHED` for the zero-copy memory type)~~ -- **measured and
    ruled out (2026-10-15, "M3-2q")**: type 6 **can** export an fd (256 MB / 512 MB / 3968 MB all pass, `mmap` at the chosen
    address and both directions too), but it means **stepping outside the buffer's declared allowed types** (an external
@@ -329,6 +341,17 @@ dead) -- write a `.cmd` and use cmd's redirect, the same rule as section 6.
   said "presenting"). Judge a stall by the **present count in the heartbeats** plus the front end's "**8 seconds without a
   new present**" report. Also note the dump itself is long (about 5 s to write on Android) and the game threads keep
   running meanwhile, so fresh `DRAW_IDX` lines inside a dump are normal.
+- **Do not run the two read-back diagnostics at the same time** (2026-10-15, "M3-2u", five runs A/B/C): with the viewer
+  (`DM_WIN_SRC=28`) and the level-complete scan (`DM_NVN_SHOT_SCAN`) **both** on the path, presents freeze within about
+  20 s (the guest thread sits on a host-side lock / futex and stops issuing SVCs); with **either one alone**, 60-80 s run
+  clean (21.5 / 14.4 presents/s) => when measuring the present cadence or the frame budget, keep only one on.
+- **Take a stall's scene on demand** (same round): `adb shell touch .../files/dump.trigger` lands one dump within a second
+  (what each thread waits on + the graphics wait points) **without exiting**, and can be taken again later. The watchdog
+  route is "dump then `_exit`", and sending `SIGALRM` goes through `on_crash`, which **cuts off the dump's tail** (it has
+  none of the watchdog's 400 ms wait) -- so stall studies use the trigger only.
+- **"one slot in flight, submits four ahead of presents" in the wait-point line is not a stall signature** (same round): a
+  run that never stalled reads exactly the same (1228/1224). The signature is those counters being **frozen** plus **the
+  main thread no longer issuing SVCs** (the age on the call-chain line, e.g. `（32.1 秒前）`, tells you).
 - **MIUI refuses `adb install -r`**: it reports `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user` (the on-device
   confirmation is cancelled or the permission is off), and `install_apk.cmd` uses exactly that. Installing from the device
   side works at once: `adb push .work\apk-build\dm.apk /data/local/tmp/dm.apk` then
