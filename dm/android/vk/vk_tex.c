@@ -617,26 +617,126 @@ static int ent_build(const tex_t *t, ent_t *e) {
     return 1;
 }
 
-// 上传：池里的块线性数据 → 解排布进暂存缓冲 → 拷进 VkImage
-// Upload: the block-linear data in the pool -> deswizzle into a staging buffer -> copy into the VkImage
-static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
-    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    if (!bpb) { static int said; if (!said++) LOG("【红】上传：格式 %#x 每块字节未知", t->d.format); return 0; }
-    VkDeviceSize total = 0;
-    for (uint32_t l = 0; l < e->levels; l++) {
-        uint32_t w = e->w >> l, h = e->h >> l; if (!w) w = 1; if (!h) h = 1;
-        total += (VkDeviceSize)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * e->layers * (e->d > 1 ? e->d : 1);
+// ---------- M3-3b：常驻上传环（`DM_UP_RING`，**缺省关**）----------
+// 为什么做它：「M3-3a」的 ftrace 读数里，我方唯一"主动做成几百次驱动级电源 / 总线投票"的地方就是
+// **每次上传都新建 `VkBuffer` + `vkAllocateMemory` + `vkMapMemory`** —— 启动那 4.8 秒里我方线程在驱动里阻塞于
+// `rpmh_write_batch` 441 次、`rpm_resume` 93 次、`gpu_cc_cx_smmu_gdsc`（GPU CX SMMU 电源域）13 次、`icc_set_bw` 6 次，
+// 另有 `kgsl_iopgtbl_map`（每次分配都做一趟 IOMMU 映射）；而病态那 ~10 秒是"整条 GPU/显示通路一起睡、
+// 回来时 GPU/GMU 时钟与总线重编程"。这一刀把"每次上传新建对象"换成"**一块常驻的、只映射一次的中转缓冲 + 环内偏移**"。
+// **缺省关**（`DM_UP_RING` 未设或为 0 = 老路），这样第五臂才有意义：`ab-E.conf` = 同一份配方 + `DM_UP_RING=1`。
+//
+// 为什么不需要新的锁 / 栅栏（三条都成立，别把其中任何一条改掉）：
+//   ① 上传只有一条调用路径：`tex_of`（**持 `g_mu`**）→ `ent_upload` ⇒ 环的"读改写"天然串行；
+//   ② 每次上传都以 `one_end_on(g_cb_up, 1)`（提交 + **等队列空闲**）收尾 ⇒ 返回时这一段拷贝已经做完，
+//      偏移可以立刻推进、位置可以立刻被下一位覆盖。**注意这一刀并不去掉那次"等队列空闲"**：它去掉的是
+//      "每趟都建对象 / 分配 / 映射"，所以它量的是"那 10 秒跟对象搯腾有没有关系"，而不是"跟等队列有没有关系"。
+//   ③ 环的建立 / 扩容都发生在"队列空闲之后"（同上），不会去动一个还被在飞提交引用的缓冲。
+// 边界：单次需求 > `UP_RING_MAX`（64 MB）或环关着时**退回临时缓冲**（老路），并打一条【黄】。
+// M3-3b: a persistent upload ring (`DM_UP_RING`, **off by default**). Rationale ("M3-3a"): the one place where we
+// actively caused hundreds of driver-level power/bus votes was "every upload creates a fresh VkBuffer +
+// vkAllocateMemory + vkMapMemory" (rpmh_write_batch x441, rpm_resume x93, gpu_cc_cx_smmu_gdsc x13, icc_set_bw x6 and a
+// kgsl_iopgtbl_map per allocation in the first 4.8 s). The pathological ~10 s is "the whole GPU/display path sleeps
+// together and comes back with GPU/GMU clock and bus re-programming". This turn replaces "create objects per upload" with
+// "one persistent, once-mapped staging buffer plus a ring offset". Off by default so the fifth arm means something:
+// `ab-E.conf` = same recipe + `DM_UP_RING=1`. No new lock or fence is needed because uploads are serialised by `g_mu`,
+// every upload still ends in submit + **queue idle** (so the slice is free to reuse immediately), and the ring is only
+// created/grown after queue idle. Note this does **not** remove the queue-idle wait -- it removes the object churn, so
+// the arm measures "is the 10 s about object churn", not "is it about the queue wait".
+#define UP_RING_ALIGN 512u                            // 块压缩贴图的 texel block 最大 16 字节；512 覆盖所有格式对 bufferOffset 的对齐要求 | covers every format's bufferOffset alignment
+#define UP_RING_MAX ((VkDeviceSize)64 << 20)          // 单次上传超过它就不借环了（免得为一张巨贴图把环撑大 64 MB 以上）| above this a slice is not borrowed
+static VkBuffer g_ur_buf;
+static VkDeviceMemory g_ur_mem;
+static void *g_ur_map;
+static VkDeviceSize g_ur_cap, g_ur_off;
+static int g_ur_on = -1, g_ur_mb;
+static uint64_t g_ur_n, g_ur_wrap, g_ur_back, g_ur_make, g_ur_logged;
+
+static int up_ring_on(void) {
+    if (g_ur_on < 0) {
+        const char *e = getenv("DM_UP_RING");
+        const char *m = getenv("DM_UP_RING_MB");
+        g_ur_on = (e && *e && *e != '0') ? 1 : 0;
+        g_ur_mb = (m && *m) ? atoi(m) : 0;
+        if (g_ur_mb < 1 || g_ur_mb > 512) g_ur_mb = 16;
+        // 只打一次，而且写得让人一眼看出这一轮落在哪条路上（量 A/B 时先看这一行）
+        // Printed once, and it says at a glance which path this run is on (read this line first when doing A/B)
+        LOG("上传环：DM_UP_RING=%s（容量 %d MB，可用 DM_UP_RING_MB 改；0 = 老路，每次上传新建）",
+            g_ur_on ? "1（借常驻环）" : "0（每次新建，老路）", g_ur_mb);
     }
-    if (!total) { step_fail("算出来的上传字节数是 0"); return 0; }
-    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = total,
+    return g_ur_on;
+}
+// 建 / 换环：只在"队列已经空闲"的时候调（见上面 ③）。
+// Create/replace the ring: only ever called with the queue idle (precondition 3 above).
+static int up_ring_make(VkDeviceSize want) {
+    if (g_ur_buf) {
+        vkUnmapMemory(vk_dev(), g_ur_mem);
+        vkDestroyBuffer(vk_dev(), g_ur_buf, NULL);
+        vkFreeMemory(vk_dev(), g_ur_mem, NULL);
+        g_ur_buf = VK_NULL_HANDLE; g_ur_mem = VK_NULL_HANDLE; g_ur_map = NULL; g_ur_cap = 0;
+    }
+    VkDeviceSize sz = (VkDeviceSize)g_ur_mb << 20;
+    if (want > sz) sz = want;                 // 单次要的多就给到刚好够（上限由调用方按 UP_RING_MAX 把关）| grow to fit; the caller caps it at UP_RING_MAX
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    if (vkCreateBuffer(vk_dev(), &bci, NULL, &g_ur_buf) != VK_SUCCESS) { step_fail("上传环：vkCreateBuffer 失败"); g_ur_buf = VK_NULL_HANDLE; return 0; }
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk_dev(), g_ur_buf, &mr);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+        .memoryTypeIndex = vk_memory_type(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mr.memoryTypeBits) };
+    if (vkAllocateMemory(vk_dev(), &mai, NULL, &g_ur_mem) != VK_SUCCESS) {
+        step_fail("上传环：vkAllocateMemory 失败");
+        vkDestroyBuffer(vk_dev(), g_ur_buf, NULL); g_ur_buf = VK_NULL_HANDLE; g_ur_mem = VK_NULL_HANDLE; return 0;
+    }
+    vkBindBufferMemory(vk_dev(), g_ur_buf, g_ur_mem, 0);
+    if (vkMapMemory(vk_dev(), g_ur_mem, 0, VK_WHOLE_SIZE, 0, &g_ur_map) != VK_SUCCESS) {
+        step_fail("上传环：vkMapMemory 失败");
+        vkDestroyBuffer(vk_dev(), g_ur_buf, NULL); vkFreeMemory(vk_dev(), g_ur_mem, NULL);
+        g_ur_buf = VK_NULL_HANDLE; g_ur_mem = VK_NULL_HANDLE; g_ur_map = NULL; return 0;
+    }
+    g_ur_cap = sz; g_ur_off = 0; g_ur_make++;
+    LOG("【绿】上传环：常驻中转缓冲就绪 %llu 字节（映射一次，之后每趟只借一段偏移；第 %llu 次建/换）",
+        (unsigned long long)sz, (unsigned long long)g_ur_make);
+    return 1;
+}
+// 借一块"要写进哪里"：`ring = 1` 时 buf/map 是常驻环的（`up_rel` 什么都不做），`ring = 0` 时是现建的临时缓冲。
+// Take a place to write into: with `ring = 1` buf/map belong to the persistent ring (`up_rel` then does nothing),
+// otherwise they are a freshly created temporary buffer.
+typedef struct { VkBuffer buf; VkDeviceMemory mem; void *map; VkDeviceSize off; int ring; } upm_t;
+static int up_acq(VkDeviceSize need, upm_t *u) {
+    memset(u, 0, sizeof *u);
+    if (up_ring_on() && need <= UP_RING_MAX) {
+        if (!g_ur_buf || g_ur_cap < need) {
+            dm_waitled_enter("vk：上传环：建常驻中转缓冲（只建一次）");
+            int ok = up_ring_make(need);
+            dm_waitled_leave();
+            if (!ok) return 0;
+        }
+        VkDeviceSize off = (g_ur_off + UP_RING_ALIGN - 1) & ~((VkDeviceSize)UP_RING_ALIGN - 1);
+        if (off + need > g_ur_cap) { off = 0; g_ur_wrap++; }
+        // 回绕是安全的：上一段上传已经等到队列空闲（见 ②）⇒ 环里没有任何在飞提交会去读旧内容
+        // Wrapping is safe: the previous upload already waited for the queue to go idle (precondition 2), so no in-flight
+        // submission can still read the old contents of the ring.
+        u->buf = g_ur_buf; u->mem = g_ur_mem; u->map = g_ur_map; u->off = off; u->ring = 1;
+        g_ur_off = off + need; g_ur_n++;
+        // 只在这些"里程碑"回绕上打一行（第一次量的时候条件写成 `== 1`，于是第一次回绕之后**每趟都打**，
+        // 一轮刷出十几行同样的计数 —— 读数没坏，但日志被污染了，所以这里加了 `g_ur_logged` 去重）。
+        // Print only at these wrap milestones. The first cut used `== 1`, which re-printed on **every** later borrow once
+        // the first wrap had happened (a dozen identical lines per round); the readings were fine but the log was muddied.
+        if (g_ur_wrap != g_ur_logged && (g_ur_wrap == 1 || g_ur_wrap == 16 || g_ur_wrap == 256 || (g_ur_wrap % 4096) == 0)) {
+            g_ur_logged = g_ur_wrap;
+            LOG("上传环：环内已借 %llu 次、回绕 %llu 次、建/换 %llu 次（环 %llu 字节）",
+                (unsigned long long)g_ur_n, (unsigned long long)g_ur_wrap, (unsigned long long)g_ur_make,
+                (unsigned long long)g_ur_cap);
+        }
+        return 1;
+    }
+    // 老路（环关着，或单次超 UP_RING_MAX）：每次上传现建一块 —— 站点名与「M3-2w」以来的一致，
+    // 所以 E 臂与老日志在这条账目上可直接比。老路下这一步正是我们在驱动里做成百次电源 / 总线投票的地方。
+    // The old path (ring off, or a single upload over the cap): build one per upload. The site name matches "M3-2w", so
+    // the E arm and the old logs stay comparable -- and this step is exactly what drove the hundreds of power/bus votes.
+    dm_waitled_enter("vk：上传：建中转缓冲 + 分配 + 映射");
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = need,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
     VkBuffer stg = VK_NULL_HANDLE;
-    // M3-2w：上传的"建中转缓冲 + 分配 + 映射"也记账 —— 这一段**每次上传都新建对象**，而真机上它正好伴生
-    // 上百条「贴图上传失败」；`vkAllocateMemory` / `vkMapMemory` 在驱动里都可能久等（分配器 / 非一致映射）。
-    // M3-2w: the upload's "create staging buffer + allocate + map" is recorded too -- this runs **per upload** and on the
-    // device it is exactly what accompanies the hundreds of 「贴图上传失败」 lines; `vkAllocateMemory` / `vkMapMemory` can
-    // both wait inside the driver (allocator / non-coherent mapping).
-    dm_waitled_enter("vk：上传：建中转缓冲 + 分配 + 映射");
     { VkResult cr = vkCreateBuffer(vk_dev(), &bci, NULL, &stg);
       if (cr != VK_SUCCESS) { step_fail("上传：vkCreateBuffer 返回 %d", (int)cr); dm_waitled_leave(); return 0; } }
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk_dev(), stg, &mr);
@@ -650,6 +750,46 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     { VkResult mp = vkMapMemory(vk_dev(), sm, 0, VK_WHOLE_SIZE, 0, &smap);
       if (mp != VK_SUCCESS) { step_fail("上传：vkMapMemory 返回 %d", (int)mp); dm_waitled_leave(); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; } }
     dm_waitled_leave();
+    u->buf = stg; u->mem = sm; u->map = smap; u->off = 0; u->ring = 0;
+    g_ur_back++;
+    // 两种原因分开说：「环关着」（老路这一臂）与「单次超上限」（环开着但这一趟借不了）在读数里完全不是一回事
+    // （第一版把两者混在一句里，"单次 1920000 字节 > 上限 67108864"这种自相矛盾的括号会把读日志的人带偏）。
+    // Two reasons, said separately: "ring off" (the old arm) and "a single upload over the cap" (ring on, this one trip
+    // cannot borrow) are completely different readings. The first cut mixed them into one line, and a self-contradictory
+    // parenthetical like "single 1920000 bytes > cap 67108864" misleads whoever reads the log.
+    if (g_ur_back == 1) {
+        if (!up_ring_on()) LOG("【黄】上传环：DM_UP_RING=0，走的是老路（每趟上传都现建临时缓冲）");
+        else LOG("【黄】上传环：单次 %llu 字节 > 上限 %llu，这一趟退回临时缓冲", (unsigned long long)need,
+                 (unsigned long long)UP_RING_MAX);
+    }
+    return 1;
+}
+static void up_rel(upm_t *u) {
+    if (u->ring || !u->buf) return;           // 环里的偏移在 up_acq 里就推进了；环本身常驻 | the ring slice was already released in up_acq; the ring itself stays
+    vkUnmapMemory(vk_dev(), u->mem);
+    vkDestroyBuffer(vk_dev(), u->buf, NULL);
+    vkFreeMemory(vk_dev(), u->mem, NULL);
+    u->buf = VK_NULL_HANDLE; u->mem = VK_NULL_HANDLE; u->map = NULL;
+}
+
+// 上传：池里的块线性数据 → 解排布进暂存缓冲 → 拷进 VkImage
+// Upload: the block-linear data in the pool -> deswizzle into a staging buffer -> copy into the VkImage
+static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    if (!bpb) { static int said; if (!said++) LOG("【红】上传：格式 %#x 每块字节未知", t->d.format); return 0; }
+    VkDeviceSize total = 0;
+    for (uint32_t l = 0; l < e->levels; l++) {
+        uint32_t w = e->w >> l, h = e->h >> l; if (!w) w = 1; if (!h) h = 1;
+        total += (VkDeviceSize)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * e->layers * (e->d > 1 ? e->d : 1);
+    }
+    if (!total) { step_fail("算出来的上传字节数是 0"); return 0; }
+    // M3-3b：中转缓冲从这里取 —— 环关着（缺省）/ 单次超上限时走老路（每次新建），环开着就借一段偏移。
+    // 两条路的记账站点名分开，所以环模式下「vk：上传：建中转缓冲 + 分配 + 映射」会从 >300 毫秒的统计里消失。
+    // M3-3b: the staging buffer is taken here -- the old per-upload path when the ring is off (default) or a single
+    // upload is over the cap, otherwise a slice of the persistent ring. The two paths carry different ledger site names,
+    // so in ring mode the old site disappears from the >300 ms statistics.
+    upm_t u;
+    if (!up_acq(total, &u)) return 0;
 
     // **上传走自己那条命令缓冲（`g_cb_up`），也不拿 `g_one_mu`**。两件都要：调用方 `tex_of` 正**持着 `g_mu`** 调进来，
     // 而读回那边是 `one_mu → g_mu` —— 上传若去拿读回那把锁就是锁序反转，真机表现是"**启动就停住、出图 0 次**"
@@ -661,7 +801,7 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     // "M3-2n"; walked into once). And "sharing one command buffer" disappears by construction once each section has its
     // own, so this site needs no lock and cannot collide with the readback path. The only thing left to serialise is the
     // queue submit, which has the queue lock already.
-    if (!one_begin_on(&g_cb_up)) { vkUnmapMemory(vk_dev(), sm); vkDestroyBuffer(vk_dev(), stg, NULL); vkFreeMemory(vk_dev(), sm, NULL); return 0; }
+    if (!one_begin_on(&g_cb_up)) { up_rel(&u); return 0; }
     // 拷贝前的布局转换：新建是 UNDEFINED，目标 TRANSFER_DST
     // Layout transition before the copy: newly created is UNDEFINED, the target is TRANSFER_DST
     VkImageMemoryBarrier b0 = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -677,12 +817,12 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
         if (nvn_deswizzle_geom(&t->d, l, 0, &row_bytes, &rows, &slices, &base, &th, &td, &bp)) { ok = 0; break; }
         for (uint32_t layer = 0; layer < e->layers && ok; layer++) {
             // 每层单独解排布：nvn_deswizzle 一次解一层一级 | deswizzle one layer of one level at a time
-            if (nvn_deswizzle(&t->d, l, layer, t->mem, (uint8_t *)smap + off, row_bytes)) { ok = 0; break; }
+            if (nvn_deswizzle(&t->d, l, layer, t->mem, (uint8_t *)u.map + u.off + off, row_bytes)) { ok = 0; break; }
             uint32_t w = e->w >> l, h = e->h >> l; if (!w) w = 1; if (!h) h = 1;
-            VkBufferImageCopy r = { .bufferOffset = off, .bufferRowLength = 0, .bufferImageHeight = 0,
+            VkBufferImageCopy r = { .bufferOffset = u.off + off, .bufferRowLength = 0, .bufferImageHeight = 0,
                 .imageSubresource = { aspect, l, layer, 1 },
                 .imageOffset = { 0, 0, 0 }, .imageExtent = { w, h, 1 } };
-            vkCmdCopyBufferToImage(g_cb_up, stg, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            vkCmdCopyBufferToImage(g_cb_up, u.buf, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
             off += (VkDeviceSize)row_bytes * rows * (slices ? slices : 1);
         }
     }
@@ -694,9 +834,7 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
     int done = ok && one_end_on(g_cb_up, 1);   // M3-3a：1 = 上传（站点名与读回分开）| M3-3a: 1 = upload (site name split from readback)
 
-    vkUnmapMemory(vk_dev(), sm);
-    vkDestroyBuffer(vk_dev(), stg, NULL);
-    vkFreeMemory(vk_dev(), sm, NULL);
+    up_rel(&u);   // 环里那段偏移在 up_acq 里已经推进（本轮到这里队列已空闲）；只有老路才真的销毁 | the slice was released in up_acq (the queue is idle by now); only the old path actually destroys anything
     if (done) { atomic_fetch_add(&g_uploads, 1); atomic_fetch_add(&g_upload_bytes, (uint64_t)total); e->lay = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
     return done;
 }
