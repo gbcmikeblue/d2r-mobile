@@ -231,6 +231,13 @@ static void *thread_main(void *p) {
     t->mport = pthread_mach_thread_np(pthread_self());
 #if defined(__ANDROID__)
     t->tid = and_tid();   // 现场导出要用（见 thr_proc_dump）| Needed by the state dump (see thr_proc_dump)
+    // N4-d 第二部分：给**客体线程**起个可辨识的 `comm`（15 字节上限）。为什么必须有：`ftrace` / `ps -T` / `top`
+    // 里那条 `comm` 是**事后把 tid 认成"谁"的唯一凭据**，而经这里起的线程原来全都叫 `ai.d2rm.dm`（与进程名同）
+    // ⇒ 2026-10-16 的 atrace 现场里"哪个 tid 是主/前端"只能靠推。带上句柄之后：`dm-*` = 宿主起的、
+    // `dm-g*` = 客体起的，还能回查 `CreateThread h=…` 那几行。
+    // N4-d part 2: a recognisable comm (15 bytes max) for guest threads. ftrace / ps -T / top show only the comm,
+    // and every thread created here used to share the process name, so a tid could not be traced back to a role.
+    { char nm[16]; snprintf(nm, sizeof nm, "dm-g%x", t->handle); pthread_setname_np(pthread_self(), nm); }
 #endif
     crash_thread_init();
     guest_thread_init();
@@ -268,6 +275,10 @@ uint32_t svc_thread_main_init(void) {
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
 #if defined(__ANDROID__)
     t->tid = and_tid();   // 现场导出要用（见 thr_proc_dump）| Needed by the state dump (see thr_proc_dump)
+    // 客体主线程（= 宿主 `guest_thread` 那个 pthread）：见上面 thread_main 里那段说明。这个名字让 atrace 现场里
+    // 一眼看出"哪个 tid 跑的是 dm_main / 前端上屏那一路"。
+    // The guest main thread (the host's guest_thread pthread); see the note in thread_main above.
+    pthread_setname_np(pthread_self(), "dm-guest");
 #endif
     // 主线程的栈范围：bt_sample 只在这个范围里读 x29 链（读坏地址在安卓上会直接崩）
     // The main thread's stack range: bt_sample reads the x29 chain only inside it (a bad read would crash on Android)

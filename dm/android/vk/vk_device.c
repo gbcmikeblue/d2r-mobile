@@ -625,6 +625,7 @@ static VkFence g_ka_fence;
 static atomic_ullong g_ka_n, g_ka_skip, g_ka_err, g_ka_tick;
 
 static void *keepalive_main(void *arg) {
+    pthread_setname_np(pthread_self(), "dm-keep");   // N4-d：宿主线程要能在 atrace 里认出来 | name our own thread for atrace
     long ms = (long)(intptr_t)arg;
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_qfi };
     VkCommandPool cp = VK_NULL_HANDLE;

@@ -1112,11 +1112,19 @@ int vk_diag_line(char *buf, size_t cap) {
     if (g_vk2_gpu && n > 0 && (size_t)n < cap) {
         vk2_sub_stats ss; vk2_sub_stats_get(&ss);
         vk2_xfer_stats xs; vk2_xfer_stats_get(&xs);
+        // N4-d 第二部分：**三个水位线之间差 1 的口径**要靠"正在录的 frame"才能对齐（`vk2_sub_begin` 已经把这个
+        // frame 记进台账，只是没被报出来）。三个数一起读才有意义：`提交到 X` 是**已经交给队列的最大 frame**、
+        // `完成到 Y` 是**已确认完成的最大 frame**、`正在录 Z` 是**下一个要提交的 frame**（`vk2_sub_begin` 拿到
+        // 槽之后、`vk2_sub_commit` 之前，此时 Z 还没进队列）。⇒ 稳态下应满足 `Z == X + 1`（下一帧已开始录）、
+        // `X - Y == 在飞`；冻结时若 `X` 不涨而 `Y` 也不涨，才是"队列不动"（反过来 `X` 涨而 `Y` 不涨 = 在飞堆积）。
+        // N4-d part 2: the "off-by-one" between the three numbers can only be settled by also reporting the frame
+        // being recorded right now. In steady state Z == X+1 and X - Y == in-flight.
         n += snprintf(buf + n, cap - (size_t)n,
-                      "；**我方超时** 回读拷贝 %llu / 取槽 %llu；**提交到 %llu、完成到 %llu**（在飞 %d）"
+                      "；**我方超时** 回读拷贝 %llu / 取槽 %llu；**提交到 %llu、完成到 %llu、正在录 %llu**（在飞 %d）"
                       "；ReadTexels 读到 GPU 写过的贴图 %llu 次",
                       (unsigned long long)xs.fence_timeouts, (unsigned long long)ss.timeout_fails,
-                      (unsigned long long)g_fence, (unsigned long long)ss.reaped_max, vk2_sub_pending(),
+                      (unsigned long long)g_fence, (unsigned long long)ss.reaped_max,
+                      (unsigned long long)vk2_sub_frame(), vk2_sub_pending(),
                       (unsigned long long)vk_tex_reads_gpu_written());
     }
     return n;
@@ -1589,11 +1597,12 @@ report_ops:
             vk2_sub_stats ss; vk2_sub_stats_get(&ss);
             vk2_xfer_stats xs; vk2_xfer_stats_get(&xs);
             LOG("[vk] 提交 %llu：ReadTexels 读到 GPU 写过的贴图 %llu 次；**我方超时** 回读拷贝 %llu / 取槽 %llu；"
-                "提交失败 %llu、取不到槽 %llu；**提交到 frame %llu、完成到 frame %llu**（在飞 %d）",
+                "提交失败 %llu、取不到槽 %llu；**提交到 frame %llu、完成到 frame %llu、正在录 %llu**（在飞 %d）",
                 (unsigned long long)g_sub_total, (unsigned long long)vk_tex_reads_gpu_written(),
                 (unsigned long long)xs.fence_timeouts, (unsigned long long)ss.timeout_fails,
                 (unsigned long long)ss.submit_fail, (unsigned long long)ss.no_slot_fail,
-                (unsigned long long)g_fence, (unsigned long long)ss.reaped_max, vk2_sub_pending());
+                (unsigned long long)g_fence, (unsigned long long)ss.reaped_max,
+                (unsigned long long)vk2_sub_frame(), vk2_sub_pending());
         } else {
             LOG("[vk] 提交 %llu：ReadTexels 读到 GPU 写过的贴图 %llu 次（0 = 从 VkImage 读回那套暂时还只是工具）",
                 (unsigned long long)g_sub_total, (unsigned long long)vk_tex_reads_gpu_written());

@@ -162,6 +162,10 @@ static double now_s(void) {
 // line by line into `__android_log_print`. The dividend is that libc's and third-party libraries' messages come along
 // too, with not one line of the host changed.
 static void *log_pump(void *arg) {
+    // N4-d 第二部分：宿主自己的线程要能在 atrace / ps -T 里一眼认出来（`dm-*` = 宿主、`dm-g*` = 客体，
+    // 见 `hle_thread.c` 里那段说明）。这一条是"事后把 tid 认成谁"的唯一凭据。
+    // N4-d part 2: name our own threads so atrace / ps -T can tell them apart (dm-* ours, dm-g* the guest's).
+    pthread_setname_np(pthread_self(), "dm-log");
     int fd = (int)(intptr_t)arg;
     char buf[1024];
     size_t n = 0;

@@ -668,6 +668,14 @@ PC 侧的路径与工具见第二、三节；这里只说**跑一次并拿到读
 | `.work/vk2_pool_rounds.py` | **N1 起**：把某个探针跑 N 轮（第 1~N−1 轮带 tag 留档、**最后一轮不带 tag = 正式读数**）并打一张"字段 × 轮次"的对照表 ⇒ 一眼看出哪个字段轮间不一致（N1 四轮 29 个字段全一致；N2 判据字段全一致、只有六个时间字段抖动）。**N2 起带 `--probe` 参数**：`--probe vk2_xfer_probe` |
 | `.work/push_dev2.py` | 把设备侧数据推齐（逐文件 + 跳过已存在 + 重试；`spv` 走 tar） |
 | `.work/bg.py` | 把长任务放后台并把输出落盘（前台一条命令会堵住整个回合） |
+| `.work/n4_apk_round.py` | **N4 起**：一轮真机跑法的固定闭环（出包 → 设备端装机 → 推 conf → `force-stop` → `am start` → 等 N 秒 → 拉 `latest.log` → 抽账），读数落 `.work/logs/n4-<tag>.log`（不覆盖） |
+| `.work/n4d_rounds.py` | **N4-d 起**：顺序跑一批轮（第一轮带 `--build --install`），末尾打跨轮小结（出图峰值 / 最大心跳空隙 / 停住 / 判据行 / 等待站点 / 红行） |
+| `.work/n4d_shot2.py` | **N4-d 第二部分起**：一轮 = 推 conf → 重启 → 等 N 秒 → **截屏** + 完整日志，并把三件自证一起打出来（①启动头 `DM_WIN_SRC` ②**查看器亮度读数** ③心跳）—— **判"屏幕上是不是游戏画面"的专用工具**（`DM_WIN_SRC=0` 时屏幕上是 `paint()` 测试图） |
+| `.work/n4d_view_rounds.py` / `.work/n4d_view0_rounds.py` | 把"查看器打开"的 A′/B′ 各两轮（第 1 级）/ 各一轮（第 0 级）跑完并打跨轮小结 |
+| `.work/n4d_view_summary.py` | 把上面几轮的日志抽成一张表（出图峰值 / 心跳空隙 / 有目标 · 无目标 / 读成 · 跳过 / 亮度唯一值 / 红黄行数） |
+| `.work/n4d_atrace2.py` | **N4-d 第二部分起**：`atrace` 抓停顿（判到停顿后**再等 `--hold-s` 秒**才 stop，躲开停止动作的边界效应；`--want` 次；顺手落 `/proc/<pid>/task/*/comm` 的 tid 映射）。产物 `.work/trace/at_stall-<tag>-<k>.txt` + `tids-<tag>-<k>.txt` |
+| `.work/n4d_atrace_report3.py` / `.work/n4d_atrace_focus.py` / `.work/n4d_waker.py` | 读 atrace：第 3 版按"**持续抬升**"找停顿点（不是第一个/最后一个突变）并给逐线程表；`focus` 按**三本账**（换出 `prev_state` / 被唤醒 / 阻塞原因）算"谁在等谁"；`waker` 问"给定 tid **谁在唤醒它**"（跨所有进程，会露出 `<idle>` 那一档） |
+| `.work/poll.py` | 看 `.work/logs/bg-<tag>.txt` 的尾部 |
 
 ```powershell
 $adb = 'C:\Android\Sdk\platform-tools\adb.exe'
