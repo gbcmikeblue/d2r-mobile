@@ -41,6 +41,7 @@
 #define VK2_UPLOAD_BANKS 8
 #include "dm.h"
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -679,6 +680,176 @@ static int vb_fail_breakdown(char *buf, size_t cap) {   // 「没绑上（按流
     }
     return o;
 }
+
+// ============================================================================
+// N4-f：**顶点数据与常量缓冲的只读采样**（诊断，缺省关 `DM_VTX_PROBE=1`）
+// ============================================================================
+// 要回答的那句话（N4-e 把范围收到这里）：**"游戏那些绘制的顶点，经变换后到底在不在裁剪体里、有没有 NaN/Inf"**。
+// 本轮先问最直接的一半 —— **顶点数据本身**与**位置的变换矩阵（常量缓冲）**：
+//   `NaN/Inf 命中` 或 `数量级离谱`（|分量| 不在 1e-3~1e6 这个常见世界/局部坐标区间里）就是"一个片元都不产生"
+//   的经典形状；两样都正常，问题就落在着色器输出那一侧。
+// **为什么现在才做得了**：新地基的池是**本进程可读写的普通内存**（N1 / N4-a 的读数反复验过），而旧路的池也是
+// `mmap` 回来的普通内存 ⇒ **两臂都能在 CPU 侧直接读影子里的字节**，不必问 GPU、也不必改任何行为。
+// 纪律：**只读**（不改状态、不标脏、不提交）、**缺省关**、一个判据行采一个样本（一轮约 20 个）；
+// 与 N4-d（第一部分）同一条教训 —— 采样行的**位置**要挂在既有判据行上（第 ⑱ 条），否则一轮打不出几行。
+// Reading: NaN/Inf > 0 or a wild magnitude in the position stream means the vertex side is the cause of "not one
+// fragment"; a healthy range moves the question on to the shader's output.
+static _Atomic uint64_t g_vtx_samp, g_vtx_nan, g_vtx_inf, g_vtx_unread;   // 顶点采样：次数 / NaN / Inf / 读不了
+static _Atomic uint64_t g_ubo_samp, g_ubo_nan, g_ubo_inf;                 // 常量采样：次数 / NaN / Inf
+
+// 采样开关自证（**缺省关**；`DM_VTX_PROBE=0` 或未设都是关）
+static int vtx_probe_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_VTX_PROBE");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v)
+            LOG("【查】DM_VTX_PROBE=1：判据行处读一次**影子里的顶点数据与常量缓冲**（只读：不标脏、不提交）"
+                "——查 NaN / Inf / 数量级；位置属性取 Location 0（缺则取着色器声明的第一条真的绑了的）");
+    }
+    return v;
+}
+
+// 半精度 → 单精度。**NaN 的位要保住**（这个开关就是来问"有没有 NaN"的，把 NaN 折成 0 等于把判据删掉）。
+static float vtx_half(uint16_t h) {
+    uint32_t s = (uint32_t)(h >> 15) & 1u, e = (h >> 10) & 0x1fu, m = h & 0x3ffu, b;
+    float v;
+    if (e == 31) { b = (s << 31) | 0x7f800000u | (m << 13); memcpy(&v, &b, 4); return v; }
+    if (e == 0) { if (!m) return s ? -0.0f : 0.0f; v = (float)m * 5.9604644775390625e-8f; return s ? -v : v; }
+    b = (s << 31) | ((e + 112u) << 23) | (m << 13); memcpy(&v, &b, 4); return v;
+}
+static int vtx_is_nan(float v) { uint32_t b; memcpy(&b, &v, 4); return (b & 0x7f800000u) == 0x7f800000u && (b & 0x007fffffu) != 0; }
+static int vtx_is_inf(float v) { uint32_t b; memcpy(&b, &v, 4); return (b & 0x7fffffffu) == 0x7f800000u; }
+
+// 按 NVN 属性格式把指针处的分量解成浮点：1 = 浮点/归一化类（**可做数值判断**）、0 = 整数类或认不出的格式。
+// 编号与 vk_pipe.c 那张 `g_attr_fmt` 表同一套：分量数 = (f-1)/12 + 1；组内类型 k = (f-1)%12，其中
+// 0 UCharUNORM / 1 CharSNORM / 4 Half / 5 UShortUNORM / 6 ShortSNORM / 9 Float 是**浮点系**，其余是整数系。
+// 整数系（uint/sint）不做数值判断：它们在 IEEE 里不会出现 NaN/Inf，报了反而误导（第 ⑥ 条同一类"不许越读"）。
+static int vtx_decode(const uint8_t *p, uint32_t f, float out[4], int *ncomp) {
+    int n = 4, k = -1;
+    if (f >= 0x01 && f <= 0x30) { n = (int)((f - 1) / 12) + 1; k = (int)((f - 1) % 12); }
+    for (int i = 0; i < 4; i++) out[i] = 0.0f;
+    if (ncomp) *ncomp = n;
+    switch (k) {
+        case 0: for (int i = 0; i < n; i++) out[i] = (float)p[i] / 255.0f; return 1;
+        case 1: for (int i = 0; i < n; i++) { float v = (float)(int8_t)p[i] / 127.0f; out[i] = v < -1.0f ? -1.0f : v; } return 1;
+        case 4: for (int i = 0; i < n; i++) { uint16_t h; memcpy(&h, p + 2 * i, 2); out[i] = vtx_half(h); } return 1;
+        case 5: for (int i = 0; i < n; i++) { uint16_t h; memcpy(&h, p + 2 * i, 2); out[i] = (float)h / 65535.0f; } return 1;
+        case 6: for (int i = 0; i < n; i++) { int16_t h; memcpy(&h, p + 2 * i, 2); float v = (float)h / 32767.0f; out[i] = v < -1.0f ? -1.0f : v; } return 1;
+        case 9: for (int i = 0; i < n; i++) { float v; memcpy(&v, p + 4 * i, 4); out[i] = v; } return 1;
+        default: return 0;   // 整数类（uint / sint）：不做数值判断 | integer classes: no numeric verdict
+    }
+}
+
+// 安全拼接（**不**用 `o += snprintf(...)`：截断时 snprintf 返回"本来要写的长度"，`cap - o` 会下溢）
+static void vtx_cat(char *b, size_t cap, int *o, const char *fmt, ...) {
+    if (!b || !o || *o < 0 || (size_t)*o >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b + *o, cap - (size_t)*o, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    *o += n;
+    if ((size_t)*o >= cap) *o = (int)cap - 1;
+}
+
+// 判据行处的一次采样：位置属性的前几个顶点 + 顶点阶段第一个常量槽的前 64 字节。**只读**。
+static void vtx_sample(const vk_gfx_state *st, const vk_shader *vs, uint64_t draw_no, int nvert) {
+    // ---- ① 位置属性：Location 0（缺则取着色器声明的第一条真的绑了的）----
+    int loc = -1;
+    if (st->attr[0].valid) loc = 0;
+    else if (vs) for (uint32_t i = 0; i < vs->nin; i++) {
+        uint32_t l = vs->in[i].loc;
+        if (l < 16 && st->attr[l].valid) { loc = (int)l; break; }
+    }
+    if (loc < 0) {
+        atomic_fetch_add(&g_vtx_unread, 1);
+        LOG("【顶点采样】DRAW 第 %llu 次：**没有可用的位置属性**（Location 0 既没绑、着色器也没声明别的）：读不了",
+            (unsigned long long)draw_no);
+        return;
+    }
+    uint32_t f = st->attr[loc].nvn_fmt, off = st->attr[loc].offset;
+    uint32_t sidx = st->attr[loc].stream & 15, stride = st->stream[sidx].stride;
+    uint64_t addr = g_rs.vbuf[sidx].address, size = g_rs.vbuf[sidx].size;
+    int nv = stride ? 4 : 1;          // 步长 0 = NVN 的"常量流"（每个实例一个元素）⇒ 只读一个
+    int ncomp = 0, nan_n = 0, inf_n = 0, nz = 0, decoded = 0;
+    float lo = 0.0f, hi = 0.0f;
+    char vt[360]; int vo = 0;
+    vt[0] = 0;
+
+    void *bb = NULL; uint64_t bo = 0;
+    uint64_t need = (uint64_t)off + (uint64_t)(nv - 1) * (uint64_t)stride + 16;
+    if (!addr) vtx_cat(vt, sizeof vt, &vo, "**流%d 没绑（`vbuf.address` = 0）**", sidx);
+    else if (!mtl_addr(addr, need, &bb, &bo)) vtx_cat(vt, sizeof vt, &vo, "**流%d 地址 %#llx 不在池里（读不了）**", sidx, (unsigned long long)addr);
+    else {
+        const uint8_t *base = (const uint8_t *)(uintptr_t)vk2_ptr_mask((uintptr_t)addr);
+        for (int i = 0; i < nv; i++) {
+            float c[4];
+            if (!vtx_decode(base + off + (uint64_t)i * stride, f, c, &ncomp)) {
+                vtx_cat(vt, sizeof vt, &vo, "（格式 %#x 不是浮点/归一化类：不做数值判断）", f);
+                break;
+            }
+            decoded = 1;
+            vtx_cat(vt, sizeof vt, &vo, "%s(%g", i ? " " : "", (double)c[0]);
+            for (int j = 1; j < ncomp && j < 4; j++) vtx_cat(vt, sizeof vt, &vo, ",%g", (double)c[j]);
+            vtx_cat(vt, sizeof vt, &vo, ")");
+            for (int j = 0; j < ncomp && j < 4; j++) {
+                if (vtx_is_nan(c[j])) nan_n++;
+                else if (vtx_is_inf(c[j])) inf_n++;
+                else { float a = c[j] < 0 ? -c[j] : c[j]; if (a > 0) { nz++; if (a > hi) hi = a; if (!lo || a < lo) lo = a; } }
+            }
+        }
+    }
+    atomic_fetch_add(&g_vtx_samp, 1);
+    atomic_fetch_add(&g_vtx_nan, (uint64_t)nan_n);
+    atomic_fetch_add(&g_vtx_inf, (uint64_t)inf_n);
+
+    // ---- ② 变换矩阵：顶点阶段**所有**有地址的常量槽，各读前 64 字节（16 个 float）----
+    // **为什么不是"第一个非零槽"就够**（第一轮读数给的更正）：第一轮 A 臂 12 个样本里，`常量[0][0]`
+    // 的前 4 个是 `-0.00125,0,0,0`（|最大| 2）—— 那**不像**变换矩阵；同一轮另一条样本里
+    // `0.766044,0,-0.642788,0`（|最大| 1055）才是旋转/平移那一类 ⇒ **只查一个槽会漏掉真正在做变换的那一段**
+    // （第 ⑩ 条的同类："快照取在哪"直接改变结论）。所以这里改成扫全部槽，只有第一个槽额外报前 4 个值。
+    char ut[560]; int uo2 = 0;
+    ut[0] = 0;
+    int nub = 0, u_nan = 0, u_inf = 0; float u_hi = 0.0f;
+    for (int i = 0; i < 16; i++) {
+        uint64_t a2 = g_rs.ubo[0][i].addr, s2 = g_rs.ubo[0][i].size;
+        if (!a2 || !s2) continue;
+        nub++;
+        vtx_cat(ut, sizeof ut, &uo2, "%s槽%d:", nub > 1 ? "；" : "", i);
+        uint64_t n = s2 < 64 ? s2 : 64;
+        int nf = (int)(n / 4);
+        void *ub = NULL; uint64_t ub_off = 0;
+        if (!nf) { vtx_cat(ut, sizeof ut, &uo2, "小(%lluB)", (unsigned long long)s2); continue; }
+        if (!mtl_addr(a2, n, &ub, &ub_off)) { vtx_cat(ut, sizeof ut, &uo2, "不在池里"); continue; }
+        const uint8_t *up = (const uint8_t *)(uintptr_t)vk2_ptr_mask((uintptr_t)a2);
+        int kn = 0, ki = 0; float kh = 0.0f;
+        for (int k2 = 0; k2 < nf; k2++) {
+            float v;
+            memcpy(&v, up + 4 * k2, 4);
+            if (nub == 1 && k2 < 4) vtx_cat(ut, sizeof ut, &uo2, k2 ? ",%g" : "%g", (double)v);
+            if (vtx_is_nan(v)) kn++;
+            else if (vtx_is_inf(v)) ki++;
+            else { float aa = v < 0 ? -v : v; if (aa > kh) kh = aa; }
+        }
+        vtx_cat(ut, sizeof ut, &uo2, "…(NaN %d/Inf %d/|max| %g)", kn, ki, (double)kh);
+        u_nan += kn; u_inf += ki;
+        if (kh > u_hi) u_hi = kh;
+        atomic_fetch_add(&g_ubo_samp, 1);
+        atomic_fetch_add(&g_ubo_nan, (uint64_t)kn);
+        atomic_fetch_add(&g_ubo_inf, (uint64_t)ki);
+    }
+    if (!nub) vtx_cat(ut, sizeof ut, &uo2, "顶点阶段的常量槽：**一个都没绑**");
+
+    LOG("【顶点采样】DRAW 第 %llu 次（%d 个顶点、vs=%s）：位置 属性%d 流%u 步长%u 偏移%u 格式%#x vbuf=%#llx/%llu；%s"
+        "；NaN %d、Inf %d、非零 %d%s"
+        "｜常量 %d 个槽：%s；合计 NaN %d、Inf %d、|最大| %g",
+        (unsigned long long)draw_no, nvert, vs ? vs->key : "无", loc, sidx, stride, off, f,
+        (unsigned long long)addr, (unsigned long long)size, vo ? vt : "（空）",
+        nan_n, inf_n, nz,
+        decoded ? (nz ? "" : "（**全零**）") : "",
+        nub, uo2 ? ut : "（空）", u_nan, u_inf, (double)u_hi);
+}
 static uint8_t g_opring[32];
 static _Atomic unsigned g_opring_i;
 static uint64_t g_last_rt[8];
@@ -1169,6 +1340,19 @@ int vk_diag_line(char *buf, size_t cap) {
                       (unsigned long long)atomic_load(&g_vb_ok), (unsigned long long)atomic_load(&g_vb_fail),
                       (unsigned long long)atomic_load(&g_vb_none), (unsigned long long)atomic_load(&g_draw_v0),
                       (unsigned long long)atomic_load(&g_draw_i0));
+        // N4-f：顶点/常量侧那几格。**只在开了采样时出现**（缺省关 ⇒ 这一行的长度与 N4-e 逐字节相同，
+        // "缺省关不改变既有判据"这条口径因此是可核的）。明细在判据行那条【顶点采样】里（心跳放不下）。
+        uint64_t vs_n = atomic_load(&g_vtx_samp), us_n = atomic_load(&g_ubo_samp);
+        if ((vs_n || us_n) && (size_t)n < cap) {
+            int m = snprintf(buf + n, cap - (size_t)n,
+                             "；**顶点采样 %llu 次**（NaN %llu / Inf %llu / 读不了 %llu）；常量采样 %llu 次（NaN %llu / Inf %llu）",
+                             (unsigned long long)vs_n, (unsigned long long)atomic_load(&g_vtx_nan),
+                             (unsigned long long)atomic_load(&g_vtx_inf), (unsigned long long)atomic_load(&g_vtx_unread),
+                             (unsigned long long)us_n, (unsigned long long)atomic_load(&g_ubo_nan),
+                             (unsigned long long)atomic_load(&g_ubo_inf));
+            if (m > 0) n += m;
+            if ((size_t)n > cap) n = (int)cap;
+        }
     }
     return n;
 }
@@ -3288,6 +3472,12 @@ void mtl_exec(const uint8_t *p) {
                     fbo ? fbs : "无",
                     (unsigned long long)atomic_load(&g_vb_none), (unsigned long long)atomic_load(&g_draw_v0),
                     (unsigned long long)atomic_load(&g_draw_i0));
+                // N4-f：**同一个节流点**上采一个顶点/常量样本（缺省关）。为什么不另开节流：判据行本身
+                // 已经是"前 8 次 + 每 2048 次"，另开一条节流在一轮 ~3 万次绘制里会**两次都打不出**（第 ⑱ 条）。
+                if (vtx_probe_on()) {
+                    int dcnt = (h.op == OP_DRAW_IDX) ? (int)((const p_draw_idx *)a)->count : (int)d->count;
+                    vtx_sample(&stv, shs[0], k + 1, dcnt);
+                }
             }
             break; }
 
