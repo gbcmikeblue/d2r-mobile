@@ -300,6 +300,37 @@ target_link_libraries(vk2_takeover_probe PRIVATE vulkan)
 target_link_options(vk2_takeover_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk2_takeover_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
 
+# 新地基 **N4-g** 的能力探针（**只问不接管**，N0 的形状）：N4-e/N4-f/A1 之后只剩「顶点着色器输出」，
+# 而"不改产物地拿到 gl_Position 真值"的唯一硬办法是 `VK_EXT_transform_feedback` ⇒ 它有没有决定 N4-g 走哪条路。
+# 顺带把 A1 那一轮层点名的三个扩展、几条上限（裁剪/剔除距离、顶点输出、transform feedback、视口）与
+# "按游戏路径那份扩展清单建一次逻辑设备"（层喊的 01387 是不是依赖没满足）一起问掉。
+# 自证：扩展枚举报"设备一共报了几个扩展"、点名扩展报"在第几条"、特性结构体逐 bool 打 0/1。
+# 不进宿主也不进 APK。读数落 .work/logs/probe-<串号>-vk2_cap_probe[-tag].txt（走 .work/probes.py run）。
+# The N4-g capability probe (ask only, the shape of N0): after N4-e/N4-f/A1 only the vertex shader's output is
+# left, and the only hard way to get the real gl_Position without touching an artifact is
+# VK_EXT_transform_feedback, so its presence decides N4-g's route. It also asks the three extensions the A1
+# validation layer named, a handful of limits, and creates a logical device with the game path's extension
+# list (to answer the layer's 01387). Part of neither the host nor any APK.
+add_executable(vk2_cap_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_cap_probe.c)
+target_link_libraries(vk2_cap_probe PRIVATE vulkan)
+target_link_options(vk2_cap_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk2_cap_probe PRIVATE ${COMPAT})
+
+# 新地基 **N4-g** 的最小自证探针（"我们自己的一个三角形"）：两格只差**一处** —— 顶点着色器里
+# `gl_PerVertex` 声明的 `gl_ClipDistance[8]` + `gl_CullDistance[1]`（= 9，而本设备
+# `maxCombinedClipAndCullDistances` = 8），而两份都不写它们。判据 = 画一次、读回来数红像素。
+# 起因：本轮的主刀（`VK_EXT_transform_feedback` 抓 `gl_Position`）要求给游戏那份 SPIR-V 加 Xfb 装饰，
+# 而本轮明令"不许改产物" ⇒ 退到最小自证。SPIR-V 由 `.work/n4g_tri_spv.py` 生成（NDK 自带 glslc）、
+# `.work/n4g_tri_push.py` 推进设备，探针从 /data/local/tmp/dm/tri 读。
+# The minimal self-proof probe of N4-g: two cells differing in exactly one place -- the gl_PerVertex
+# declaration of gl_ClipDistance[8] + gl_CullDistance[1] (9 > this device's combined limit of 8), neither
+# written. Missing Xfb decorations in the game's SPIR-V block the transform-feedback route, so this is the
+# minimal self-proof instead. Part of neither the host nor any APK.
+add_executable(vk2_tri_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_tri_probe.c)
+target_link_libraries(vk2_tri_probe PRIVATE vulkan)
+target_link_options(vk2_tri_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk2_tri_probe PRIVATE ${COMPAT})
+
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；
 # 打成 APK 留到 M2 之后（那时才有画面）。

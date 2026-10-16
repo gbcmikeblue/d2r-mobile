@@ -813,6 +813,64 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
   用 `DM_PASS_PROBE` 已知色底子做一个最小"我们自己的三角形"落屏自证"。
   工具 `.work/n4f_confs.py`（三份 conf）、`.work/n4f_report.py`（抽表：格式→分量数、逐槽 |max|、NaN/Inf 合计）；
   结论见「八、N4-f」。
+ ▶ **回勾（2026-10-16，本轮）：N4-g 做完 —— ① 带层的 B 臂把 15 种 VUID 逐名对上、② 能力问到了、
+ ③ 但 TF 这条路被"不许改产物"挡住、④ 两条替代路各给出一条读数（**一条负结果 + 一条决定性负结果**）** ——
+  **① 一把免费的筛子**（`.work/vklayer_round.py --conf .work/vklayer-b.conf --tag vk-b1`，B 臂的 conf 与 A1 的
+  `.work/vklayer-a.conf` **只差一行**：不设 `DM_GFX2`）：层加载自证 3 条；**按 VUID 名逐项对比**
+  （新脚本 `.work/vuid_species_diff.py vk-a2 vk-b1`）—— **A 15 种 / B 15 种 / 两臂共有 15 种**，
+  **只有 A 臂 0 种、只有 B 臂 0 种** ⇒ **新地基没有引入任何一条新的用法错误**（提示词里"只有新地基才有的那堆
+  延后"这条判据**没有可延后的对象**）。15 种里**唯一落在"顶点输出那一层"的是
+  `VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710`（A×20 / B×20）**；组 (a) 的第一优先
+  `vkBindBufferMemory-memory-01035/01508/02726`（14/14/14）的**原文**显示它就是我们自己的**内存换轨**
+  （缓冲声明要类型 0/6、绑到**导出过的**类型 4 内存、dedicated 给另一个 buffer、带偏移）—— **旧路一模一样**。
+  **② 能力**（新探针 `dm/android/vk2/vk2_cap_probe.c`，只问不接管）：设备 **165 个扩展**、
+  **`VK_EXT_transform_feedback` 在（第 117 条）、`transformFeedback = 1`、`geometryStreams = 1`**；
+  `VK_EXT_fragment_shader_interlock` **不在设备上**（层的 20 条抱怨 = 真没这个扩展）；
+  **`shaderClipDistance = 1` / `shaderCullDistance = 1`（设备支持，我们从来没启用过）**；
+  **`maxCombinedClipAndCullDistances = 8`**（`maxClipDistances` / `maxCullDistances` 都是 8）。
+  **③ TF 这条路本轮不走**：Vulkan 的 transform feedback 只抓**声明了 `XfbBuffer` / `Offset` 装饰**的输出，
+  而离线核对 `.work/spv` 6923 份里 **0 份带这类装饰**（只有 1 份带 `OpExecutionMode Xfb`）⇒ 要用它抓游戏的
+  `gl_Position` **必须给游戏那份 SPIR-V 加装饰**，与本轮写死的"**不动 SPIR-V / 改写产物**"直接冲突 ⇒
+  改走计划里的替代路（离线核对 + 我们自己的三角形最小自证）。
+  **④ 离线核对（替代路 ①）**：`spirv-dis`（NDK 自带）反汇编主路径顶点着色器 `f88d27f131d71049`：
+  `%gl_PerVertex = OpTypeStruct %v4float %float %_arr_float_uint_8 %_arr_float_uint_1`，成员装饰
+  0=Position / 1=PointSize / **2=BuiltIn ClipDistance** / **3=BuiltIn CullDistance**；**对 `%gl_PerVertex`
+  的全部取值链只有 9 条**（PointSize、Position.x/y/z/w 各两次）—— **没有一条点到成员 2 或 3**。
+  全库扫描（`.work/clipdist_use.py`，6923 份）：**声明 `ClipDistance[8]` + `CullDistance[1]` 的 2345 份
+  （全是顶点着色器；合计 9 > 设备上限 8 ⇒ 那 20 条 00710 的来源）、其中「写」0 份、「读」0 份**；
+  这个形状是译文器**无条件**产出的（`dm/third_party/ryujinx/…/CodeGen/Spirv/Declarations.cs:454-476`；
+  `Translation/Translator.cs:262-268` 只在 `ClipDistancesWritten != 0` 时才补 8 个 0 存储）⇒
+  **"驱动看到 9 个裁剪/剔除距离、内容未定义"**。
+  **⑤ 单变量实验 1（游戏路径，`DM_CLIPDIST`，缺省关）**：`vk_device.c` 里把
+  `shaderClipDistance` / `shaderCullDistance` 挂进特性链（带启动头自证行）；两轮游戏**只差 conf 里一行**
+  （`n4g-clip-a0` 启用 0 / `n4g-clip-a1` 启用 1）：**两轮查看器亮度都是 `均值 0.0 / 最小 0 / 最大 0`**
+  （读成功 121 / 301）⇒ **负结果：打开这两个特性不改变画面**。
+  **⑥ 单变量实验 2（新探针 `vk2_tri_probe`，四格）**：两份**只差一处**的顶点着色器（NDK 自带 `glslc` 生成、
+  `spirv-dis` 自证差异）——A = `Clip[1] + Cull[1] = 2`（glslang 对"没提过裁剪距离"的着色器产出的形状）、
+  B = `Clip[8] + Cull[1] = 9 > 8`（**照游戏那份的形状**），两份都**不写**裁剪/剔除距离；其它一切
+  （片段着色器 / 图 / 清除 / 视口 / 绘制调用）**完全相同**。读数：**A 32640 红像素 / B 32640 红像素**
+  （总 65536 ⇒ 半屏 = 三角形该占的 49.8%），**特性关/开两档都一样** ⇒ 判据写死的那三格里
+  **"两格都落屏 ⇒ 这一支被排除"** —— **「声明 9 个裁剪/剔除距离却从不写」不足以让这台 Adreno 830 的图元消失**；
+  顺带证明**我们自己的三角形能在这一层落屏**（光栅化本身是通的）。
+  **⑦ 回归**：N1/N2/N3/N4-b 四个探针各重跑一轮（`-n4gregress`），另把 `vk2_sub_probe` 多跑三轮看轮间区间
+  （`.work/n4g_sub_rounds.py`，`…-n4gsub{1,2,3}.txt`）：**非时间的判定键三轮全一致**（`G4_COMMITS` / `G4_SUBMITS` /
+  `G4_RECLAIMS` 24/24/24、`G4_SUBMIT_FAIL` 0、`G4_IDLE_ZERO` 1、`SUB_*_TOTAL` 152、`*_IDLE_CALLS` /
+  `*_FENCE_TIMEOUTS` 0、`WAITALL_*` 3/3/0）、**`VK2_INFLIGHT_CHOSEN` 三轮都是 3**（回归轮里那个 4 是一次坏测量
+  带出来的派生值）；**本轮没有改新地基的任何模块**（`vk2_*.c` 一行未动），改的只有 `vk_device.c` 里那两个
+  **缺省关**的核心特性位。⚠ 顺带记下探针自己的一个读数缺陷：`VK2_D3_TO_D4_GAIN_PM` 在某档测成 ≈0 时会给
+  天文数字（三轮 = 3.99e15 / 3.85e15 / 13）⇒ **判据别读它**。
+  ⇒ **本轮净结论**：**顶点输出的"裁剪/剔除距离"这一层被两刀排除**（声明形状 + 特性开关都排掉了），
+  剩下的是**其余两臂共有的那几条**（`pCode-08737` 的 SPIR-V 自身不合法、image view / copy image 的 aspect、
+  信号量重复 signal、交换链 `compositeAlpha`…）与**"游戏那些绘制自己的管线/状态"**。
+  **下一个 = N4-h**：把**我们自己的三角形画进游戏的通道里**（`DM_PASS_PROBE=28` 的已知色底子上，用
+  已经跑通的 `vk2_tri_probe` 那套最简管线 + 一个缺省关的 `DM_TRI_IN_GAME=<绘制序号>`）——
+  它落屏 ⇒ **通道与状态在那一刻是好的、只有游戏的绘制产不出片元**（范围再钉死一层，与 A1 的负结果合起来
+  把责任推给"游戏着色器 / 管线状态"）；它也不落屏 ⇒ **那一层（通道/视口/裁剪/附件）本身有问题**（先修那里）。
+  工具：`.work/n4g_tri_spv.py`（生成两份变体 + 自证）、`.work/n4g_tri_push.py`（推 SPIR-V）、
+  `.work/n4g_clip_rounds.py`（游戏两轮并排）、`.work/n4g_regress.py` / `.work/n4g_sub_rounds.py`（回归）、
+  `.work/vuid_species_diff.py`（按 VUID 名分堆）、`.work/regress_diff.py`（通用逐键比对）、
+  `.work/clipdist_use.py`（离线用途分析）、`.work/spv_dump_ops.py`（自写反汇编，后改用 NDK 的 `spirv-dis`）；
+  结论见「八、N4-g」，仪器事实见 `TOOLS` B¹²。
 
 1. ~~**里程碑 B：客体停住**（任务图侧）~~ —— **2026-10-15「M3-2t」结案（任务图这条线）**：三张位图做了时间序列，
    三轮真机读数把「M3-2s」第四节的甲（上膛 0 位）/ 乙（完成后被清）分开了 —— **甲否掉、乙成立**：待派发最大
@@ -3999,6 +4057,188 @@ VUID 去重 **16 种**。逐条定性（`vklayer_report.py` 归类 → `vklayer_
 `vklayer_msgs.py` / `vklayer_ctx.py`（抽完整消息体 —— 层的"具体原因"在 `MessageID` 之后的续行里，**只看首行会漏掉最关键那句**）、
 `vklayer_vuid_check.py`（离线核 `OpCapability`）、`vklayer_builtin_check.py`（离线核 `BuiltIn`）、
 `vklayer_fp64_check.py`（离线核 64 位算术）、`vklayer_off.py`（退回常态）。
+
+---
+
+### N4-g：只剩"顶点着色器输出" —— ① 用带层的 **B 臂**把 15 种 VUID 逐名对上、② 问到了设备能力、③ TF 被"不许改产物"挡住、④ 两条替代路各给一条读数（2026-10-16，第一台 Adreno 830）
+
+**这一轮的题目**（提示词里写死的）：N4-e 把"画面在哪"收进**光栅化之前**，N4-f 排掉**顶点数据 / 常量缓冲**，
+A1 给出一条负结果（**16 种 VUID 里没有一条是 draw 层面的用法错误**：顶点缓冲没绑 / 管线与通道不兼容 /
+描述符没绑 / 顶点属性与声明不匹配**都不报**）⇒ **只剩"顶点着色器输出"**：
+"经变换后在不在裁剪体里 / 有没有 NaN"，或者"几何是自己算没了"背后的**别的共用代码**。
+
+**第 0 步 ①：跑一轮「带层的 B 臂」（旧路对照）—— 一把免费的筛子**
+
+- 跑法：`.work/vklayer_round.py --conf .work/vklayer-b.conf --tag vk-b1 --secs 45 --build --install`；
+ `.work/vklayer-b.conf` 与 A1 的 `.work/vklayer-a.conf` **只差一行**（不设 `DM_GFX2`）⇒ 两臂只差一个变量。
+- 自证：logcat 里 `added global layer …` + `Loaded layer VK_LAYER_KHRONOS_validation` 共 **3 条**
+ （**0 条 = 层没加载**，这是判据）；B 臂 logcat 1,583,749 字节（10567 行）、层报 **217 Error / 20 Warning**。
+- 判据脚本（本轮新写）：`.work/vuid_species_diff.py vk-a2 vk-b1` —— **按 VUID 名**逐项对比
+ （不许看总条数：`pCode-08740` 是每个 module 报一次、只报第一个未满足的 capability ⇒ 修一条会改报另一条、
+ 总数一点不变，A1 的教训）。
+- **读数：A 15 种 / B 15 种 / 两臂共有 15 种；只有 A 臂 0 种、只有 B 臂 0 种**
+ ⇒ **新地基没有引入任何一条新的用法错误**；提示词里那条判据（"只有新地基才有的那堆**延后**"）
+ **没有可延后的对象** ⇒ 整片 (a) 退化成"两臂共有的 15 条按离几何/顶点的远近排队"。
+- 15 种（A×n / B×n）：`pCode-08740` 20/20、`pCode-08742` 20/20、
+ **`RuntimeSpirv-maxCombinedClipAndCullDistances-00710` 20/20**、`imageCreateMaxMipLevels-02251` 20/20、
+ `ImageViewCreateInfo-usage-08931` 20/20、`vkCmdCopyImage-aspectMask-00142` 20/20、`-00143` 20/20、
+ `vkBindBufferMemory-memory-01035` 14/14、`-01508` 14/14、`-02726` 14/13、`pCode-08737` 12/12、
+ `ImageViewCreateInfo-image-04441` 10/10、`vkQueueSubmit-pSignalSemaphores-00067` 8/8、
+ `vkCreateDevice-ppEnabledExtensionNames-01387` 2/2、`VkSwapchainCreateInfoKHR-compositeAlpha-01280` 2/2。
+- **组 (a) 的第一优先（`vkBindBufferMemory` 三条）的原文**（`.work/logs/logcat-vk-b1.txt`）：
+ `buffer requires memoryTypeBits (0x41) but bound memory (VkDeviceMemory 0x1a…) was allocated with
+ memoryTypeIndex (4)`；`memory … is dedicated allocation, but VkMemoryDedicatedAllocateInfo::buffer
+ VkBuffer 0x19… must be equal to VkBuffer 0x1d… and memoryOffset 14016`；
+ `memory … has an external handleType of VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT which does not
+ include at least one handle from VkBuffer …`
+ ⇒ **这三条说的就是我们自己的内存换轨**（缓冲声明要类型 0/6、绑到**导出过的**类型 4 内存、dedicated 给
+ 另一个 buffer、带 14016 的偏移），**旧路一模一样**（两臂同名同量级）⇒ 它与"画面全零"是不是因果要
+ **单独一块**才谈；本轮证据链的收窄**没有指向它**（它是内存那一层，而"画面零"的形状是"片元没落下"）。
+
+**第 1 步 ②/③：问设备能力（新探针 `vk2_cap_probe`，只问不接管；`cmd gpu vkjson` 同向）**
+
+- 新文件 `dm/android/vk2/vk2_cap_probe.c`（接进 `dm/android/CMakeLists.txt` 与 `.work/probes.py` 的 `ALL`）。
+ 自证口径：**扩展枚举报"设备一共报了几个"**（不是"我认出几个"）、**点名扩展报"在第几条"**、
+ **特性结构体逐 bool 打 0/1**（不打"支持/不支持"这种二次加工的词）。读数
+ `.work/logs/probe-8b1f1e50-vk2_cap_probe.txt`（`.work/logs/vkjson-8b1f1e50.json` 是同时落盘的 `cmd gpu vkjson` 原文）。
+- **设备 165 个扩展**（首次问得 165、本次取到 165）：
+ - **`VK_EXT_transform_feedback` 在，第 117 条**；`VkPhysicalDeviceTransformFeedbackFeaturesEXT`
+   **`transformFeedback = 1`、`geometryStreams = 1`**；上限
+   `maxTransformFeedbackStreams = 4`、`maxTransformFeedbackBuffers = 4`、
+   `maxTransformFeedbackBufferSize = 1 GiB`、`maxTransformFeedbackStreamDataSize = 2048`、
+   `maxTransformFeedbackBufferDataSize = 2048`、`maxTransformFeedbackBufferDataStride = 2048`；
+   布尔 `transformFeedbackQueries = 1`、`transformFeedbackRasterizationStreamSelect = 1`、**`transformFeedbackDraw = 1`**、
+   `transformFeedbackStreamsLinesTriangles = 0`
+ - **`VK_EXT_fragment_shader_interlock` 不在设备上** ⇒ A1 那 20 条"`SPV_EXT_fragment_shader_interlock` 未启用"
+   是**真的没这个扩展**（不是我们忘了开）；`VK_EXT_vertex_attribute_divisor` 在（第 56 条，两个 bool 都 1）、
+   `VK_EXT_provoking_vertex` 在（第 119 条）、`VK_EXT_depth_clip_control` 在（第 116 条）、
+   `VK_EXT_external_memory_host` **不在**
+ - **核心特性（N4-g 最要紧的一格）**：**`shaderClipDistance = 1`、`shaderCullDistance = 1`**（设备支持）、
+   `geometryShader = 1`、`tessellationShader = 1`、`multiViewport = 1`、`depthClamp = 1`、`independentBlend = 1`
+ - 上限：**`maxClipDistances = 8`、`maxCullDistances = 8`、`maxCombinedClipAndCullDistances = 8`**、
+   `maxVertexOutputComponents = 128`、`maxVertexInputAttributes = 32`、`maxVertexInputBindings = 32`、
+   `maxViewports = 16`、`maxViewportDimensions = [16384, 16384]`
+ - 按游戏路径那份扩展清单（`VK_KHR_external_memory_fd` / `VK_ANDROID_external_memory_android_hardware_buffer` /
+   `VK_EXT_vertex_attribute_divisor`）**建逻辑设备成功（VkResult 0）** ⇒ 层喊的 `01387` 不在那三条里
+   （剩下的嫌疑是 `VK_KHR_swapchain` 那一支 —— **低优先，待核**）。
+
+**③ 本轮主刀的路线判定：TF 能力在，但这条路被"不许改产物"挡住（本轮不走）**
+
+- Vulkan 的 transform feedback 只捕获**声明了 `XfbBuffer` / `XfbStride` / `Offset` 装饰**的输出
+ （`OpDecorate` / `OpMemberDecorate`），并且入口点要带 `OpExecutionMode Xfb`。
+- 离线核对（扫 `.work/spv` 全部 6923 份）：**带 Xfb 装饰的 0 份**、**带 `OpExecutionMode Xfb` 的只有 1 份**。
+- ⇒ 用 TF 抓游戏的 `gl_Position` **必须给游戏那份 SPIR-V 加装饰**，而本轮写死的"不做"里有一条正是
+ "**不动 RomFS / SPIR-V / 改写产物**（transform feedback 抓的是游戏自己那份 SPIR-V 跑出来的输出，
+ **不许去改它**）" ⇒ **TF 本轮不走**，改走计划里的替代路（离线核对 + 我们自己的三角形最小自证）。
+- **这条要留档**：TF 的能力已经问到（下轮要重开这条路，只要"给游戏那份产物加装饰"这件事被批准即可；
+ 探针侧的机制**还没验过**，属于下一轮的账）。
+
+**④ 离线核对（替代路 ①）：`gl_ClipDistance` 是"只声明、从不写"**
+
+- 工具：**NDK 自带的 `spirv-dis.exe` / `glslc.exe` / `spirv-as.exe`**
+ （`C:\Android\Sdk\ndk\30.0.16248370\shader-tools\windows-x86_64\`，本机实测路径见 `TOOLS` B¹²）——
+ 比自写的解析器权威得多（`.work/spv_dump_ops.py` 是本轮先写的自写反汇编，后改用 `spirv-dis`）。
+- **主路径顶点着色器 `f88d27f131d71049` 的反汇编**（`.work/logs/dis-f88d27f131d71049.txt`）：
+ - `%gl_PerVertex = OpTypeStruct %v4float %float %_arr_float_uint_8 %_arr_float_uint_1`；
+   成员装饰 `0 BuiltIn Position` / `1 BuiltIn PointSize` / **`2 BuiltIn ClipDistance`** / **`3 BuiltIn CullDistance`**；
+ - **对 `%gl_PerVertex` 的全部取值链只有 9 条**：`%88`（PointSize）、`%91/%93/%95/%97`（Position.x/y/z/w）、
+   `%175/%189/%196/%198`（Position 的第二次写）—— **没有一条点到成员 2 或 3**。
+- **全库扫描**（`.work/clipdist_use.py`，第三版；读数 `.work/logs/clipdist-use.txt`）：
+ - **声明 `ClipDistance[8]` 成员的 2345 / 6923**、声明 `CullDistance[1]` 的也是 **2345**（全是顶点着色器）；
+ - **「写」0 份、「读」0 份**（`OpStore` / `OpLoad` 的指针操作数等于那条取值链的**0 次**）；
+ - ⇒ **8 + 1 = 9 > 设备上限 8**，正是 `00710` 那 20 条；**而驱动看到的内容是未定义的**。
+- **形状来自译文器，不是游戏写的**：`dm/third_party/ryujinx/…/CodeGen/Spirv/Declarations.cs:454-476`
+ （`CreatePerVertexStructType` **无条件**建 `float[8]` + `float[1]` 两个成员）+
+ `Translation/Translator.cs:262-268`（`InitializeVertexOutputs` **只在 `ClipDistancesWritten != 0` 时**
+ 才补 8 个 0 存储）⇒ 本游戏 `ClipDistancesWritten == 0`（离线读数：0 份写）⇒ **那 8 个 0 存储也不在**。
+- **⚠ 仪器自己踩的坑（第 ㉒ 条同源，本轮第二次）**：第一版 `.work/clipdist_check.py` 用"取值链的**下标里
+ 出现 2**"当"访问了 ClipDistance"，于是把 `[0,2]`（= **Position.z**，成员 0 是 `vec4`、第 2 个分量）
+ 读成了 ClipDistance，报出"2344 份在写"这样一个**假读数**；第三版把**类型链解析做对**（`OpTypeStruct` /
+ `OpTypeArray` / `OpTypeVector` 递归）并**按 BuiltIn 判**之后才归零。⇒ **"下标里有个数"不等于"点到了那个成员"**。
+
+**⑤ 单变量实验 1（游戏路径，`DM_CLIPDIST`，缺省关）：负结果**
+
+- 改 `dm/android/vk/vk_device.c`（**一处**）：把 `shaderClipDistance` / `shaderCullDistance` 两个**核心特性**
+ 挂进 `feats.features`（此前**从来没挂过**）；开关 `DM_CLIPDIST` **缺省关**（= 一字不改的既有行为）、
+ `=1` 才开；启动头一行自证
+ `[vk] shaderClipDistance/shaderCullDistance：设备支持 %d（… %d / … %d）、本轮启用 %d（DM_CLIPDIST 缺省关）；
+ 设备 maxCombinedClipAndCullDistances = %u，而译文器在 gl_PerVertex 里声明的 8 + 1 = 9`。
+- 两轮游戏（**同一份已装 APK**，conf 只差一行；`.work/n4g_clip_rounds.py`）：
+ `n4g-clip-a0`（自证「本轮启用 0」）/ `n4g-clip-a1`（自证「本轮启用 1」）；
+ 两轮**查看器都打开**（启动头 `DM_WIN_SRC=28`；`.work/n4d_shot2.py`）。
+- **读数：两轮的亮度都是 `均值 0.0 / 最小 0 / 最大 0`**（a0 读成功 121、跳过 325；a1 读成功 301、跳过 263），
+ 截图 `.work/logs/n4b-n4g-clip-a0.png`（17763 字节）/ `-a1.png`（17778 字节）⇒ **负结果：
+ 打开这两个特性不改变画面**（这与"两个特性都没启用过"这一条**不构成因果**）。
+- 顺手核到的两轮形态（沿用口径，不看这一轮停没停）：两轮都在 22 秒内出现 `VkResult -4` ×4 + 一条卡死报告
+ （**设备丢失型**），出图 75 / 123 ⇒ 亮度那条判据不受影响（**读成功**的次数各 121 / 301 是自证）。
+
+**⑥ 单变量实验 2（新探针 `vk2_tri_probe`）：我们自己的三角形 —— 一条判定性负结果**
+
+- **为什么这么做**：TF 那条路被挡住（见 ③）⇒ 走计划里的替代路 ②。两格**只差一处**：
+ - A = `tri_min.vert`：**glslang 对"没提过裁剪距离"的着色器产出的形状**（`ClipDistance[1]` + `CullDistance[1]`
+   + `PointSize`）⇒ 合计 **2 ≤ 8**；
+ - B = `tri_clip.vert`：**照游戏那份的形状显式重声明** `gl_PerVertex`（`Position` + `PointSize` +
+   `ClipDistance[8]` + `CullDistance[1]`）⇒ 合计 **9 > 8**；
+ - 两份都**不写**裁剪/剔除距离（与游戏的 2345 份同形）；**片段着色器 / 图（256×256 R8G8B8A8）/ 清除成黑 /
+   视口铺满 / `vkCmdDraw(3)`，无顶点缓冲 / 动态渲染开通道** 全部相同。
+- **自证**（`.work/n4g_tri_spv.py`，NDK 自带 `glslc` 生成 + `spirv-dis` 逐行对比；`.work/logs/tri-spv.txt`）：
+ 两份变体的 `gl_PerVertex` 成员表**只差 ClipDistance 的数组长度**（`[1]` vs `[8]`），
+ 且**两份的取值链各只有一条**（`%41 = OpAccessChain %_ptr_Output_v4float %_ … %int_0` = 只写 Position）。
+- **读数**（`.work/logs/probe-8b1f1e50-vk2_tri_probe.txt`，`DM_TRI_CLIPDIST` 关）：
+
+ | 格 | 红像素 | 非黑像素 | 总像素 | R 均值 |
+ |---|---|---|---|---|
+ | A：`tri_min`（Clip[1]+Cull[1] = 2） | **32640** | 32640 | 65536 | 127.002 |
+ | B：`tri_clip`（Clip[8]+Cull[1] = 9） | **32640** | 32640 | 65536 | 127.002 |
+
+ 第二档 `DM_TRI_CLIPDIST=1`（自证「本轮启用 1」）**四格逐位相同**（`.work/logs/probe-8b1f1e50-vk2_tri_probe-clipdist.txt`）。
+ 32640 / 65536 = **49.8% ≈ 半屏**，正是 `(-1,-1),(-1,1),(1,-1)` 该占的面积 ⇒ 采样与读回都对得上。
+- **判据（写死三格）**：A 落屏、B 不落 ⇒ 这一条就是成因；**两格都落屏 ⇒ 这一支被排除**；
+ 两格都不落 ⇒ 探针自己的通道/状态有问题，先修探针。
+ **本轮落在第二格** ⇒ **「`gl_PerVertex` 里声明 9 个裁剪/剔除距离、却从不写」不足以让这台 Adreno 830 的
+ 图元在光栅化之前消失**（哪怕它确实违反 `maxCombinedClipAndCullDistances` ⇒ 校验层照报 00710）。
+- **顺带两条正面读数**：① **我们自己的三角形落屏了** ⇒ **光栅化在这一层是通的**（不是"这台设备画不出东西"）；
+ ② 这条装置（最简管线 + `gl_VertexIndex` 建三角形 + 动/静两档特性）**留作 N4-h 的基础**。
+
+**⑦ 回归**
+
+- N1/N2/N3/N4-b 四个探针各重跑一轮（`…-n4gregress.txt`）；比对 `.work/regress_diff.py n4cregress n4gregress`
+ （`.work/n4c_regress_diff.py` 的**通用版**，后缀当参数）。
+- **`vk2_sub_probe` 这一轮的时序派生字段抖得厉害**：`VK2_D3_TO_D4_GAIN_PM` 出现
+  `3379762563889498`（⇒ 有一档测成了 ≈0），由读数派生的 `VK2_INFLIGHT_CHOSEN` 也从 3 变成 4；另有
+  `D2/D3/D8_WAITS` ±1~3、`POLL_REAPS` 0→1~2（第 ⑪ 条那类有机制解释的抖动）。
+- ⇒ 因此用 `.work/n4g_sub_rounds.py` 又跑了**三轮**（`…-n4gsub{1,2,3}.txt`）看**轮与轮的区间**，读数：
+  · **非时间的判定键三轮全一致** —— `VK2_G4_COMMITS` / `G4_SUBMITS` / `G4_RECLAIMS` / `G4_SELFPROOF_COMMITS`
+    都是 **24/24/24**、`VK2_G4_SUBMIT_FAIL` **0**、`VK2_G4_IDLE_ZERO` / `G4_PER_COMMIT_OK` / `GFX2_SWITCH_SELFPROOF` **1**、
+    `SUB_BEGINS/COMMITS/SUBMITS/RECLAIMS_TOTAL` 都是 **152**、`SUB_IDLE_CALLS` / `XFER_IDLE_CALLS` /
+    `SUB_FENCE_TIMEOUTS` / `XFER_FENCE_TIMEOUTS` / `SUB_NO_SLOT_FAIL` **0**、`VK2_WAITALL_OK` **1**、
+    `WAITALL_PENDING_BEFORE` / `WAITED` = **3**、`WAITALL_IDLE_DELTA` **0**；**`VK2_INFLIGHT_CHOSEN` 三轮都是 3**
+    （⇒ 回归轮里那个 4 是**一次坏测量**带出来的派生值，不是"3 变的"）；
+  · 唯一被脚本标成"判定"却轮间不同的是 **`VK2_G4_EMPTY_US`（2414 / 3616 / 1381 —— 它是时间字段，
+    只是名字以 `VK2_G4` 开头）**；`VK2_SUB_LONG_TOTAL` 101~102（第 ⑪ 条那类 ±1）。
+  · ⚠ **探针自己的一个读数缺陷（记档）**：`VK2_D3_TO_D4_GAIN_PM` 在三轮里是
+    `3987623016366080 / 3853508266912366 / 13` ⇒ **某档测成 ≈0 时这个派生值会给天文数字，判据别读它**
+    （要判"3 还是 4"看 `VK2_D3/D4_AVG_COMMIT_US` 的区间，别读这个派生值）。
+  ⇒ **"±1 类抖动"与"判据不一致"要分开报**；这一轮的时间字段**不作回归判据**。
+- 本轮**没有改**新地基的任何模块（`vk2_*.c` 一行未动），改的只有 `vk_device.c` 里那两个**缺省关**的特性位。
+
+**净结论（一句话）**：**"顶点输出"这一层被两刀排除** —— ① 声明形状（9 > 8、从不写）不足以让图元消失；
+② 打开那两个特性也不改变画面。⇒ 嫌疑回到**其余两臂共有的 14 条**（`pCode-08737` 的 SPIR-V 自身不合法、
+`ImageViewCreateInfo-usage-08931` / `-image-04441`、`vkCmdCopyImage-aspectMask-00142/00143`、
+`vkQueueSubmit-pSignalSemaphores-00067`、交换链 `compositeAlpha`、`vkBindBufferMemory` 三条…）
+与**"游戏那些绘制自己的管线 / 状态"**；而**下一刀是 N4-h**（把我们的三角形画进游戏的通道里，
+把"通道/状态"与"游戏的绘制"分开）。
+
+**器械（都在 `.work/`，全部走 `.venv` Python）**：`.work/vklayer_round.py`（带层一轮）、
+`.work/vuid_species_diff.py`（**按 VUID 名分堆**：共有 / 只 A / 只 B）、`.work/clipdist_check.py`
+（第一版离线扫描，**已知有假阳性，留档**）、`.work/clipdist_use.py`（第三版：类型链解析 + 按 BuiltIn 判用途）、
+`.work/spv_dump_ops.py`（自写反汇编）、`.work/n4g_tri_spv.py`（两份变体 + 自证）、`.work/n4g_tri_push.py`（推 SPIR-V）、
+`.work/n4g_clip_rounds.py`（游戏两轮并排）、`.work/n4g_regress.py`（第二档 + 四个回归）、
+`.work/n4g_sub_rounds.py`（轮 × 键表）、`.work/regress_diff.py`（通用逐键比对）；读数
+`.work/logs/{logcat-vk-b1.txt, n4-vk-b1.log, vuid-diff-vk-a2-vk-b1.txt, probe-…-vk2_cap_probe.txt,
+vkjson-8b1f1e50.json, clipdist-check.txt, clipdist-use.txt, dis-f88d27f131d71049.txt, tri-spv.txt,
+dis-tri_{min,clip}.vert.txt, probe-…-vk2_tri_probe[-clipdist].txt, n4-shot-n4g-clip-a{0,1}.log,
+n4b-n4g-clip-a{0,1}.png, probe-…-vk2_{pool,xfer,sub,takeover}_probe-n4gregress.txt}`。
 
 ---
 

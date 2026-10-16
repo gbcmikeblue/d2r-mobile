@@ -223,6 +223,23 @@
 | **`.work/n4f_report.py`（抽表）** | 把各轮的 `【顶点采样】` 抽成"格式→分量数（`0x22` → `3×Float`）/ 步长 / 偏移 / 形状分布 / 逐槽 \|max\| / NaN·Inf 合计 / 明细"；心跳那一格的累计也一起抽。写抽取脚本时**正则要跟紧读数格式**（本轮改过一次采样行格式，抽取脚本同步改） |
 | **`.work/n4f_confs.py`（三份 conf）** | A 臂（`DM_GFX2=1`）/ B 臂（对照）/ 截图轮（`DM_WIN_SRC=28`）—— 都与 N4-c 的 A/B 臂 conf **逐字相同、只加 `DM_VTX_PROBE=1`**，这样"这一轮的形态是不是 N4-c 那个"可以直接对着看。多轮跑法直接复用 `.work/n4d_rounds.py --arm A --conf … --tags …` |
 
+## B¹². N4-g 期间量出来的仪器事实（2026-10-16，下次开工直接用）
+
+| 事实 | 读数 / 怎么用 |
+|---|---|
+| **★ NDK 里自带 `glslc` / `spirv-dis` / `spirv-as`** | `C:\Android\Sdk\ndk\30.0.16248370\shader-tools\windows-x86_64\{glslc,spirv-dis,spirv-as}.exe`（**本机实测存在**，三个都在）⇒ ① 要**反汇编**一份 `.spv` 看它到底声明了什么、访问了什么，**别自己写解析器**（`.work/spv_dump_ops.py` 是本轮先写的自写版，花了半天还踩了两个坑：`Decoration::BuiltIn` 是 **11** 不是 30、`Offset` 是 **35** 不是 33）；② 要**写自己的最小着色器**（探针用）时直接写 GLSL 编成 SPIR-V，不必手搓指令字 |
+| **`spirv-dis` 的第一条读法：`OpMemberDecorate` 才是"结构体成员的 BuiltIn"** | 只看 `OpDecorate` 的旧脚本（`.work/vklayer_builtin_check.py`）**一定漏** `gl_PerVertex` 里的 `ClipDistance` / `CullDistance`（走 `OpMemberDecorate`）。SPIR-V 的 BuiltIn 枚举：`Position=0`、`PointSize=1`、**`ClipDistance=3`**、**`CullDistance=4`**、`VertexIndex=5`、`BaseInstance=4425` |
+| **★ 判"某个输出变量被读写没有"，要按**类型链**判，不能按"下标里有个数"** | 本轮第一版用"取值链的下标里出现 2"当"访问了 ClipDistance"，于是把 `[0,2]`（成员 0 是 `vec4`、**第 2 个分量** ⇒ `Position.z`）读成了 ClipDistance，报出"2344 份在写"这样一个**假读数**。正确做法：从 `OpVariable` 的指针类型出发，按 `OpTypeStruct`（下标 = 成员）/ `OpTypeArray`、`OpTypeVector`（下标 = 元素）递归走，**成员的 BuiltIn 从 `OpMemberDecorate` 取**；再看那条取值链的**结果被谁用**（`OpStore` 的指针 = **写**、`OpLoad` 的指针 = **读**）。脚本 `.work/clipdist_use.py` |
+| **`gl_PerVertex` 的形状是译文器**无条件**产出的** | `dm/third_party/ryujinx/…/CodeGen/Spirv/Declarations.cs:454-476`（`CreatePerVertexStructType` 永远建 `vec4 + float + float[8] + float[1]`）+ `Translation/Translator.cs:262-268`（`InitializeVertexOutputs` **只在 `ClipDistancesWritten != 0` 时**才补 8 个 0 存储）⇒ 本游戏**2345 份顶点着色器都声明 `ClipDistance[8]` + `CullDistance[1]`、一份都不写**（合计 9 > 本设备 `maxCombinedClipAndCullDistances = 8` ⇒ 校验层两臂各 20 条 `00710`）。**这一条本身不是画面全零的成因**（N4-g 用我们自己的三角形验过，见下） |
+| **★ 零风险地"问能力"的新探针：`vk2_cap_probe`** | 只问不接管（N0 的形状）：设备扩展**总数 + 点名扩展在第几条**、特性结构体**逐 bool**、一组上限（裁剪/剔除距离、顶点输出、transform feedback、视口），再按游戏路径那份扩展清单**建一次逻辑设备**。读数 `.work/logs/probe-8b1f1e50-vk2_cap_probe.txt`。真机：**165 个扩展**；**`VK_EXT_transform_feedback` 在（第 117 条）、`transformFeedback = 1`、`geometryStreams = 1`**；`VK_EXT_fragment_shader_interlock` **不在**；`VK_EXT_vertex_attribute_divisor` 在（第 56）；`shaderClipDistance` / `shaderCullDistance` 设备都支持；`maxCombinedClipAndCullDistances = 8` |
+| **★ transform feedback 抓 `gl_Position`**需要给产物加装饰**（本轮因此没走这条路）** | Vulkan 的 TF 只捕获**声明了 `XfbBuffer` / `XfbStride` / `Offset` 装饰**的输出 + 入口点带 `OpExecutionMode Xfb`。离线扫 `.work/spv` 全部 6923 份：**带 Xfb 装饰的 0 份**、带 `OpExecutionMode Xfb` 的只有 1 份 ⇒ 要用 TF 抓游戏的 `gl_Position` **必须给游戏那份 SPIR-V 加装饰**，与"不动产物"冲突 ⇒ 那条路要单独批准才走 |
+| **★ 新探针 `vk2_tri_probe`：把"我们自己的三角形"画进离屏图、数像素（四格，`DM_TRI_CLIPDIST` 关/开）** | 两份顶点着色器**只差一处**：A = `Clip[1]+Cull[1] = 2`（glslang 对"没提过裁剪距离"的着色器产出的**默认形状**）、B = **照游戏那份** `Clip[8]+Cull[1] = 9`，两份都**不写**裁剪/剔除距离；片段着色器 / 图（256×256 R8G8B8A8）/ 清除成黑 / 视口铺满 / `vkCmdDraw(3)`（无顶点缓冲，用 `gl_VertexIndex` 造三角形）**完全相同**。真机读数：**A 32640 红像素 / B 32640 红像素**（总 65536 ⇒ **49.8% ≈ 半屏**），**两档特性都一样** ⇒ **"声明 9 个裁剪/剔除距离却从不写"不足以让图元消失**；顺带证明**我们自己的三角形能在这一层落屏**。SPIR-V 由 `.work/n4g_tri_spv.py` 生成（`glslc`，并**自证**两份变体的成员表只差数组长度）、`.work/n4g_tri_push.py` 推到 `/data/local/tmp/dm/tri/` |
+| **安卓的 `libvulkan.so` 是桩库（只导出到 1.1）：1.3 的入口必须 `vkGetDeviceProcAddr` 取** | 探针里直接引用 `vkCmdBeginRendering` 会**链接失败**（`undefined symbol`，本轮真踩）；游戏路径早就是这么做的（`dm_vkCmdBeginRendering`，`vk_device.h:146-154` / `vk_device.c:626-631`）⇒ 新探针要用动态渲染，照抄这一套 |
+| **按 VUID 名分堆的判据脚本：`.work/vuid_species_diff.py <A> <B>`** | 输出三格：**两臂共有** / 只有 A / 只有 B。判据写死：**只有新地基才有的那堆，都不是"画面全零"的成因**（成因必在两臂共用的代码里）。真机读数：`vk-a2` 与 `vk-b1` **A 15 种 / B 15 种 / 共有 15 种 / 只 A 0 / 只 B 0** ⇒ **新地基零新增误用** |
+| **通用逐键比对：`.work/regress_diff.py <旧后缀> <新后缀>`** | `.work/n4c_regress_diff.py` 的通用版（后缀当参数，省得每轮改脚本）；四个探针一起比，**判据字段**与**时间/内存抖动**分开报 |
+| **⚠ 探针自己的一个读数缺陷（别读它）** | `vk2_sub_probe` 的 `VK2_D3_TO_D4_GAIN_PM` 在某一档测成 ≈0 时会给天文数字（三轮 = `3.99e15 / 3.85e15 / 13`，另有回归轮 `3.38e15`）⇒ 要判"3 还是 4"看 `VK2_D3/D4_AVG_COMMIT_US` 的区间；`VK2_INFLIGHT_CHOSEN` 三轮都是 **3**（回归轮里那个 4 是一次坏测量带出来的派生值） |
+| **`DM_CLIPDIST`（`vk_device.c`，缺省关）** | 把 `shaderClipDistance` / `shaderCullDistance` 两个核心特性挂进 `feats.features`（此前**从来没挂过**）；启动头有一行自证 `[vk] shaderClipDistance/shaderCullDistance：设备支持 %d（…）、本轮启用 %d（DM_CLIPDIST 缺省关）；设备 maxCombinedClipAndCullDistances = %u，而译文器声明的 8 + 1 = 9`。真机两轮（只差这一行）：**亮度都是 0/0/0 ⇒ 负结果** |
+
 ## C. 建议补（都不难，但能省好几轮）
 
 | 建议 | 为什么值得 |
@@ -241,7 +258,8 @@
 | 第一台真机 | Redmi K90（`8b1f1e50`，Adreno 830，Vulkan 1.3.284） | 插好；`adb devices -l` 能看到；用 `.work/uptime.py` 确认没重启过 |
 | 第二台真机 | Redmi `pearl`（`VC9TGM45MNJB8TSG`，Mali-G610 MC6，Vulkan 1.1.177） | **不使用**（2026-10-16 口径变更：新路径只用第一台 ⇒ **N1~N6 全在第一台上做、N5 暂缓**）；真要重开见 `ANDROID_PLAN`「M3-3e」第九节（人在设备旁 + 明确同意 + 从最小尺寸起步） |
 | `trace_processor`（读 `.work/trace/stall.pftrace`） | **仍缺**：工作区没有 `.work/trace/`，也没有能跑它的机器 | 不阻塞新路径；要用先确认机器 |
-| Vulkan Validation Layers（真机） | **仍缺**：NDK 里没有 `libVkLayer_khronos_validation.so`（arm64） | 新地基判据不依赖它；要做先说明（需联网取） |
+| Vulkan Validation Layers（真机） | **已备齐、已跑通**（A1，2026-10-16）：层 `.so`（27,684,688 字节）取自 Khronos `android-binaries-1.4.363.0.zip`，进 APK 靠 `build_apk.cmd` 里**缺省关**的 `DM_VKLAYER=1` 可选段 | 配方见 **§G**（不用 root、不改代码）；`.work/vklayer_round.py` 一轮、`.work/vklayer_off.py` 退回常态；A1/N4-g 都用过 |
+| NDK 自带着色器工具 | `shader-tools/windows-x86_64/` 里有 **`glslc.exe` / `spirv-dis.exe` / `spirv-as.exe`** | 反汇编看 `.spv`、写自己最小的着色器都用它们（见 **B¹²**） |
 | 设备侧数据 | RomFS / SPIR-V / 改写产物已在两台 `/data/local/tmp/dm/` | 不变；新地基不动它们 |
 
 ## E. 一律不要做的"工具"

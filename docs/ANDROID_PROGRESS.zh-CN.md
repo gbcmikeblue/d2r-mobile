@@ -21,7 +21,7 @@
 | 维度 | 现状 |
 |---|---|
 | 支线目标 | 把已存在的 iOS/macOS 兼容层（宿主 + Metal 图形层 + iOS 前端）搬到 Android |
-| 阶段 | **M1 完成、M2 未验收、M3 进行中**（M0 完成，M4 未开始）；**新地基 N0 / N1 / N2 / N3 / N4-a / N4-b / N4-c 已完成，N4-d 的两部分、N4-e 的第一刀、N4-f 的前半（顶点数据 / 常量缓冲都是正常的）与台账里那条 A1（真机装 Vulkan 校验层）也都已完成**（2026-10-16，路径见 `rewrite/`；**校验层照出 16 种 VUID、其中一条真误用（`shaderDrawParameters`）已修并复验**，但**没有一条是"draw 层面的用法错误"** ⇒ 下一块 = "**顶点着色器输出**"：位置经变换后出裁剪体 / 输出 NaN —— N4-g 先问 `VK_EXT_transform_feedback` 能力） |
+| 阶段 | **M1 完成、M2 未验收、M3 进行中**（M0 完成，M4 未开始）；**新地基 N0 / N1 / N2 / N3 / N4-a / N4-b / N4-c 已完成，N4-d 的两部分、N4-e 的第一刀、N4-f 的前半（顶点数据 / 常量缓冲都是正常的）、台账里那条 A1（真机装 Vulkan 校验层）与 N4-g 也都已完成**（2026-10-16，路径见 `rewrite/`；N4-g = 带层的 **B 臂**把 15 种 VUID 逐名对上（**两臂共有 15 种、只 A 0 种** ⇒ 零新增误用）、能力问到（**TF 在，但要抓 `gl_Position` 必须给游戏那份 SPIR-V 加装饰 ⇒ 与"不许改产物"冲突**）、改用**我们自己的三角形**验证 ⇒ **"顶点输出"这一层被两刀排除**（声明形状 + 特性开关都排掉了）⇒ 下一块 = **N4-h**：把三角形画进**游戏的通道里**） |
 | 工作窗口 | 2026-10-13 ～ 2026-10-15，**97 个提交**（10-13：1 / 10-14：73 / 10-15：23） |
 | 安卓侧代码量 | `dm/android/` 50 个源文件、约 **10,700 行**（C/H）；兼容层 15 个头/源 |
 | 产物 | `dm.apk` **6.10 MB**（内含 `libdm.so` 6.09 MB，宿主 + 回放层全静态链入） |
@@ -29,7 +29,7 @@
 | 已达成 | 改写产物在真机装载执行 → 进 `nnMain`；Vulkan 通路 + 零拷贝内存模型落地；出图与上屏链路真机通（窗口能显示主机像素）；绘制真下发（≈40 万次/轮、零失败） |
 | 未达成 | **M2 验收判据「屏幕出（游戏自己的）画面」未过**：渲染目标读回仍是全零 |
 | 当前卡点 | 每轮约 **10 秒**的「GPU/显示通路整体停摆」（提交在飞、GPU 却在等新活），会把交付节奏按帧率切成两半 |
-| 下一步 | **⓪ 架构口径变更（2026-10-16）：图形层改为 Vulkan 原生的显式实现 —— 见 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md) 与 §6.4 / §11 第 0 条**；**该路径已走到 N4-e 的第一刀（2026-10-16）：内存、提交、可见性三块都在新地基上；"屏幕出画面"这条验收的**证据本身**先被更正（N4-a 起两臂都是 `DM_WIN_SRC=0` ⇒ 屏幕上那张是 `paint()` 测试图），再用"查看器打开"的 6 轮重新取证据 ⇒ **两臂两级亮度读数全是 0/0/0**；N4-e 又用"扫描器 + 已知色对照 + 通道探针 + 光栅化侧全放开"四步把"全零"这句话收敛到**片元在光栅化之前就没了**，顶点/几何侧的新仪表再排掉"顶点流没绑 / 几何为空" ⇒ **下一步只剩"顶点数据与着色器输出"（位置出裁剪体 / NaN）****；**N4-f 已把前半答完（2026-10-16）** —— 新开关 `DM_VTX_PROBE=1`（缺省关、**只读**）挂在既有判据行上，7 轮共 100+ 个采样点：**位置数据 NaN 0 / Inf 0 / 整片全零 0**（两种形状：UI `3×Float 步长20`、主场景 `4×ShortSNORM` 归一化压缩顶点）、**常量缓冲 NaN 0 / Inf 0**（逐槽 |max|：槽0 1~1067、槽2 ≈1、**槽3 = 1600 = 屏幕宽**、槽10 410~1070；**两臂逐项相同** ⇒ 不是新地基引入的）、分量类型与 SPIR-V 声明对上（`f88d27f131d71049` 的 Location 0/1 都是 float×4）⇒ **"顶点数据本身坏掉"这一支被排除，只剩"顶点着色器输出"这一处**（N4-g 先问 `VK_EXT_transform_feedback` 能力）；那 ~10 秒的驱动级停顿也仍未定案（N4-d 只落到线程上：`dm-guest` 4.6 kHz 睡→醒、前端被 `kgsl-events` 叫醒、我方 `vkQueueSubmit` 卡 11.7 s）；① 换设备 / 换驱动对照；② 有 `trace_processor` 的机器上读停顿窗口的 trace；③ 若仍在这台机上：试「GPU 保活」（隔 N 毫秒空提交，**已在「M3-3f」做过、负结果**）；④ **卡点 A 侧**：真机装 Validation Layers（见 §14 A1，**不依赖换设备**） |
+| 下一步 | **⓪ 架构口径变更（2026-10-16）：图形层改为 Vulkan 原生的显式实现 —— 见 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md) 与 §6.4 / §11 第 0 条**；**该路径已走到 N4-e 的第一刀（2026-10-16）：内存、提交、可见性三块都在新地基上；"屏幕出画面"这条验收的**证据本身**先被更正（N4-a 起两臂都是 `DM_WIN_SRC=0` ⇒ 屏幕上那张是 `paint()` 测试图），再用"查看器打开"的 6 轮重新取证据 ⇒ **两臂两级亮度读数全是 0/0/0**；N4-e 又用"扫描器 + 已知色对照 + 通道探针 + 光栅化侧全放开"四步把"全零"这句话收敛到**片元在光栅化之前就没了**，顶点/几何侧的新仪表再排掉"顶点流没绑 / 几何为空" ⇒ **下一步只剩"顶点数据与着色器输出"（位置出裁剪体 / NaN）****；**N4-f 已把前半答完（2026-10-16）** —— 新开关 `DM_VTX_PROBE=1`（缺省关、**只读**）挂在既有判据行上，7 轮共 100+ 个采样点：**位置数据 NaN 0 / Inf 0 / 整片全零 0**（两种形状：UI `3×Float 步长20`、主场景 `4×ShortSNORM` 归一化压缩顶点）、**常量缓冲 NaN 0 / Inf 0**（逐槽 |max|：槽0 1~1067、槽2 ≈1、**槽3 = 1600 = 屏幕宽**、槽10 410~1070；**两臂逐项相同** ⇒ 不是新地基引入的）、分量类型与 SPIR-V 声明对上（`f88d27f131d71049` 的 Location 0/1 都是 float×4）⇒ **"顶点数据本身坏掉"这一支被排除，只剩"顶点着色器输出"这一处**（N4-g 先问 `VK_EXT_transform_feedback` 能力）；那 ~10 秒的驱动级停顿也仍未定案（N4-d 只落到线程上：`dm-guest` 4.6 kHz 睡→醒、前端被 `kgsl-events` 叫醒、我方 `vkQueueSubmit` 卡 11.7 s）；① 换设备 / 换驱动对照；② 有 `trace_processor` 的机器上读停顿窗口的 trace；③ 若仍在这台机上：试「GPU 保活」（隔 N 毫秒空提交，**已在「M3-3f」做过、负结果**）；④ **卡点 A 侧**：真机装 Validation Layers（见 §14 A1，**不依赖换设备**）——**这一条已做完**（A1：照出 16 种 VUID、修掉一条真误用、**没有一条是 draw 层面的用法错误**）。**★★ 2026-10-16（N4-g）最新**：① 带层的 **B 臂**（旧路对照）把 15 种 VUID **逐名**对上 ⇒ **A 15 / B 15 / 共有 15、只 A 0** ⇒ **新地基零新增误用**（成因必在两臂共用的代码里）；② 设备能力问到：**`VK_EXT_transform_feedback` 在（第 117/165 条）、`transformFeedback = 1`**、`VK_EXT_fragment_shader_interlock` **不在**、**`shaderClipDistance`/`shaderCullDistance` 设备都支持**、**`maxCombinedClipAndCullDistances = 8`**；③ 但 TF 抓 `gl_Position` **要求给游戏那份 SPIR-V 加 `XfbBuffer`/`Offset` 装饰**（离线：6923 份里 **0 份**有），与"不许改产物"冲突 ⇒ **本轮不走**；④ 离线核对：`gl_PerVertex` 里 **2345 份顶点着色器声明 `ClipDistance[8]`+`CullDistance[1]`（9 > 8）而"写"0 份"读"0 份** ⇒ **驱动看到的裁剪/剔除距离内容未定义**；⑤ 两刀都排掉了这一层 —— `DM_CLIPDIST`（两个核心特性，缺省关）两轮**亮度都是 0/0/0**（负结果）、新探针 `vk2_tri_probe` 的**我们自己的三角形** A（`Clip[1]+Cull[1] = 2`）与 B（**照游戏那份** `Clip[8]+Cull[1] = 9`）**都是 32640 / 65536 红像素**（特性关/开都一样）⇒ **"声明 9 个裁剪/剔除距离却从不写"不足以让图元消失**；顺带证明**我们自己的三角形落屏**（光栅化这一层是通的）。⇒ **下一刀 = N4-h**：把三角形画进**游戏的通道里**（`DM_TRI_IN_GAME=<绘制序号>`），把"通道/状态"与"游戏的绘制"分开 |
 
 ---
 
@@ -137,7 +137,8 @@ flowchart LR
 | **N4-e（第一刀）** | **已完成（2026-10-16）**：不再靠肉眼看屏幕，改成"**用我们自己的写入当刻度**"一层层收 —— ① **扫描器**（`DM_NVN_SHOT_SCAN`，一次扫全部已知贴图逐张逐级）：**A′/B′ 两臂 @出图 40 逐项相同**（139 张、≥256×256 的 26 张、读 33 次、成功 20 / 失败 13），20 次成功里**只有序号 27 的第 1/2 级是整片 255（纯白）**、其余全 0/0/0；@60 一轮 192 张 / 167 次 / **成功 13 / 失败 154（`读回不支持格式 138`）**。② **两个对照**证明读回链通：`DM_GFX_PROBE=7` ⇒ 序号 7 = **136.0**（与预算值逐位命中）、`=28` ⇒ 28 三级 = **152.0**。③ **通道探针**（新开关 `DM_PASS_PROBE`）：`:end` ⇒ 152 ⇒ **附件/视图/布局/存储那一层成立**；不带 `:end` ⇒ **仍是整片 152** ⇒ **游戏 3.9 万次绘制一个像素都没落下**。④ **光栅化侧逐条排除**：`DM_NO_DEPTH_TEST=1`、`DM_PASS_AREA=2`、**`DM_RASTER_BRUTE=1`（剔/混/写掩码/视口裁剪全放开）** 三种全放开的组合下**序号 28 仍是整片 152** ⇒ **片元在光栅化之前就没了**。⑤ **顶点/几何侧新仪表**（绑上/没绑上（按流）/顶点数 0/索引数 0）⇒ 两轮：**没绑上的 2682~2762 次全部是第 4 条流**、**顶点数 0 的 0 次**、索引数 0 的 19~23 次 ⇒ "顶点流没绑 / 几何为空"都不成立 | 读数 `.work/logs/n4-shot-n4e-{scan-a40,scan-b40,probe28-a40,probe7-a40}.log` + `n4-n4e-{passprobe28,passprobe28open,nodepth,passarea2,brute,vtx,vtx2,vtx3}.log`（每轮都带**开关自证行**，逐轮核对 `.work/n4e_chk_sw.py`）；抽表 `.work/n4e_scan_report.py`；**M2 的验收仍未过**（且"画面"这一问已被收窄到"顶点数据与着色器输出"） | `ANDROID_PLAN` §八·N4-e |
 | **N4-f（前半：顶点数据 / 常量缓冲）** | **已完成（2026-10-16）**：新开关 `DM_VTX_PROBE=1`（**缺省关、只读**：不改状态 / 不标脏 / 不提交）挂在**既有判据行**（前 8 次绘制 + 每 2048 次）那一点上，读**影子里的**顶点数据与常量缓冲 —— 位置属性（Location 0，缺则取着色器声明里第一条真的绑了的）的 NVN 格式 / 步长 / 偏移 / 流 / 影子地址 + 按格式解码前 4 个顶点；顶点阶段**所有**有地址的常量槽各读前 64 字节。**A 臂 5 轮 + B 臂 2 轮**：**位置数据 NaN 0 / Inf 0 / 整片全零 0**（形状两种：UI `3×Float 步长20`、主场景 `4×ShortSNORM 步长28/24/20`，顶点数 3~14550）；**常量缓冲 NaN 0 / Inf 0**、逐槽 \|max\| **两臂逐项相同**（槽0 1~1067、槽2 ≈1、**槽3 = 1600 = 屏幕宽**、槽10 410~1070）；**分量类型与 SPIR-V 声明对上**（`f88d27f131d71049` 的 Location 0/1 都是 float×4，NVN 给 `3×Float` 第 4 分量补 1，两侧一致）。⚠ 仪器自己出过一次错并当场更正：第一版只查"第一个非零常量槽"（`常量[0][0]` 的前 4 个 `-0.00125,0,0,0` **不像**变换矩阵）⇒ 改成**扫全部槽**。⇒ **"顶点数据本身坏掉"这一支被排除**；**画面仍是全零**（截图轮 `DM_WIN_SRC=28` 781 次读成功、亮度全 0，`n4b-n4f-shot-a.png`）。 | `ANDROID_PLAN` §八·N4-f |
 | **A1（台账 §14）真机装 Vulkan 校验层** | **已完成（2026-10-16）**：层的 `libVkLayer_khronos_validation.so`（**27,684,688 字节**，Khronos `android-binaries-1.4.363.0.zip`）进 APK 的 `lib/arm64-v8a/`（`build_apk.cmd` 新增**缺省关**的 `DM_VKLAYER=1` 可选段），用 `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用 —— **不用 root、不改一行代码**（清单里 `android:debuggable="true"` 本来就有）。自证：logcat `added global layer … from library '/data/app/…/lib/arm64/libVkLayer_khronos_validation.so'` + `Loaded layer`。**一轮 60 秒照出 218 条 Error / 16 种 VUID**；**当场点出一条真误用并已修 + 复验**：`SPIR-V Capability DrawParameters` 归 `VkPhysicalDeviceVulkan11Features::shaderDrawParameters` 管，而 `vk_device.c` 从没挂过这个结构，**游戏的顶点着色器 1839 份都在用 `gl_BaseInstance`**（离线 `.work/spv` 的 `BuiltIn 4425`）⇒ 修后层**不再报它**（按 capability 逐项对比：`DrawParameters` 2 → 0）。**对卡点 A 最要紧的是一条负结果**：**16 种 VUID 里没有一条是"draw 层面的用法错误"**（顶点缓冲绑定 / 管线与通道兼容性 / 描述符 / 顶点属性都不报）⇒ **我们的 draw 在 API 层面合法** ⇒ 与 N4-e/N4-f 的"几何是自己算没了"一致。剩 15 种真误用（SPIR-V 自身不合法、内存类型、aspectMask、信号量、clip/cull 超上限…）已逐条列档。 | `ANDROID_PLAN` §八·A1 / §七·第 6 条；`TOOLS` §G |
-| **新地基 N4-e 之后的 N5 ~ N6** | **未开工**（N5 仍暂缓：第二台不使用；下一步 = **N4-g**：只剩"**顶点着色器输出**" —— 位置经变换后全在裁剪体之外、或输出 NaN/Inf ⇒ 一个片元都不产生；**先问设备能力 `VK_EXT_transform_feedback`**，有就抓 `gl_Position` 直接回答"在不在裁剪体里"；那 ~10 秒停顿仍未定案） | 逐块计划、每块判据、"新基线六个字段"与"开工前要确认的三件事"见 `rewrite/ANDROID_REWRITE.zh-CN.md` §十一；§9.7 的接管点表已有批注⑥（N4-b）/⑦（N4-c）/⑧（N4-d 第一部分）/⑨（N4-d 第二部分）；新基线读数表 `.work/logs/vk2-readings.tsv`（N0 补录 + N1 ~ **N4-f** 十二行，六个字段已填满） | — |
+| **N4-g** | **已完成（2026-10-16）**：① **带层的 B 臂**（旧路对照）配新脚本 `.work/vuid_species_diff.py` **按 VUID 名**分堆 ⇒ **A 15 种 / B 15 种 / 共有 15 种、只 A 0 种、只 B 0 种** ⇒ **新地基零新增误用**（15 种里唯一落在"顶点输出那一层"的是 `maxCombinedClipAndCullDistances-00710`）；② **能力**（新探针 `vk2_cap_probe`）：**165 个扩展**、**`VK_EXT_transform_feedback` 在（第 117 条）、`transformFeedback = 1`、`geometryStreams = 1`**、`VK_EXT_fragment_shader_interlock` **不在设备上**、**`shaderClipDistance`/`shaderCullDistance` 设备都支持**、**`maxCombinedClipAndCullDistances = 8`**；③ **TF 本轮不走**（离线：`.work/spv` 6923 份里 **0 份**带 `XfbBuffer`/`Offset` 装饰 ⇒ 要用它抓游戏 `gl_Position` 必须改产物，与"不许改产物"冲突）；④ **离线核对**（NDK 自带 `spirv-dis`）：主路径 `f88d27f131d71049` 的 `gl_PerVertex` 成员 2/3 = `ClipDistance`/`CullDistance`，**全部取值链 9 条没有一条点到它们**；全库 **2345 份顶点着色器声明 `Clip[8]`+`Cull[1]`（9 > 8）而"写"0 份"读"0 份**；⑤ **两刀**：`DM_CLIPDIST`（两个核心特性，缺省关）两轮**亮度都是 0/0/0**；**新探针 `vk2_tri_probe`** 的**我们自己的三角形** A（`Clip[1]+Cull[1] = 2`）与 B（**照游戏那份** `Clip[8]+Cull[1] = 9`）**都是 32640 / 65536 红像素**（特性关/开都一样）⇒ **"声明 9 个裁剪/剔除距离却从不写"不足以让图元消失**；顺带证明**我们自己的三角形落屏**（光栅化这一层是通的）；⑥ 回归：N1/N2/N3/N4-b 各一轮 + `vk2_sub_probe` 三轮 ⇒ **非时间判定键全一致**、`VK2_INFLIGHT_CHOSEN` 三轮都是 3（⚠ `VK2_D3_TO_D4_GAIN_PM` 某档测成 ≈0 时给天文数字，**判据别读它**）。**M2 的验收仍未过**（两轮查看器打开、亮度 0/0/0） | 读数 `.work/logs/{probe-8b1f1e50-vk2_cap_probe.txt, vkjson-8b1f1e50.json, vuid-diff-vk-a2-vk-b1.txt, logcat-vk-b1.txt, clipdist-use.txt, dis-f88d27f131d71049.txt, tri-spv.txt, probe-…-vk2_tri_probe[-clipdist].txt, n4-shot-n4g-clip-a{0,1}.log, n4b-n4g-clip-a{0,1}.png, …-vk2_{pool,xfer,sub,takeover}_probe-n4gregress.txt, …-vk2_sub_probe-n4gsub{1,2,3}.txt}` | `ANDROID_PLAN` §八·N4-g；仪器事实 `TOOLS` B¹² |
+| **新地基 N4-h 之后的 N5 ~ N6** | **未开工**（N5 仍暂缓：第二台不使用；下一步 = **N4-h**：把**我们自己的三角形画进游戏的通道里**（`DM_TRI_IN_GAME=<绘制序号>`）—— 它落屏 ⇒ **通道与状态在那一刻是好的、只有游戏的绘制产不出片元**；它也不落屏 ⇒ 那一层（通道/视口/裁剪/附件）本身有问题；其余候选 = 两臂共有的 14 条 VUID（`pCode-08737` 的 SPIR-V 自身不合法、image view / copy image 的 aspect、信号量重复 signal、交换链 `compositeAlpha`、`vkBindBufferMemory` 三条…）；那 ~10 秒停顿仍未定案） | 逐块计划、每块判据、"新基线六个字段"与"开工前要确认的三件事"见 `rewrite/ANDROID_REWRITE.zh-CN.md` §十一；§9.7 的接管点表已有批注⑥（N4-b）/⑦（N4-c）/⑧（N4-d 第一部分）/⑨（N4-d 第二部分）；新基线读数表 `.work/logs/vk2-readings.tsv`（N0 补录 + N1 ~ **N4-g** 十三行，六个字段已填满） | — |
 | M4 | 未开始 | — | — |
 
 **M3 任务清单的勾选状态与进度不一致**：`front_run` / `front_text_input` / 触摸 / 音频 /
@@ -343,6 +344,27 @@ mach-o 段查找一律返回找不到；安卓 SIGSEGV 拿不到 ESR 读写位�
   其余 15 种（SPIR-V 自身不合法 / 绑内存的类型与 dedicated / `vkCmdCopyImage` 的 aspectMask / 信号量重复
   signal / clip-cull 超上限…）已逐条列档。读数 `.work/logs/logcat-vk-a1.txt`（2.45 MB）与 `logcat-vk-a2.txt`
   （修后），结论 `ANDROID_PLAN` §八·A1、配方 `TOOLS` §G。
+- **★ 2026-10-16（N4-g）"顶点输出"这一层被两刀排除**：① **带层的 B 臂**（旧路对照，`.work/vklayer-b.conf`
+  与 A1 的 A 臂 conf **只差一行**）配新脚本 `.work/vuid_species_diff.py` **按 VUID 名**分堆 ——
+  **A 15 种 / B 15 种 / 两臂共有 15 种、只有 A 臂 0 种** ⇒ **新地基没有引入任何一条新的用法错误**；
+  15 种里**唯一落在"顶点输出那一层"的是 `RuntimeSpirv-maxCombinedClipAndCullDistances-00710`**（A×20 / B×20）。
+  ② **离线核对**（NDK 自带 `spirv-dis` + `.work/clipdist_use.py`）：那 00710 的形状是译文器**无条件**产出的
+  （`Declarations.cs:454-476` ⇒ `gl_PerVertex` 永远带 `ClipDistance[8]` + `CullDistance[1]`，合计 9 > 设备上限 8），
+  而 **2345 份顶点着色器一份都不读也不写**（`Translator.cs:262-268` 只在 `ClipDistancesWritten != 0` 时才补 0 存储）
+  ⇒ **驱动看到的是"9 个内容未定义的裁剪/剔除距离"**。③ 两刀：**`DM_CLIPDIST`**（把 `shaderClipDistance` /
+  `shaderCullDistance` 挂进特性链，缺省关）两轮**亮度都是 0/0/0**；**新探针 `vk2_tri_probe`** 的
+  **我们自己的三角形**（A = `Clip[1]+Cull[1] = 2`、B = **照游戏那份** `Clip[8]+Cull[1] = 9`，
+  两份都不写、其它完全相同）**两格都是 32640 / 65536 红像素**（= 半屏 49.8%；特性关/开都一样）
+  ⇒ **"声明 9 个裁剪/剔除距离却从不写"不足以让这台 Adreno 830 的图元消失**；顺带证明
+  **我们自己的三角形能在这一层落屏**（**光栅化本身是通的**）。④ 画面仍是全零（两轮查看器都打开、
+  亮度 0/0/0），**M2 的验收仍未过**。⇒ 嫌疑回到**其余两臂共有的 14 条**（`pCode-08737` 的 SPIR-V 自身不合法、
+  `ImageViewCreateInfo-usage-08931` / `-image-04441`、`vkCmdCopyImage-aspectMask-00142/00143`、
+  `vkQueueSubmit-pSignalSemaphores-00067`、交换链 `compositeAlpha`…）与**"游戏那些绘制自己的管线 / 状态"**；
+  **下一刀 = N4-h**（把三角形画进游戏的通道里）。读数 `.work/logs/{probe-…-vk2_cap_probe.txt,
+  vuid-diff-vk-a2-vk-b1.txt, clipdist-use.txt, probe-…-vk2_tri_probe[-clipdist].txt, n4b-n4g-clip-a{0,1}.png}`，
+  结论 `ANDROID_PLAN` §八·N4-g、仪器事实 `TOOLS` B¹²。
+  ⚠ **一条要留档的路线判定**：`VK_EXT_transform_feedback` **能力在**，但要用它抓游戏的 `gl_Position`
+  必须给游戏那份 SPIR-V 加 `XfbBuffer`/`Offset` 装饰 ⇒ **要重开这条路得先拿到"允许给产物加装饰"这一句**。
 
 ### 6.2 卡点 B：每轮约 10 秒的 GPU/显示通路停摆（当前主战场）
 
@@ -746,6 +768,36 @@ iCloud→Drive/自建；mach `vm_*`→`/proc/self/maps`、`__builtin___clear_cac
   两条自证），抽表 `.work/n4f_report.py`，conf `.work/n4f_confs.py`，结论见 `ANDROID_PLAN` §八·N4-f。
   **下一步 = N4-g**：**先问设备能力** `VK_EXT_transform_feedback`（+ `transformFeedback` / `geometryStreams`）——
   有就抓 `gl_Position` 直接回答"经变换后在不在裁剪体里"，没有就走"离线核对 + 已知色底子上的最小三角形自证"。
+  **✓ 补记（2026-10-16，本轮）：N4-g 做完 —— 带层的 B 臂把 15 种 VUID 逐名对上、能力问到了、
+  TF 被"不许改产物"挡住、两条替代路各给一条读数** ——
+  **① 免费的筛子**（`.work/vklayer_round.py --conf .work/vklayer-b.conf --tag vk-b1`，B 臂与 A1 的 A 臂 conf
+  **只差一行**：不设 `DM_GFX2`）：层加载自证 3 条；新脚本 `.work/vuid_species_diff.py vk-a2 vk-b1` **按 VUID 名**
+  分堆 —— **A 15 种 / B 15 种 / 共有 15 种、只 A 0 种、只 B 0 种** ⇒ **新地基零新增误用**
+  （15 种里**唯一落在"顶点输出那一层"的是 `maxCombinedClipAndCullDistances-00710`**，A×20 / B×20；
+  组 (a) 第一优先的 `vkBindBufferMemory-memory-01035/01508/02726` ×14 的原文显示它就是**我们自己的内存换轨**，
+  **旧路一模一样**）。**② 能力**（新探针 `vk2_cap_probe`）：设备 **165 个扩展**、
+  **`VK_EXT_transform_feedback` 在（第 117 条）、`transformFeedback = 1`、`geometryStreams = 1`**；
+  `VK_EXT_fragment_shader_interlock` **不在设备上**；**`shaderClipDistance = 1` / `shaderCullDistance = 1`**；
+  **`maxCombinedClipAndCullDistances = 8`**。**③ TF 本轮不走**：离线扫 `.work/spv` 6923 份 ——
+  **0 份带 Xfb 装饰**（只有 1 份带 `OpExecutionMode Xfb`）⇒ 要用 TF 抓游戏的 `gl_Position`
+  **必须给游戏那份 SPIR-V 加装饰**，与"不许改产物"冲突（要重开这条路得单独批准）。
+  **④ 离线核对**（NDK 自带 `spirv-dis`）：主路径 `f88d27f131d71049` 的 `%gl_PerVertex` 成员
+  0=Position / 1=PointSize / **2=BuiltIn ClipDistance** / **3=BuiltIn CullDistance**，而**全部取值链只有 9 条**
+  **没有一条点到成员 2/3**；全库 **2345 份顶点着色器声明 `ClipDistance[8]`+`CullDistance[1]`（9 > 8）
+  而"写"0 份"读"0 份**（形状来自译文器：`Declarations.cs:454-476` 无条件产出、
+  `Translator.cs:262-268` 只在 `ClipDistancesWritten != 0` 时补 0 存储）⇒ **驱动看到的 9 个裁剪/剔除距离内容未定义**。
+  **⑤ 单变量实验 1（`DM_CLIPDIST`，缺省关，`vk_device.c`）**：把两个核心特性挂进特性链（启动头一行自证）；
+  两轮游戏**只差 conf 一行**，**亮度都是 0/0/0** ⇒ **负结果**。
+  **⑥ 单变量实验 2（新探针 `vk2_tri_probe`，四格）**：A = `Clip[1]+Cull[1] = 2`（glslang 的默认形状）vs
+  B = **照游戏那份** `Clip[8]+Cull[1] = 9`，两份都**不写**裁剪/剔除距离、其它**完全相同** ⇒
+  **A 32640 红像素 / B 32640 红像素**（总 65536 = 半屏 49.8%），**特性关/开都一样** ⇒
+  **"声明 9 个裁剪/剔除距离却从不写"不足以让图元消失**；顺带证明**我们自己的三角形落屏**（光栅化这一层是通的）。
+  **⑦ 回归**：N1/N2/N3/N4-b 各一轮 + `vk2_sub_probe` 三轮 —— **非时间判定键全一致**、
+  `VK2_INFLIGHT_CHOSEN` 三轮都是 3（⚠ `VK2_D3_TO_D4_GAIN_PM` 某档测成 ≈0 时给天文数字，**判据别读它**）。
+  ⇒ **"顶点输出"这一层被两刀排除**；**下一个 = N4-h**：把我们自己的三角形画进**游戏的通道里**
+  （`DM_TRI_IN_GAME=<绘制序号>`），把"通道/状态"与"游戏的绘制"分开。读数
+  `.work/logs/{probe-…-vk2_cap_probe.txt, vuid-diff-vk-a2-vk-b1.txt, clipdist-use.txt,
+  probe-…-vk2_tri_probe[-clipdist].txt, n4b-n4g-clip-a{0,1}.png}`，结论见 `ANDROID_PLAN` §八·N4-g。
 
 1. ★ **主线回到第一台（Adreno）**（2026-10-16「M3-3e」第九节，**口径变更**）—— 第二台的 AHB 线**暂停**：
    分级复量**已做完**（读数与结论见 ANDROID_PLAN「M3-3e」第八节）：分配 / mmap / 导入 / 撤销都安全、

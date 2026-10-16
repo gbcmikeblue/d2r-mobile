@@ -42,6 +42,7 @@ static int g_fill_non_solid;                   // 非实心多边形模式（线
 static int g_attr_divisor, g_attr_divisor_zero; // 顶点流每实例步进 > 1 / 可为 0 | per-instance vertex stream step > 1 / may be 0
 static int g_aniso;                            // 各向异性过滤（采样器用）| anisotropic filtering (for samplers)
 static int g_drawparams;                       // shaderDrawParameters（gl_BaseInstance 才有定义）| shaderDrawParameters (what makes gl_BaseInstance defined); see the A1 note at vkCreateDevice
+static int g_clipdist;                         // shaderClipDistance/shaderCullDistance（N4-g 的单变量实验：译文器声明了 9 个裁剪/剔除距离但从没写过）| the N4-g single-variable experiment: the translator declares 9 clip+cull distances and never writes them
 static VkExtensionProperties *g_exts; static uint32_t g_nexts;
 static void *g_window;                         // 窗口（M3）：有它才开 surface / 交换链 / 呈现队列 | the window (M3): with it, surface, swapchain and the present queue are enabled
 static VkSurfaceKHR g_surf;
@@ -512,6 +513,36 @@ void vk_device_init(void) {
     g_drawparams = (want_drawparams && have_dp) ? 1 : 0;
     if (!have_dp)
         LOG("【黄】设备不支持 shaderDrawParameters：用了 gl_BaseInstance 的着色器行为未定义（顶点位置会错）");
+
+    // ★ N4-g 的单变量实验：`shaderClipDistance` / `shaderCullDistance`。
+    // 事实（两条都是离线核对出来的，见 `.work/logs/clipdist-use.txt`）：
+    //   ① 译文器**无条件**在 `gl_PerVertex` 里声明 `gl_ClipDistance[8]` + `gl_CullDistance[1]`
+    //      （`dm/third_party/ryujinx/…/CodeGen/Spirv/Declarations.cs:454-476`，与 NVN 那边写没写无关）；
+    //   ② **2345 份顶点着色器一份都没访问过它们**（0 份写、0 份读）⇒ 驱动看到的是"声明了 9 个
+    //      裁剪/剔除距离、内容未定义"。
+    // 而本设备 `maxCombinedClipAndCullDistances = 8` ⇒ 8 + 1 = 9 > 8 ⇒ 校验层在**两臂各报 20 条**
+    // `VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710`（A/B 15 种 VUID 逐项同名）。
+    // 这两个核心特性**从来没被启用过**（设备两个都支持：`vk2_cap_probe` 读数 shaderClipDistance=1、
+    // shaderCullDistance=1）⇒ 按规范，未启用时"这些成员不该被读或写"，而译文器声明了它们 ⇒ 未定义行为，
+    // 且正好落在 N4-e/N4-f 收出来的那一层（**光栅化之前**）。
+    // 缺省**关**（= 一字不改的既有行为，A/B 的对照臂）；`DM_CLIPDIST=1` 才把这两个特性打开。
+    // 这是"未写的裁剪距离是不是『片元在光栅化之前就没了』的成因"这个假设的**单变量实验**：
+    // 先量打开它有没有用，再决定要不要翻缺省（翻缺省要单独一块、单独说清）。
+    // N4-g single-variable experiment: the translator unconditionally declares gl_ClipDistance[8] +
+    // gl_CullDistance[1] in gl_PerVertex (Declarations.cs:454-476) and **never accesses either** (0 of 2345
+    // vertex shaders read or write them), while the device's maxCombinedClipAndCullDistances is 8 (8+1 = 9),
+    // which is exactly what validation layer VUID ...-00710 reports in both arms. Neither core feature was
+    // ever enabled (the device supports both). Default **off** (the unchanged behaviour, i.e. the control
+    // arm); DM_CLIPDIST=1 turns them on -- one variable, measured before anything is decided.
+    const char *cd_env = getenv("DM_CLIPDIST");
+    int want_clipdist = (cd_env && cd_env[0] == '1') ? 1 : 0;
+    int have_cd = (core.shaderClipDistance && core.shaderCullDistance) ? 1 : 0;
+    g_clipdist = (want_clipdist && have_cd) ? 1 : 0;
+    LOG("[vk] shaderClipDistance/shaderCullDistance：设备支持 %d（shaderClipDistance %d / shaderCullDistance %d）、"
+        "本轮启用 %d（DM_CLIPDIST 缺省关）；设备 maxCombinedClipAndCullDistances = %u，"
+        "而译文器在 gl_PerVertex 里声明的 8 + 1 = 9",
+        have_cd, (int)core.shaderClipDistance, (int)core.shaderCullDistance, (int)g_clipdist,
+        (unsigned)p.limits.maxCombinedClipAndCullDistances);
     if (!g_dyn_render) LOG("【黄】设备不支持动态渲染（Vulkan 1.3）：渲染通道这一层退回只记状态");
     // 非实心多边形模式（线框）与顶点流的每实例步进：先问再开，没有就由管线层退化并报黄
     // Non-solid polygon modes (wireframe) and per-instance vertex stream steps: asked for before being enabled;
@@ -555,6 +586,9 @@ void vk_device_init(void) {
     feats.features = core;
     feats.features.fillModeNonSolid = g_fill_non_solid ? VK_TRUE : VK_FALSE;
     feats.features.samplerAnisotropy = g_aniso ? VK_TRUE : VK_FALSE;
+    // N4-g 的单变量实验（缺省关，见上面的长注释）| the N4-g single-variable experiment (off by default)
+    feats.features.shaderClipDistance = g_clipdist ? VK_TRUE : VK_FALSE;
+    feats.features.shaderCullDistance = g_clipdist ? VK_TRUE : VK_FALSE;
     f13.dynamicRendering = g_dyn_render ? VK_TRUE : VK_FALSE;
     {
         void *tail = &f13;
