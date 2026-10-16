@@ -104,6 +104,64 @@ static uint64_t ahb_max_bytes(void) {
     return mb > 0 ? (uint64_t)mb << 20 : 0;
 }
 
+// `DM_REGION_AHB_DRYRUN=1`：分配 / 取 fd / mmap / 导入**都做一遍**，然后原路撤掉、**返回 0**（不注册区域）。
+// 用途：分离"分配 + mmap + 导入"与"客体真的去用这块内存"—— 复量第二台的内核 panic 时，这一步是判据。
+// `DM_REGION_AHB_DRYRUN=1` does the whole allocate / take-fd / mmap / import sequence and then undoes it and
+// **returns 0** without registering a region. It separates "allocate + mmap + import" from "the guest actually uses
+// the memory" -- the discriminating measurement when pinning down device 2's kernel panic.
+static int ahb_dryrun(void) {
+    const char *e = getenv("DM_REGION_AHB_DRYRUN");
+    return e && *e && *e != '0';
+}
+
+// `DM_REGION_AHB_TOUCH=<MB>`：把映射好的这段**宿主自己按页触一遍**（每页写一个字节再读回来），
+// 每 128 MB 打一行进度，触完**原路撤掉、返回 0**（同 DRYRUN 的收尾，不交给客体）。
+// 用途：把"客体真的去用"再分一层 —— 分离"**单纯 CPU 访问**这块大内存"与"客体/GPU 在用它"。
+// 进度行是给"崩在半路"用的：内核 panic 会当场重启，只有崩之前已经写进日志的那几行留得下来。
+// `DM_REGION_AHB_TOUCH=<MB>` has the **host itself touch the mapping page by page** (write a byte, read it back),
+// logging progress every 128 MB, and then undo it all and **return 0** (the same tail as DRYRUN, so the guest never
+// gets it). It splits "the guest actually uses it" one level further: "**plain CPU access** to this large memory"
+// versus "the guest / the GPU using it". The progress lines are for the "it died half way" case: a kernel panic
+// reboots on the spot, so only the lines already written to the log survive.
+static uint64_t ahb_touch_bytes(void) {
+    const char *e = getenv("DM_REGION_AHB_TOUCH");
+    if (!e || !*e) return 0;
+    long long mb = atoll(e);
+    return mb > 0 ? (uint64_t)mb << 20 : 0;
+}
+
+// `DM_REGION_AHB_MEMSET=<MB>`：与 TOUCH 同一位置，但**用 `memset` 按 1 MB 一块清零**（每 128 MB 打一行进度），
+// 再按页读回校验，最后同 DRYRUN 的收尾（撤掉、返回 0）。为什么单列一个：在 arm64 上 bionic 的 `memset`
+// 大面积清零会走 **`DC ZVA`**（缓存块清零指令），而 GPU-only 的 AHB 映射很可能是 **Device / 非缓存**属性 ——
+// "宿主逐页写读没事、客体一开跑就崩"这个形状，最想排除的就是这一类指令。
+// `DM_REGION_AHB_MEMSET=<MB>` sits in the same place as TOUCH but **zeroes 1 MB at a time with `memset`** (logging
+// progress every 128 MB), reads it back page by page and then takes the same DRYRUN tail (undo, return 0). It is a
+// separate switch because on arm64 bionic's memset uses **`DC ZVA`** for large zeroing, and a GPU-only AHB mapping is
+// very likely **Device / non-cached** memory -- the one class of instruction this "host page writes are fine, the
+// guest dies as soon as it runs" shape most wants to rule out.
+static uint64_t ahb_memset_bytes(void) {
+    const char *e = getenv("DM_REGION_AHB_MEMSET");
+    if (!e || !*e) return 0;
+    long long mb = atoll(e);
+    return mb > 0 ? (uint64_t)mb << 20 : 0;
+}
+
+// `DM_REGION_AHB_ATOMIC=<MB>`：与 TOUCH / MEMSET 同一位置，但每页做一次**原子加**（`__ATOMIC_SEQ_CST`，
+// arm64 上编成 `ldaxr/stlxr` 独占访问），每 128 MB 打一行进度，最后同 DRYRUN 的收尾（撤掉、返回 0）。
+// 为什么猜这个：客体一拿到堆就会用互斥 / 引用计数这类原子操作，而**独占访问落在 Device / 非可缓存内存上是
+// 不可预测的**（这类内存连 LDXR/STXR 的语义都没有）。宿主那边的写、清零、读回都试过没事，剩下的差别里它最像。
+// `DM_REGION_AHB_ATOMIC=<MB>` sits in the same place as TOUCH / MEMSET but does one **atomic add** per page
+// (`__ATOMIC_SEQ_CST`, i.e. `ldaxr/stlxr` exclusive access on arm64), logging progress every 128 MB and taking the
+// same DRYRUN tail. Why this guess: the guest's first act on a heap is mutexes / refcounts, i.e. atomics, and
+// **exclusive access to Device / non-cached memory is unpredictable** (such memory does not even have LDXR/STXR
+// semantics). Host writes, zeroing and read-back were all clean, and this is the most likely remaining difference.
+static uint64_t ahb_atomic_bytes(void) {
+    const char *e = getenv("DM_REGION_AHB_ATOMIC");
+    if (!e || !*e) return 0;
+    long long mb = atoll(e);
+    return mb > 0 ? (uint64_t)mb << 20 : 0;
+}
+
 static int route(void) {
     if (g_route >= 0) return g_route;
     if (!opaque_fd_exportable() && ahb_available() && ahb_enabled()) {
@@ -379,6 +437,85 @@ static size_t overlay_ahb(void *at, size_t size, const char *what) {
             munmap(at, try); AHardwareBuffer_release(a);
             LOG("【红】%s 内存换轨（AHB）：导入 AHB 失败 VkResult %d（类型 %u，%llu MB）",
                 what, (int)r, mi, (unsigned long long)(pr.allocationSize >> 20));
+            return 0;
+        }
+        uint64_t touch = ahb_touch_bytes();
+        uint64_t zbytes = ahb_memset_bytes();
+        uint64_t abytes = ahb_atomic_bytes();
+        uint8_t *raw = (uint8_t *)at;
+        if (touch) {
+            if (touch > try) touch = try;
+            const uint64_t page = 4096, step = 128ull << 20;
+            volatile uint8_t *p8 = (volatile uint8_t *)at;
+            for (uint64_t o = 0; o < touch; o += page) {
+                p8[o] = (uint8_t)(o >> 12);
+                if ((o % step) == 0)
+                    LOG("【黄】%s 内存换轨（AHB）：TOUCH 写到 %llu MB / %llu MB",
+                        what, (unsigned long long)(o >> 20), (unsigned long long)(touch >> 20));
+            }
+            LOG("【黄】%s 内存换轨（AHB）：TOUCH 写完一遍（%llu MB），开始按页读回校验",
+                what, (unsigned long long)(touch >> 20));
+            uint64_t bad = 0;
+            for (uint64_t o = 0; o < touch; o += page) if (p8[o] != (uint8_t)(o >> 12)) bad++;
+            LOG("【黄】%s 内存换轨（AHB）：TOUCH 读回完成：%llu 个页里 %llu 个不一致",
+                what, (unsigned long long)(touch / page), (unsigned long long)bad);
+        }
+        if (zbytes) {
+            if (zbytes > try) zbytes = try;
+            const uint64_t chunk = 1ull << 20, step = 128ull << 20;
+            volatile uint8_t *p8 = (volatile uint8_t *)at;
+            for (uint64_t o = 0; o < zbytes; o += chunk) {
+                memset(raw + o, 0, (size_t)chunk);      // 大面积清零：arm64 上 bionic 会走 DC ZVA
+                if ((o % step) == 0)
+                    LOG("【黄】%s 内存换轨（AHB）：MEMSET 清到 %llu MB / %llu MB",
+                        what, (unsigned long long)(o >> 20), (unsigned long long)(zbytes >> 20));
+            }
+            LOG("【黄】%s 内存换轨（AHB）：MEMSET 清完一遍（%llu MB），开始按页读回校验",
+                what, (unsigned long long)(zbytes >> 20));
+            uint64_t nz = 0, pages = 0;
+            for (uint64_t o = 0; o < zbytes; o += 4096) { pages++; if (p8[o]) nz++; }
+            LOG("【黄】%s 内存换轨（AHB）：MEMSET 读回完成：%llu 个页里 %llu 个非零",
+                what, (unsigned long long)pages, (unsigned long long)nz);
+        }
+        if (abytes) {
+            if (abytes > try) abytes = try;
+            const uint64_t page = 4096, step = 128ull << 20;
+            for (uint64_t o = 0; o < abytes; o += page) {
+                // 一次原子加：arm64 上是 ldaxr/stlxr（独占访问）。用 volatile 挡住优化，别让它被消掉。
+                volatile uint32_t *a32 = (volatile uint32_t *)(raw + o);
+                __atomic_fetch_add((uint32_t *)a32, 1u, __ATOMIC_SEQ_CST);
+                if ((o % step) == 0)
+                    LOG("【黄】%s 内存换轨（AHB）：ATOMIC 加到 %llu MB / %llu MB",
+                        what, (unsigned long long)(o >> 20), (unsigned long long)(abytes >> 20));
+            }
+            LOG("【黄】%s 内存换轨（AHB）：ATOMIC 做完一遍（%llu MB，每页一次），开始读回",
+                what, (unsigned long long)(abytes >> 20));
+            uint64_t bad = 0, pages = 0;
+            for (uint64_t o = 0; o < abytes; o += page) {
+                pages++;
+                uint32_t v;
+                __atomic_load((uint32_t *)(raw + o), &v, __ATOMIC_SEQ_CST);
+                if (v != 1u) bad++;
+            }
+            LOG("【黄】%s 内存换轨（AHB）：ATOMIC 读回完成：%llu 个页里 %llu 个不是 1",
+                what, (unsigned long long)pages, (unsigned long long)bad);
+        }
+        if (ahb_dryrun() || touch || zbytes || abytes) {
+            // 撤掉时必须**把这段重新占住**（匿名映射），否则客体地址空间里会留一个没映射的洞 —— 那不是
+            // "没做换轨"的状态，会变成"客体一碰就 SIGSEGV"，把要分离的两件事又混在一起。
+            // When undoing, the range must be **occupied again** (anonymous mapping); otherwise the guest address
+            // space is left with an unmapped hole, which is not the "no overlay" state but "the guest faults on
+            // first touch", mixing up exactly the two things this switch is meant to separate.
+            LOG("【黄】%s 内存换轨（AHB）：%s —— %llu MB 的分配/映射/导入都成了，原路撤掉、返回 0（不注册区域）",
+                what, abytes ? "ATOMIC 之后撤掉（等于 DRYRUN）"
+                             : (zbytes ? "MEMSET 之后撤掉（等于 DRYRUN）"
+                                       : (touch ? "TOUCH 之后撤掉（等于 DRYRUN）" : "DRYRUN")),
+                (unsigned long long)(try >> 20));
+            vkFreeMemory(vk_dev(), mem, NULL);
+            AHardwareBuffer_release(a);
+            munmap(at, try);
+            void *q = mmap(at, try, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+            LOG("【黄】%s 内存换轨（AHB）：撤掉收尾 —— 该段已按匿名映射重新占住（%p，要 %p）", what, q, at);
             return 0;
         }
         g_reg[g_nreg].base = at; g_reg[g_nreg].size = try;

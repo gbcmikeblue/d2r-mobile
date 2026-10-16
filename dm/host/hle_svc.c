@@ -159,7 +159,21 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (size > g_heap_cap) { LOG("SetHeapSize OOM: req %#zx > cap %#zx", size, g_heap_cap); regs[0] = 0xD401; return 0; }
         if (size + image_bytes() > app_pool()) { g_heap_rejects++; regs[0] = 0x10801; return 0; }   // 超出应用内存池：ResultLimitReached。游戏启动时按 2 MB 递减重试直到放得下（main+0x1b66184） | exceeds the application memory pool: ResultLimitReached. At startup the game retries in 2 MB decrements until it fits (main+0x1b66184)
         int rc = 0;
-        if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
+        // DM_HEAP_NOPROT=1：**跳过**对堆区的这两次 mprotect —— 诊断用。
+        // 为什么要有这个开关（2026-10-16，「M3-3e」）：第二台（MTK/Mali）上"堆换成 AHB 内存 + SetHeapSize 成功"
+        // 就会**内核 panic**，而这一段里唯一的系统调用就是这两次 mprotect；凡是没走到这里的轮（`size > g_heap_cap`
+        // 在上一行就 OOM 返回了）全都安全 —— 相关性很干净，值得单独验一次。
+        // DM_HEAP_NOPROT=1 **skips** these two mprotects on the heap region -- for diagnosis.
+        // Why it exists (2026-10-16, M3-3e): on device 2 (MTK/Mali) "the heap turned into AHB memory + a successful
+        // SetHeapSize" leads to a **kernel panic**, and the only syscall in that window is these two mprotects; every
+        // round that never got here (size > g_heap_cap returns OOM on the line above) was safe -- a clean enough
+        // correlation to test on its own.
+        static int noprot = -1;
+        if (noprot < 0) { const char *e = getenv("DM_HEAP_NOPROT"); noprot = (e && *e && *e != '0'); }
+        if (noprot) {
+            static int said_np;
+            if (!said_np) { said_np = 1; LOG("【黄】DM_HEAP_NOPROT=1：SetHeapSize **不做** mprotect（诊断用，堆区边界不再收紧）"); }
+        } else if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
         else if (size < g_heap_cur) rc = mprotect(g_heap + size, g_heap_cur - size, PROT_NONE);
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
         { static int said; if (!said && size) { said = 1; LOG("SetHeapSize：首次设堆成功 %zu MB（应用内存池 %llu MB − 映像 %zu MB；此前被拒 %d 次）", size >> 20, (unsigned long long)(app_pool() >> 20), image_bytes() >> 20, g_heap_rejects); } }
