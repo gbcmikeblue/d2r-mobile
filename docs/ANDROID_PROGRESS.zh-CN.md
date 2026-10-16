@@ -9,7 +9,8 @@
 > `docs/CROSS_MACHINE.zh-CN.md` §7（交接现状）、`.work/recon/handoff.md`（本机事实与取证数据）。
 > 凡本页与上述文档冲突处，已在 §13「口径提醒」中标出。
 >
-> **基线**：分支 `android`，HEAD `04ea8e8`（2026-10-16，规则 + 文档口径提交；其前 `c384b22` = docs 对照台账，`b32db34` = M3-3c 收尾）。
+> **基线**：分支 `android`，HEAD `0da66c0`（2026-10-16，「M3-3e」：装机已验证 + AHB 支路两台成立并落地、
+> 支路默认关闸；其前 `d16de56` = M3-3d 收尾、`8c497b8` = M3-3d、`04ea8e8` = 规则 + 文档口径）。
 > **自本提交起，Windows 上一切命令走项目内的 `.venv` Python**（规则 `.codebuddy/rules/windows-python-only/RULE.mdc`，alwaysApply）。
 > 主线 `main` 是不含安卓的 iOS / macOS 版本。
 
