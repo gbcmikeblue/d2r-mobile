@@ -262,7 +262,7 @@ dm/tools/mac_app.sh        # 产出 ~/dm-work/out/macapp/D2R Mobile.app
 - 没验过的那几项，走通或走不通都值得告诉我们。
 - 想改代码：先跑通上面的测试入口，每次改动都要过回归闸门。
 
-**往别的平台走：** 这套做法不限于 iPhone 和 iPad。Apple 芯片的 Mac 可以直接移植过去——我们每天的回归测试就是把同一个包放在 Mac 上跑的。安卓手机用的是同一类处理器，游戏程序同样可以原生执行，这条路完全走得通：要换的只是宿主和图形层对接的那一侧。作者手边没有安卓手机，非常期待看到有人把它带到安卓上。这件事要做什么——能复用什么、要重写什么、风险在哪——见 [docs/ANDROID.zh-CN.md](docs/ANDROID.zh-CN.md)。
+**往别的平台走：** 这套做法不限于 iPhone 和 iPad。Apple 芯片的 Mac 可以直接移植过去——我们每天的回归测试就是把同一个包放在 Mac 上跑的。安卓手机用的是同一类处理器，游戏程序同样可以原生执行：**宿主那半边完全走得通**（实测复用率约 95%），但**图形层不能照搬**——Metal 的三条平台语义（指针即缓冲、写完即可见、小提交便宜）在 Vulkan 上都没有对应物，必须按原生方式重新实现。这件事要做什么、支线走到哪、为什么最近改了口径——见 [docs/ANDROID.zh-CN.md](docs/ANDROID.zh-CN.md) 与 [docs/ANDROID_REWRITE.zh-CN.md](docs/ANDROID_REWRITE.zh-CN.md)。
 
 ## 各部分的说明
 
@@ -279,6 +279,7 @@ dm/tools/mac_app.sh        # 产出 ~/dm-work/out/macapp/D2R Mobile.app
 | [docs/ANDROID.zh-CN.md](docs/ANDROID.zh-CN.md) | 安卓移植：是否可行、能复用什么、要重做什么、风险与建议路线 |
 | [docs/ANDROID_PLAIN.zh-CN.md](docs/ANDROID_PLAIN.zh-CN.md) | 上面那份分析的通俗版，给不写代码的读者 |
 | [docs/ANDROID_PLAN.zh-CN.md](docs/ANDROID_PLAN.zh-CN.md) | 安卓移植的实施计划：里程碑与可勾选的任务清单 |
+| [docs/ANDROID_REWRITE.zh-CN.md](docs/ANDROID_REWRITE.zh-CN.md) | 安卓图形层重写：推翻「同种架构可照搬」，改为 Vulkan 原生的显式实现（口径变更 + 规格） |
 | [docs/DERIVED.zh-CN.md](docs/DERIVED.zh-CN.md) | 仓库里与游戏有关的东西：有什么、没有什么、为什么 |
 
 ## 声明

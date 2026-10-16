@@ -262,7 +262,7 @@ Download our prebuilt "shell" package (`D2RMobile-shell.ipa`), which contains no
 - For the items marked not verified, tell us whether they worked or not. Either answer is valuable.
 - To change the code: get the test entry points above passing first. Every change has to pass the regression gates.
 
-**Taking it to other platforms:** this approach is not limited to iPhone and iPad. It ports directly to Apple silicon Macs — our daily regression tests run the very same package on a Mac. Android phones use the same class of processor, so the game program executes natively there as well, and the route is fully open: the only parts to replace are the sides of the host and the graphics layer that face the platform. The author has no Android phone at hand, and would love to see someone bring it to Android. For what that involves — what can be reused, what has to be rewritten, and the risks — see [docs/ANDROID.md](docs/ANDROID.md).
+**Taking it to other platforms:** this approach is not limited to iPhone and iPad. It ports directly to Apple silicon Macs — our daily regression tests run the very same package on a Mac. Android phones use the same class of processor, so the game program executes natively there as well: **the host side carries over** (measured reuse around 95%), but **the graphics layer cannot be carried over** — Metal's three platform semantics (a host pointer is a buffer, writes are immediately visible, small submits are cheap) have no Vulkan equivalent and have to be rebuilt natively. For what that involves, how far the Android branch has come, and why the wording changed recently — see [docs/ANDROID.md](docs/ANDROID.md); the newer analysis and specification is Chinese-only for now: [docs/ANDROID_REWRITE.zh-CN.md](docs/ANDROID_REWRITE.zh-CN.md).
 
 ## Documentation by part
 
@@ -279,6 +279,7 @@ Download our prebuilt "shell" package (`D2RMobile-shell.ipa`), which contains no
 | [docs/ANDROID.md](docs/ANDROID.md) | Porting to Android: is it feasible, what can be reused, what has to be redone, the risks and the suggested path |
 | [docs/ANDROID_PLAIN.md](docs/ANDROID_PLAIN.md) | The same analysis in plain language, for readers who do not work with code |
 | [docs/ANDROID_PLAN.md](docs/ANDROID_PLAN.md) | The Android port implementation plan: milestones and a checkable task list |
+| [docs/ANDROID_REWRITE.zh-CN.md](docs/ANDROID_REWRITE.zh-CN.md) | Rewriting the Android graphics layer: why "reuse the same architecture" was struck down, and the Vulkan-native specification (Chinese only for now) |
 | [docs/DERIVED.md](docs/DERIVED.md) | Game-related material in this repository: what is here, what is not, and why |
 
 ## Legal
