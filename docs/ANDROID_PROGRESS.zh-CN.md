@@ -9,7 +9,8 @@
 > `docs/CROSS_MACHINE.zh-CN.md` §7（交接现状）、`.work/recon/handoff.md`（本机事实与取证数据）。
 > 凡本页与上述文档冲突处，已在 §13「口径提醒」中标出。
 >
-> **基线**：分支 `android`，HEAD `b32db34`（M3-3c 收尾），生成于 2026-10-16。
+> **基线**：分支 `android`，HEAD `c384b22`（2026-10-16，docs 台账提交；其前为 `b32db34` = M3-3c 收尾）。
+> **§14 的对照台账与 `docs/ANDROID_PLAN.zh-CN.md`「七、下一步」第 6 条是本提交新增的内容。**
 > 主线 `main` 是不含安卓的 iOS / macOS 版本。
 
 ---
