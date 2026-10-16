@@ -27,6 +27,8 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
+#include "vk2_dirty.h"   // N2：区间级脏记账（§9.4）——池里那个占位字段现在换实了 | N2's dirty accounting
+
 // ---------------------------------------------------------------- 常数（N0 真机读数，不许再估）
 // 块大小 = **960 MB**：纸面上限 = min(maxStorageBufferRange 2047 MB, maxMemoryAllocationSize 1024 MB) = 1024 MB，
 // 阶梯实测「1088 MB 失败（静默：建/分配/绑定/提交全成功，只有尾页 4 KB 回读对不上）/ 1024 MB 成功」，
@@ -98,16 +100,11 @@ typedef struct {
     int            small;   // 1 = 只能按传输用法建出来（必须为 0）| 1 = transfer-only fallback (must stay 0)
 } vk2_chunk;
 
-// 脏记账的**占位类型**：真的 `vk2_dirty` 是 N2 的交付物（`vk2_dirty.c/.h`：区间级 CPU_DIRTY/GPU_DIRTY + 位图）。
-// N1 按 §9.2 把这个字段留在池结构里，但**一行代码都不读它**（N1 不建立任何可见性语义）——N2 到位时把它换实。
-// Placeholder for the dirty accounting that N2 delivers; N1 keeps the field per section 9.2 but never reads it.
-typedef struct { void *impl; } vk2_dirty;
-
 typedef struct {
     uintptr_t    lo, hi;    // 客体池的地址区间（就是宿主给的那份普通内存）| the pool's address range
     int          nchunk;
     vk2_chunk   *chunk;
-    vk2_dirty    dirty;     // N2 填实（N1 只留字段）| filled in by N2 (a placeholder in N1)
+    vk2_dirty    dirty;     // N2 填实：区间级脏位图（N1 时这里只是个占位字段）| N2's interval dirty bitmap
     int          mode;      // VK2_MODE_SHADOW / VK2_MODE_PINNED
     uint64_t     seq;       // 登记序号（日志里好认）| registration sequence number (for the log)
     char         tag[24];   // 调用方给的名字（可空）| caller-supplied name (may be empty)
@@ -120,6 +117,7 @@ typedef struct {
 typedef struct {
     VkDevice                                 dev;
     VkPhysicalDevice                         phys;
+    VkQueue                                  q;      // N2 起要提交（搬运窗口 / 回读拷贝）；N1 用不到，留空即可
     uint32_t                                 qfi;    // 承载提交的队列族（量能力/建缓冲时用）| queue family index
     VkPhysicalDeviceMemoryProperties         mp;
     VkPhysicalDeviceProperties               props;
@@ -136,7 +134,8 @@ typedef struct {
     uint64_t small;         // **G3 判据**：退成只带传输位的**块**数（旧路 g_pool_small）| must be 0
     uint64_t no_region;     // **G3 判据**：因"池落在 GPU 不可达区间"而一块没建出的池数（旧路 g_pool_no_region）
     uint64_t overlap;       // 登记时发现地址区间重叠的池数（调用方 bug，只报计数）| overlapping registrations
-    uint64_t tagged;        // 池地址带高位标记（TBI/PAC）的登记次数——掩到低 48 位之后照样成立 | tagged pool addresses
+    uint64_t tagged;        // 池地址带高位标记（TBI/PAC）的登记次数——掩掉最高字节之后照样成立 | tagged pool addresses
+    uint64_t dirty_fail;    // N2：脏位图建不出来 ⇒ 整个池登记失败的次数（应当一直是 0）| dirty bitmap alloc failures
     uint64_t bytes;         // 当前所有池覆盖的总字节 | total bytes covered by the pools
     uint64_t lookups, hits, misses, cross;   // 地址反查：总次数 / 命中 / 没落在池内 / 跨块
     uint64_t cross_hist[VK2_XLEN_BUCKETS];   // 跨块请求的**长度分布**（§9.3 要求的那份日志）
@@ -171,6 +170,14 @@ int  vk2_addr(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off);
 // 探针/诊断用：看池的内部形状 | for the probe and diagnostics: the pool's internal shape
 int             vk2_pool_count(void);
 const vk2_pool *vk2_pool_at(int i);
+// N2：池的脏位图（可写）。上传窗口按它扫 CPU_DIRTY 的 run，回读之后由调用方置 CLEAN。
+// N2: the pool's dirty bitmap (mutable). The upload window scans it for CPU_DIRTY runs; the caller marks CLEAN
+// after a readback.
+vk2_dirty      *vk2_pool_dirty(int i);
+// 池的宿主基地址（= 影子内存的地址）/ 池大小：搬运窗口要按它算"池内偏移"。
+// The pool's host base (the shadow's address) and size: the transfer windows derive pool-relative offsets.
+void           *vk2_pool_base(int i);
+uint64_t        vk2_pool_bytes(int i);
 
 // ---------------------------------------------------------------- 快路（§9.8）：只做降级规则
 // 请求把某个池"钉"到 GPU 内存上（省掉搬运）。**任何一步失败 ⇒ 该池回落 SHADOW，报计数不报红**；

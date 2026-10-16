@@ -435,7 +435,8 @@ int main(int argc, char **argv) {
                 A("【红】找不到刚登记的池（探针自己的账不对）");
             } else {
                 q_4g_chunks = q->nchunk;
-                A("池 %p+%llu MB ⇒ **%d 块**（%llu MB/块 + 余数）；模式 = %s；脏记账字段是 N2 的占位（N1 不读）",
+                A("池 %p+%llu MB ⇒ **%d 块**（%llu MB/块 + 余数）；模式 = %s；"
+                  "脏位图已由 N2 填实（本探针不读它，但它证明「登记要连位图一起建出来」）",
                   shadow, (unsigned long long)pool_mb, q->nchunk, (unsigned long long)q_chunk_mb,
                   q->mode == VK2_MODE_SHADOW ? "SHADOW（正确性路径）" : "PINNED");
                 uint64_t nsmall = 0;

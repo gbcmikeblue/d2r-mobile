@@ -69,6 +69,27 @@ const vk2_pool *vk2_pool_at(int i) {
     pthread_mutex_unlock(&g_mu);
     return p;
 }
+vk2_dirty *vk2_pool_dirty(int i) {
+    vk2_dirty *d = NULL;
+    pthread_mutex_lock(&g_mu);
+    if (i >= 0 && i < g_npool) d = &g_pools[i].dirty;
+    pthread_mutex_unlock(&g_mu);
+    return d;
+}
+void *vk2_pool_base(int i) {
+    void *b = NULL;
+    pthread_mutex_lock(&g_mu);
+    if (i >= 0 && i < g_npool) b = (void *)g_pools[i].lo;
+    pthread_mutex_unlock(&g_mu);
+    return b;
+}
+uint64_t vk2_pool_bytes(int i) {
+    uint64_t n = 0;
+    pthread_mutex_lock(&g_mu);
+    if (i >= 0 && i < g_npool) n = g_pools[i].hi - g_pools[i].lo;
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
 
 // 按需求位挑一个内存类型，并列时选堆最大的那个（与 N0 探针同一套规则）
 // Pick a memory type by property bits, preferring the largest heap on a tie (the same rule as N0's probe)
@@ -265,6 +286,7 @@ void vk2_pool_fini(void) {
     for (int i = 0; i < g_npool; i++) {
         for (int k = 0; k < g_pools[i].nchunk; k++) chunk_free(&g_pools[i].chunk[k]);
         free(g_pools[i].chunk);
+        vk2_dirty_fini(&g_pools[i].dirty);
     }
     free(g_pools);
     g_pools = NULL; g_npool = 0; g_ready = 0;
@@ -351,6 +373,22 @@ int vk2_pool_add(void *mem, uint64_t size, const char *tag) {
     }
     vk2_pool *pool = &g_pools[g_npool];
     memset(pool, 0, sizeof *pool);
+    // N2：这块池的脏位图（4 KiB 起步）。**没有脏记账的池就用不了**（上传窗口无从知道该搬哪一段），
+    // 所以位图建不出来时宁可整个池登记失败，也不要留下一个"能反查但永远搬不上去"的池。
+    // N2: the pool's dirty bitmap. A pool without dirty accounting is unusable (the upload window would not know
+    // what to move), so failing to allocate the bitmap fails the whole registration.
+    if (!vk2_dirty_init(&pool->dirty, size, 0)) {
+        for (uint64_t k = 0; k < built; k++) chunk_free(&cs[k]);
+        free(cs);
+        g_st.dirty_fail++;
+        uint64_t n = g_st.dirty_fail;
+        pthread_mutex_unlock(&g_mu);
+        V2LOG("【红】池 %p+%llu 的脏位图建不出来（%llu 字节，粒度 %u）⇒ 整个池登记失败（dirty_fail 累计 %llu）",
+              mem, (unsigned long long)size,
+              (unsigned long long)vk2_dirty_bitmap_bytes(size, vk2_dirty_gran_default()),
+              vk2_dirty_gran_default(), (unsigned long long)n);
+        return 0;
+    }
     pool->lo = lo; pool->hi = hi;
     pool->chunk = cs; pool->nchunk = (int)built;
     pool->mode = VK2_MODE_SHADOW;
@@ -386,6 +424,7 @@ void vk2_pool_del(void *mem) {
         uint64_t sz = g_pools[i].hi - g_pools[i].lo;
         for (int k = 0; k < g_pools[i].nchunk; k++) chunk_free(&g_pools[i].chunk[k]);
         free(g_pools[i].chunk);
+        vk2_dirty_fini(&g_pools[i].dirty);
         g_st.bytes -= sz;
         g_pools[i] = g_pools[--g_npool];
         g_st.pools = (uint64_t)g_npool;

@@ -75,6 +75,10 @@ add_library(dmhost_android STATIC
   # New foundation N1: shadow memory + chunked backing store + address lookup. Made available now; taking over
   # the replay layer is N4. Until then nothing calls it, so it only becomes part of the build.
   ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c
+  # 新地基 N2：区间级脏记账（§9.4）+ 上传/回读窗口（§9.5）。同样"先让它可用"，接管回放层是 N4。
+  # New foundation N2: interval dirty accounting and the upload/readback windows; made available now, N4 takes over.
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_dirty.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_xfer.c
   ${HOST_SRC}
   ${DM}/host/entry.S
   ${GFX_SRC}
@@ -224,12 +228,33 @@ target_include_directories(vk2_probe PRIVATE ${COMPAT})
 # The self-proving probe of N1: gate G3 as a question-and-answer run (a 4 GB pool built chunk-wise as
 # full-featured backing, both ends of every chunk really written and read back, small/no_region at zero, the
 # cross-chunk length distribution, the PINNED degradation, and a self-proof that DM_GFX2 is readable).
+# N2 起 vk2_pool.c 会用脏记账（每个池一张位图）⇒ 这个 N1 的探针也要链上 vk2_dirty.c；
+# 顺带它就成了"N1 的 G3 在 N2 的代码上还成立吗"的回归探针（N2 轮里跑一次）。
+# Since N2 the pool allocates a dirty bitmap, so N1's probe links vk2_dirty.c too -- which incidentally makes it
+# the regression probe for "does G3 still hold on N2's code".
 add_executable(vk2_pool_probe
   ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool_probe.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_dirty.c)
 target_link_libraries(vk2_pool_probe PRIVATE vulkan)
 target_link_options(vk2_pool_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk2_pool_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
+
+# 新地基 N2（脏记账 + 上传/回读窗口 + 显式屏障）的自证探针：把判据 **G1**（往返闭环逐字节正确）与
+# **G2**（不等待读旧值 / 等完栅栏仍不回读还是旧值 / 回读之后才是新值）做成一问一答，外加脏位图与朴素模型的
+# 逐位对比、扫描耗时三档、半页竞态、以及一批**机制**读数（明确不是帧读数）。不进宿主也不进 APK。
+# 读数落 .work/logs/probe-<串号>-vk2_xfer_probe[-tag].txt（走 .work/probes.py run）。
+# The self-proving probe of N2: gates G1 and G2 as a question-and-answer run, plus a per-bit self-proof of the
+# dirty bitmap against a naive model, three scan-timing rungs, the half-page hazard and a batch of mechanism
+# readings (explicitly not frame readings).
+add_executable(vk2_xfer_probe
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_xfer_probe.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_dirty.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_xfer.c)
+target_link_libraries(vk2_xfer_probe PRIVATE vulkan)
+target_link_options(vk2_xfer_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk2_xfer_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
 
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；
