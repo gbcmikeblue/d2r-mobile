@@ -368,10 +368,15 @@ mach-o 段查找一律返回找不到；安卓 SIGSEGV 拿不到 ESR 读写位�
 
 ### 8.3 Windows 作业规范（踩过的坑）
 
+- **命令入口：一律走项目内的 `.venv` Python**（2026-10-16 起）—— 规则文件 `.codebuddy/rules/windows-python-only/RULE.mdc`（alwaysApply）；
+  解释器 `d:/yiyi/d2r-mobile/.venv/Scripts/python.exe`（3.10.11；**PATH 上没有 `python` / `py`**，裸写会 `CommandNotFoundException`），
+  一切命令写成 `.venv\Scripts\python.exe -X utf8 <脚本>`；不再用 PowerShell 的管道 / 重定向 / `Out-File` / `Get-Content` / `Select-String`，也不再用 cmd 的 `>`。
 - 仓库 `.cmd` 是 **UTF-8 无 BOM**，而本机 cmd 代码页是 **936** ⇒ 直接跑会被中文注释拆行，
-  **先 `chcp 65001` 再 call**；提交消息由编辑器写成 UTF-8，**别经 PowerShell 转写**（会二次编码）。
-- Python 一律 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`（否则 GBK 会中途 `UnicodeEncodeError`，生成被截断的表）。
-- 重定向用 **cmd 的 `>`**，不要 PowerShell 管道 + `Out-File`；长任务必须带进度显示（ninja / curl / adb 自带）。
+  **先 `chcp 65001` 再 call**（现在这一步由 Python 的 `subprocess.run(["cmd","/c","chcp 65001 >nul && call …"])` 完成）；
+  提交消息由 Python 直接写成 UTF-8 无 BOM 文件，**别经 PowerShell 转写**（会二次编码）。
+- Python 一律带 `-X utf8`（等价 `PYTHONUTF8=1`）+ `PYTHONIOENCODING=utf-8`（否则 GBK 会中途 `UnicodeEncodeError`，生成被截断的表）；
+  文件读写一律显式 `encoding="utf-8"`，读外部工具产物加 `errors="replace"`。
+- **"用 cmd 的 `>` 重定向"这条路已作废**：写文件、过滤日志、拼文本全部在 Python 里做；长任务必须带进度显示（ninja / curl / adb 自带）。
 - 路径一律纯 ASCII；工具链路径集中在 `dm/android/apk/toolchain.cmd` **一处**决定（换机器不改仓库文件）。
 - `cmd` 脚本纪律：`if 条件 (set A & set B)` 必须加括号；`rem` 行里的 `&`/`|`/`>`/`<` 会被当命令分隔；
   `if` 条件里不要写 `%VAR:STR=REPL%`；括号块里不要放 `for /f`。
@@ -500,6 +505,10 @@ iCloud→Drive/自建；mach `vm_*`→`/proc/self/maps`、`__builtin___clear_cac
    `stall-ftrace.ps1`（抓取配方），另提到 `.work/` 下的 A/B 配方脚本与 `ab-E.conf`。同时 `.work/` 根下
    最新的提交消息副本是 `commit-msg-m3-2w.txt`（M3-2x 之后几轮的 `.work` 产物均不在）。
    ⇒ **要把 trace 复核列进下一步的话，得先在能跑的设备上按配方重抓**，或从当初那台机器上取回这些文件。
+   **2026-10-16 实测确认**：`.work/` 里**没有** `ab-run.ps1`、也没有任何 `ab-*.conf` —— 只有 `dm.conf`，
+   而它是 **M3-2w 的"A 轮复现"配置**（查看器 `DM_WIN_SRC=28` + 逐级扫描 + 看门狗 600 秒），**不能拿来做健康 / 生病对照**。
+   换设备对照动手前必须先**重建**：一份"最干净的臂"（两路诊断全关）的 conf + 一个跑 N 轮取读数的脚本
+   （按 `.codebuddy/rules/windows-python-only/RULE.mdc` 用 `.venv` Python 写）。
 5. `dm.conf` 是"参数即配置"的落点，设备上那一份**就是某一轮的复现配方**；`DM_WATCH_STALL` 值 ≤ 0
    **不是"只记不杀"**（会回落到 15 秒判死），要完全不看只能整行不写。
 

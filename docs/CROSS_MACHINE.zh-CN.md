@@ -41,7 +41,10 @@ Android 侧最小工具集（版本是当前实测能用的那一套）：
 
 只有要重新生成 `.work/spv` 时才需要 dotnet 10。Xcode、spirv-cross、xcodegen 属于 iOS 那条链，Android 侧不需要（安卓在 SPIR-V 处就下车了）。
 
-Python 环境：`python -m venv .venv`，再 `.venv\Scripts\pip install pillow numpy lz4 capstone unicorn`。
+Python 环境：`python -m venv .venv`，再 `.venv\Scripts\python.exe -m pip install pillow numpy lz4 capstone unicorn`。
+**所有命令一律用这个 `.venv` 的解释器**（`.venv\Scripts\python.exe -X utf8 …`）：本机 **PATH 上没有 `python` / `py`**
+（裸写会 `CommandNotFoundException`），而 `.venv` 在 `.gitignore` 里、**新机器必须重建**。规则文件与替换配方见
+`.codebuddy/rules/windows-python-only/RULE.mdc`（alwaysApply，2026-10-16 起）。
 
 ### 工具链路径：**不要**改文件
 
@@ -314,6 +317,13 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
   与"停住"很可能是同一条线。
 
 ### 下一步（细节在 ANDROID_PLAN「七、下一步」）
+
+> **2026-10-16 现状更新：第二台安卓设备已就位** ⇒ 上面第 1 条（换设备 / 换驱动对照，分辨力最强）现在可以做了。
+> 两个已知缺口，动手前先补：① `.work/` 里**没有** `ab-run.ps1`、也没有任何 `ab-*.conf`，只有 `dm.conf` —— 而它是
+> **M3-2w 的"A 轮复现"配置**（`DM_WIN_SRC=28` + `DM_NVN_SHOT_SCAN=50,54,57` + `DM_WATCH_STALL=600`），
+> **会污染健康 / 生病对照，不要推它**；要重建一份"最干净的臂"（两路诊断全关）的 conf 与跑轮脚本。
+> ② `.work/trace/` 不在，`stall.pftrace` 那条路要按配方重抓。跑轮脚本按新规则用 `.venv` Python 写
+> （`.codebuddy/rules/windows-python-only/RULE.mdc`）。
 
 1. ~~**里程碑 B：客体停住**（任务图侧）~~ —— **已结案（2026-10-15，「M3-2t」）**：三张位图的时间序列做完，
    真机三轮把甲（上膛 0 位）/ 乙（完成后被清）分开：**甲否掉、乙成立**（待派发最大 `0x3fffff`、已完成最大

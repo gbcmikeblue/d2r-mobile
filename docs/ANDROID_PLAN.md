@@ -588,13 +588,19 @@ Android 12 / API 31 is the recommendation: Vulkan 1.1 and up is mandatory by the
 
 The port is currently being driven from a Windows machine. These are the traps already hit, and the rules that follow from them.
 
+**Command entry point (since 2026-10-16): everything goes through the project's `.venv` Python** -- rule file
+`.codebuddy/rules/windows-python-only/RULE.mdc` (alwaysApply). The interpreter is
+`d:/yiyi/d2r-mobile/.venv/Scripts/python.exe` (3.10.11; there is **no `python` or `py` on PATH**), so every command is
+written as `.venv\Scripts\python.exe -X utf8 <script>`; **no more PowerShell pipelines / redirection / `Out-File` /
+`Get-Content` / `Select-String`, and no cmd `>` either**.
+
 ### Encoding
 
 - **Always run Python with `PYTHONUTF8=1` (plus `PYTHONIOENCODING=utf-8`).** On Windows, Python defaults to GBK for both files and stdio, which bites in two ways:
   - on output, a character such as `U+2212` in a script's comments raises `UnicodeEncodeError` and **aborts the script midway** (seen as truncated generated headers);
   - on input, the tables in the repository are UTF-8 while a script's `open(path)` carries no encoding → `UnicodeDecodeError` (hit when reading `shader_facts.tsv`).
   `PYTHONUTF8=1` makes every `open()` and stdio default to UTF-8, fixing both sides at once.
-- **Redirect to a file with cmd's `>`** (preserves raw bytes); do not use a PowerShell pipeline plus `Out-File` (it changes encoding and line endings).
+- **Redirect to a file in Python** (`open(..., "w", encoding="utf-8", newline="\n")`): the earlier rule "redirect with cmd's `>` (preserves raw bytes)" is **retired** -- shell redirection already bit here (`2>/dev/null` was read as a redirect to `D:\dev\null`), and it cannot give one consistent encoding. Writing files, filtering logs and assembling text all happen inside Python now (rule file sections 3 and 6).
 - **Do not route a commit message through a `.ps1` that PowerShell 5.1 reads.** Keeping the Chinese message inside a script and
   having the script write the message file is the older habit, and it bit once: PowerShell 5.1 reads a `.ps1` using the **system
   code page (GBK) rather than UTF-8**, so the Chinese is already mojibake in memory, and `[System.IO.File]::WriteAllText(..., UTF8)`
@@ -603,7 +609,7 @@ The port is currently being driven from a Windows machine. These are the traps a
   PowerShell never touches the string. A message already damaged this way can be recovered (UTF-8 bytes read as GBK is a
   double encoding, so walking it back byte by byte works), or its text can be extracted from the script file and rewritten --
   but **do not extract it with PowerShell**; use Python (`PYTHONUTF8=1`).
-- **Read files with an explicit encoding**: PowerShell `-Encoding`, or `[System.IO.File]::ReadAllLines()`.
+- **Read files with an explicit encoding** in Python: `open(path, encoding="utf-8", errors="replace")` (always `errors="replace"` for output produced by external tools); PowerShell's `-Encoding` and `[System.IO.File]::ReadAllLines()` are no longer used.
 - **Keep every path pure ASCII.** The user directory on this machine contains non-ASCII characters (`C:\Users\ZhuanZ（无密码）`), which has already caused two problems:
   - `hactool` converts `HOME` / `USERPROFILE` to UTF-16 and crashes when that fails → set an ASCII `HOME` before running it;
   - do not put generated headers, caches or logs under the user directory.
@@ -612,7 +618,7 @@ The port is currently being driven from a Windows machine. These are the traps a
 ### Commands
 
 - **Long tasks must show progress**, never sit silent: `curl` without `--silent` for downloads, `ninja`'s built-in `[n/m]` progress for builds, `adb push/pull` for transfers.
-- **Write multi-step commands as `.bat` / `.cmd` and run those**, rather than assembling `cmd /c "..."` inside PowerShell (quote nesting breaks easily).
+- **Write multi-step commands as Python scripts** (`.work/*.py` or a project script) and drive external tools with `subprocess.run([...])`; only fall back to `subprocess.run(["cmd", "/c", ...])` when an existing `.cmd` must be reused (`build_apk.cmd` / `install_apk.cmd`), and never assemble `cmd /c "..."` inside PowerShell (quote nesting breaks easily).
 - To **collect all errors**, use `ninja -k 0` and redirect to a log, then analyse it.
 - **`sdkmanager` is deprecated** and cannot accept licences without a TTY; use `android sdk install` instead (it accepts the ToS automatically after showing it).
 - **An XML comment may not contain `--`**. With an English em-dash written as `--` inside `AndroidManifest.xml`'s comment,

@@ -1,0 +1,104 @@
+---
+description: 本仓库在 Windows 上的一切命令行操作一律由项目内的 .venv Python 驱动（execute_command 只写 .venv\Scripts\python.exe -X utf8 ...），不再使用 PowerShell / cmd 的管道、重定向、Out-File、Get-Content、Select-String —— 目的是消灭代码页 936、BOM 与二次编码造成的乱码。含解释器绝对路径、替换配方、禁止清单、允许的窄例外与 Python 侧编码配方。
+alwaysApply: true
+enabled: true
+updatedAt: 2026-10-16T00:00:00.000Z
+provider:
+---
+
+# Windows 命令一律走项目内的 `.venv` Python（禁用 PowerShell / cmd 的管道与重定向）
+
+适用：本仓库（`d2r-mobile`）在 Windows 上的所有命令行操作 —— 构建、打包、装机、adb 推拉、抓日志、过滤统计、
+探针与真机运行、批量文件操作、写提交消息、生成/比对文本。
+
+## 0. 唯一允许的命令形态
+
+`execute_command` 的 `command` 只写这一种形态（解释器写**绝对路径**，或从仓库根写 `.venv/Scripts/python.exe`）：
+
+```
+& "d:/yiyi/d2r-mobile/.venv/Scripts/python.exe" -X utf8 <某个脚本.py>
+& "d:/yiyi/d2r-mobile/.venv/Scripts/python.exe" -X utf8 -c '<一段 Python>'
+```
+
+不要写 PowerShell 管道、重定向、`Out-File`、`Get-Content`、`Select-String`、`chcp`，也不要把多步操作串成一条 shell 命令。
+
+## 1. 为什么（每条都是本项目实测过的，不是推测）
+
+| 症状（实测） | 原因 |
+|---|---|
+| `git log` 里出现 `M3-2k锛氱紦...` 这种二次编码 | PowerShell 5.1 读 `.ps1` 按**系统码页 GBK**而不是 UTF-8 → 中文在内存里已是乱码，再 `WriteAllText(..., UTF8)` 落盘 |
+| 生成的表被截断、脚本中途退出 | Python 未指定编码，输出侧含 `U+2212` 这类字符时 `UnicodeEncodeError`；输入侧读 UTF-8 表时 `UnicodeDecodeError` |
+| 重定向写成 `2>/dev/null` 时报"未能找到路径 `D:\dev\null`" | 该写法被 PowerShell 当成重定向到文件，而不是丢弃 |
+| 直接 call 仓库 `.cmd` 时中文注释被拆行 | 本机 cmd 代码页是 **936**，而仓库 `.cmd` 是 **UTF-8 无 BOM** |
+| `hactool` 崩溃 | 用户目录名含中文（`C:\Users\ZhuanZ（无密码）`），工具把 `HOME`/`USERPROFILE` 转 UTF-16 失败 |
+
+结论：**编码问题全部来自"中文经过 shell（PowerShell / cmd）的参数、管道、重定向"这一环节**。把这一环节整个换成 Python，问题从根上消失。
+
+## 2. 解释器：项目内的 `.venv`（唯一合法入口）
+
+- 路径：`d:/yiyi/d2r-mobile/.venv/Scripts/python.exe` —— Python **3.10.11**，venv 的基础解释器是 `D:\AI\python-full`。
+- **PATH 上没有 `python`，也没有 `py`**（实测：裸写 `python --version` / `py -3 --version` 都报 `CommandNotFoundException`）。
+  所以**必须写 `.venv` 的路径**；只有重建 `.venv` 这一种场合才用基础解释器 `D:\AI\python-full\python.exe`。
+- 一律带 `-X utf8`（等价于 `PYTHONUTF8=1`）；需要时再叠加 `PYTHONIOENCODING=utf-8`。
+- 跨平台等价路径：`.venv/bin/python`（macOS / Linux）。
+- `.venv` 在 `.gitignore:8` 里，**换机器必须重建**：
+  `D:\AI\python-full\python.exe -m venv .venv`，然后
+  `.venv\Scripts\python.exe -m pip install pillow numpy lz4 capstone unicorn`（清单见 `docs/CROSS_MACHINE.zh-CN.md` 第二节）。
+- 装包只用 `.venv\Scripts\python.exe -m pip ...`，**不要**用全局 pip，也不要往 venv 里放项目产物。
+
+## 3. 替换配方（旧写法 → 新写法）
+
+| 以前（PowerShell / cmd） | 现在（Python） |
+|---|---|
+| `Get-Content x.log` / `Select-String -Pattern y` | `open(path, encoding="utf-8", errors="replace")` + `re` |
+| `... > out.txt` / `Out-File` / `Set-Content` | Python `open(out, "w", encoding="utf-8", newline="\n")` |
+| `curl -o f URL` | `urllib.request.urlretrieve`，或 `subprocess.run(["curl", ...])` |
+| `adb pull` 再过滤 | `subprocess.run(["adb", "pull", ...], capture_output=True, text=True, encoding="utf-8", errors="replace")` |
+| `chcp 65001` + `call build_apk.cmd` | `subprocess.run(["cmd", "/c", "chcp 65001 >nul && call build_apk.cmd"], ...)` |
+| `git commit -m "中文消息"` | Python 写 UTF-8 无 BOM 的消息文件 → `git commit -F <file>` |
+| `$env:X=1; tool` | `subprocess.run([...], env={**os.environ, "X": "1"})` |
+
+## 4. 禁止清单
+
+- PowerShell：`Out-File`、`Set-Content`、`Add-Content`、`Get-Content`、`Select-String`、`|`、`>`、`>>`、`2>/dev/null`、
+  `-Encoding`、`[System.IO.File]::WriteAllText`、`chcp`。
+- cmd：`>` / `>>` 重定向、`%VAR%` 拼串、`cmd /c "多步拼接"`。
+- 任何"把中文经 shell 参数 / 管道传递"的写法（含把提交消息交给 PowerShell 转写）。
+
+## 5. 允许的窄例外（只此一类）
+
+**单条**外部工具调用，且命令与输出**全为 ASCII**、不含管道 / 重定向 / 中文参数 / 多步组合时，可以直接写：
+`git status --short`、`git log --oneline -5`、`adb devices`、`ninja -C <dir>`、`.venv/Scripts/python.exe --version`。
+
+一旦出现"拼接、过滤、重定向、传中文、两步以上"，**必须**改成 Python。（这类纯 ASCII 单命令本身不产生编码问题，
+包一层 Python 只会多一个出错面；其余一切照本规则走 Python。）
+
+## 6. Python 侧编码配方（照抄）
+
+```python
+import sys, subprocess, pathlib
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")          # -X utf8 的兜底
+
+text = pathlib.Path(p).read_text(encoding="utf-8", errors="replace")  # 读：显式 utf-8，外部产物加 errors="replace"
+pathlib.Path(o).write_text(text, encoding="utf-8", newline="\n")      # 写：显式 utf-8，行尾统一 \n
+
+r = subprocess.run(["adb", "shell", "ls", "-l", d],                   # 外部工具：参数传列表
+                   capture_output=True, text=True,
+                   encoding="utf-8", errors="replace")                # 不用 shell=True，不拼字符串命令
+```
+
+- 写文件**不要**用 `utf-8-sig`（会带 BOM）；仓库文件一律 UTF-8 无 BOM。
+- 控制台中文由 `-X utf8` 保证；若脚本里另行打开二进制流，自己 `reconfigure`。
+
+## 7. 与仓库既有脚本的关系
+
+- `dm/android/apk/{build_apk.cmd, install_apk.cmd, toolchain.cmd}` 仍是 cmd（工具链路径集中在 `toolchain.cmd` 一处）：
+  **由 Python 调起**，不要把它们的命令手打进 PowerShell。
+- 新的辅助脚本放 `.work/*.py`（gitignored）或作为项目脚本进 `dm/android/`、`dm/tools/`。
+- 提交消息走 Python 写 UTF-8 无 BOM 文件 + `git commit -F`（原坑记录见 `docs/ANDROID_PLAN.zh-CN.md` §六）。
+
+## 8. 与既有文档的关系
+
+`docs/ANDROID_PLAN.zh-CN.md` §六、`docs/ANDROID_PLAN.md` §6 与 `docs/ANDROID_PROGRESS.zh-CN.md` §8.3 中
+"重定向用 cmd 的 `>`""多步命令写成 `.bat`/`.cmd`""读文件用 PowerShell 的 `-Encoding`"这几条**已被本规则取代**，
+文档已同步改写；以后凡与本节冲突，以本规则为准。

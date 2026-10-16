@@ -549,20 +549,24 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
 
 本项目目前在一台 Windows 机器上推进安卓移植。这里记下已经踩过的坑与约定，后续一律照此执行。
 
+**命令入口（2026-10-16 起）：一律走项目内的 `.venv` Python** —— 规则文件 `.codebuddy/rules/windows-python-only/RULE.mdc`（alwaysApply）。
+解释器 `d:/yiyi/d2r-mobile/.venv/Scripts/python.exe`（3.10.11；**PATH 上没有 `python` / `py`**，裸写会 `CommandNotFoundException`），
+一切命令写成 `.venv\Scripts\python.exe -X utf8 <脚本>`；**不再用 PowerShell 的管道 / 重定向 / `Out-File` / `Get-Content` / `Select-String`，也不再用 cmd 的 `>`**。
+
 ### 编码
 
 - **Python 一律带 `PYTHONUTF8=1`（并加 `PYTHONIOENCODING=utf-8`）**。Windows 上 Python 默认按 GBK 处理文件与标准输出，会踩两种坑：
   - 输出侧：脚本注释含 `U+2212` 这类字符时 `UnicodeEncodeError` **中途退出**（表现为生成的表头被截断）；
   - 输入侧：仓库里的表是 UTF-8，而脚本里 `open(path)` 未指定编码 → `UnicodeDecodeError`（读 `shader_facts.tsv` 时踩到）。
   `PYTHONUTF8=1` 让所有 `open()` 与 stdio 默认走 UTF-8，一次解决两侧问题。
-- **重定向到文件用 cmd 的 `>`**（保持原始字节），不要在 PowerShell 里用管道 + `Out-File`（会改编码与行尾）。
+- **重定向到文件一律由 Python 写**（`open(..., "w", encoding="utf-8", newline="\n")`）：以前记的"用 cmd 的 `>`（保持原始字节）"**已作废** —— shell 重定向在本机既踩过 `2>/dev/null` 被当成写文件 `D:\dev\null`，也无法给出统一的编码；写文件、过滤日志、拼文本现在全在 Python 里做（规则文件 §3 / §6）。
 - **提交消息不要经由 PowerShell 5.1 读 `.ps1` 去"转写"**。把中文消息写在脚本里再让脚本写进消息文件，这条老办法踩到过一次：
   PowerShell 5.1 读 `.ps1` **按系统码页（GBK）而不是 UTF-8**，于是脚本里的中文在内存里已经是乱码，再经
   `[System.IO.File]::WriteAllText(..., UTF8)` 落盘 → **提交消息被二次编码**（`git log` 里显示成 `M3-2k锛氱紦...`，
   而仓库里更早的提交是好的）。改法：**消息文件由编辑器/工具直接写成 UTF-8**，`git commit -F <文件>` 只读字节，
   中间不经过 PowerShell 的字符串。已经写坏的那条可以还原（UTF-8 字节被当 GBK 读 = 二次编码，逐字节反向即可），
   或直接从脚本文件里把原文抽出来重写——但**别用 PowerShell 抽**，用 Python（`PYTHONUTF8=1`）。
-- **读文件显式指定编码**：PowerShell 用 `-Encoding`，或直接 `[System.IO.File]::ReadAllLines()`。
+- **读文件显式指定编码**：在 Python 里 `open(path, encoding="utf-8", errors="replace")`（读外部工具产物一定带 `errors="replace"`）；不再用 PowerShell 的 `-Encoding` 或 `[System.IO.File]::ReadAllLines()`。
 - **路径一律纯 ASCII**。本机用户目录名含中文（`C:\Users\ZhuanZ（无密码）`），已经因此踩过两个坑：
   - `hactool` 会把 `HOME` / `USERPROFILE`（含中文）转 UTF-16 失败而崩溃 → 跑之前先设一个 ASCII 的 `HOME`；
   - 生成的表头、缓存、日志不要落在用户目录下。
@@ -571,7 +575,7 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
 ### 命令
 
 - **长任务必须给出进度显示**，不要静默等待：下载用 `curl`（不加 `--silent`）、构建用 `ninja`（默认的 `[n/m]` 进度）、`adb push/pull` 自带进度等。
-- **多步命令写成 `.bat` / `.cmd` 再执行**，不要在 PowerShell 里拼 `cmd /c "..."`（引号嵌套极易出错）。
+- **多步命令写成 Python 脚本再执行**（`.work/*.py` 或项目脚本），外部工具一律用 `subprocess.run([...])` 调起；只有必须复用既有 `.cmd`（`build_apk.cmd` / `install_apk.cmd`）时才 `subprocess.run(["cmd", "/c", ...])`，且**不在 PowerShell 里拼 `cmd /c "..."`**（引号嵌套极易出错）。
 - 需要"收集全部错误"时用 `ninja -k 0`，输出重定向到日志后再统一分析。
 - **`sdkmanager` 已被官方弃用**，且在无 TTY 环境下无法接受许可；改用 `android sdk install`（启动时展示 ToS 后自动接受）。
 - **XML 注释里不能出现 `--`**。`AndroidManifest.xml` 的注释里写了英文破折号 `--`，aapt2 报的是
