@@ -70,6 +70,11 @@ add_library(dmhost_android STATIC
   # Window, swapchain and present (M3): let the host's single device put a picture on the phone screen, see vk_win.h
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
+  # 新地基（Vulkan 原生显式实现）N1：影子内存 + 分块后备资源 + 地址反查。**先让它可用**，接管回放层是 N4
+  # （§9.7 的接管点表）；在此之前没有任何调用方，所以它进来只是"编进构建、随时能用"，不改变旧路行为。
+  # New foundation N1: shadow memory + chunked backing store + address lookup. Made available now; taking over
+  # the replay layer is N4. Until then nothing calls it, so it only becomes part of the build.
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c
   ${HOST_SRC}
   ${DM}/host/entry.S
   ${GFX_SRC}
@@ -211,6 +216,20 @@ add_executable(vk2_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_probe.c)
 target_link_libraries(vk2_probe PRIVATE vulkan)
 target_link_options(vk2_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk2_probe PRIVATE ${COMPAT})
+
+# 新地基 N1（影子 + 分块后备 + 地址反查）的自证探针：把判据 **G3** 做成一问一答 —— 4 GB 池按块建出**全功能**
+# 后备资源（每块头尾都真写一遍并回读）、`g_pool_small` 与 `g_pool_no_region` 为 0、跨块请求的长度分布、
+# 快路 PINNED 的降级、以及 `DM_GFX2` 开关的可读自证。它与 vk2_pool.c 一起编，不进宿主也不进 APK。
+# 读数落 .work/logs/probe-<串号>-vk2_pool_probe[-tag].txt（走 .work/probes.py run）。
+# The self-proving probe of N1: gate G3 as a question-and-answer run (a 4 GB pool built chunk-wise as
+# full-featured backing, both ends of every chunk really written and read back, small/no_region at zero, the
+# cross-chunk length distribution, the PINNED degradation, and a self-proof that DM_GFX2 is readable).
+add_executable(vk2_pool_probe
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool_probe.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c)
+target_link_libraries(vk2_pool_probe PRIVATE vulkan)
+target_link_options(vk2_pool_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk2_pool_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
 
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；

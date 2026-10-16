@@ -123,7 +123,8 @@ flowchart LR
 | M3-诊断链 | 12 轮真机排查（M3-2k → M3-3c） | 见 §5.6 时间线；结论：**「停住」= 驱动/GPU 约 10 秒不回答，会自愈** | §八 |
 | M3-3d 换设备 | **卡点 B 的对照没拿到**（第二台跑不起来），拿到的是"移植假设"：第二台 **Mali-G610 MC6** 上零拷贝内存池那条路不存在 | 4 份探针（71 扩展 / Vulkan 1.1.177 / 外部句柄**不可导出**）+ `dmhost` 冒烟（`建载体缓冲失败` → 堆与别名区各 0 MB → `Break#1`）+ 第一台干净臂 **12 轮**（健康 1 / 停顿型 7 / 设备丢失型 2 / 崩溃 2）+ `vk_ops` 的 -4「前序 24 笔」流水 | `ANDROID_PLAN` §八·M3-3d |
 | **新地基 N0** | **已完成（2026-10-16）**：§9.9 的四个常数各有真机读数（探针四轮，三轮完整且一致）—— **只问不接管**，游戏路径一行未动 | 新探针 `dm/android/vk2/vk2_probe.c` 第一台四轮：**块大小 960 MB**（纸面上限 = `maxMemoryAllocationSize` **1024 MB**，由"1088 MB 失败 / 1024 MB 成功"证明）、**脏位图 4 KiB 起步**（位图 128 KiB、扫一遍 0.9~2.7 ms）、**`VK2_INFLIGHT` 3 起步**（D=3 51~94 µs/提交、D=8 23~44 µs）、**暂存环 16 MiB 起步**（一池全搬 4096 MB = 156~170 ms ⇒ 24~26 GB/s）；栅栏带超时返回 `VK_TIMEOUT` 且可恢复；读数 `.work/logs/probe-8b1f1e50-vk2_probe.txt` | `ANDROID_PLAN` §八·N0 |
-| **新地基 N1~N6** | **未开工**（N0 之上的下一块是 N1） | 逐块计划、每块判据、"新基线六个字段"与"开工前要确认的三件事"见 `rewrite/ANDROID_REWRITE.zh-CN.md` §十一；本表自 N0 起逐项补真机读数 | — |
+| **新地基 N1** | **已完成（2026-10-16）**：影子内存 + 分块后备资源 + 地址反查（`dm/android/vk2/vk2_pool.c/.h`）落地；**本块的"接管"= 让新池模块可用**，真正替换回放层是 N4 —— 回放层三处一行未动 | 第一台四轮（**29 个字段逐轮完全一致**）：**G3 成立** —— 4 GB 池按块建成 **5 块**（4×960 MB + 末块 256 MB），每块**头页与尾页都真写一遍并回读**逐字节一致（5/5）、**`g_pool_small = 0`、`g_pool_no_region = 0`**；开关 `DM_GFX2` **缺省关且可读自证**（未设⇒旧路 / 1⇒新地基）；跨块请求长度分布（抽 199998 次：**≤64 KiB 跨块率 0**、256 KiB 0.009%、1 MiB 0.072%、4 MiB 0.396%、16 MiB 1.841%）；`malloc` 池带 TBI 标记也照旧；请求 PINNED 回落 SHADOW（报计数不报红）；读数 `.work/logs/probe-8b1f1e50-vk2_pool_probe.txt`（前三轮 `…-r1/-r2/-r3.txt` 留档） | `ANDROID_PLAN` §八·N1 |
+| **新地基 N2~N6** | **未开工**（N1 之上的下一块是 N2：脏记账 + 上传/回读窗口 + 屏障） | 逐块计划、每块判据、"新基线六个字段"与"开工前要确认的三件事"见 `rewrite/ANDROID_REWRITE.zh-CN.md` §十一；新基线读数表 `.work/logs/vk2-readings.tsv` 已建（N0 补录 + N1 一行；六个字段仍留空标"待 N2/N3"） | — |
 | M4 | 未开始 | — | — |
 
 **M3 任务清单的勾选状态与进度不一致**：`front_run` / `front_text_input` / 触摸 / 音频 /
@@ -522,6 +523,15 @@ iCloud→Drive/自建；mach `vm_*`→`/proc/self/maps`、`__builtin___clear_cac
    一行未动、没写 `vk2_pool/dirty/xfer/sub`、没引入任何开关。读数
    `.work/logs/probe-8b1f1e50-vk2_probe.txt`，结论与"探针自身的两个错"见 `ANDROID_PLAN` §八·N0。
    **下一步 = N1**（影子 + 分块后备 + 地址反查，判据 G3）。
+   **✓ 补记（2026-10-16，本轮）：N1 已完成** —— `dm/android/vk2/vk2_pool.c/.h`（影子内存 + 分块后备资源 +
+   地址反查；块大小 **960 MB** 写成代码常量、块数按池大小算）与自证探针 `dm/android/vk2/vk2_pool_probe.c`
+   （接进 `dm/android/CMakeLists.txt` 与 `.work/probes.py` 的 `ALL`）做出来，第一台**四轮**（四个轮次的全部关键字段
+   完全一致）：**G3 成立**（4 GB 池按块建成 5 块、每块头尾真写并回读逐字节一致、`g_pool_small` 与
+   `g_pool_no_region` 都为 0）；`DM_GFX2` **缺省关且可读自证**；请求 PINNED 按 §9.8 回落 SHADOW。
+   **仍然不接管回放层**：`nvn_vk.c` / `vk_tex.c` / `vk_region.c` 一行未动，没写 `vk2_dirty` / `vk2_xfer` /
+   `vk2_sub`，**一个游戏轮都没跑**（六个新基线字段仍留空）。读数
+   `.work/logs/probe-8b1f1e50-vk2_pool_probe.txt`，结论与两条更正见 `ANDROID_PLAN` §八·N1。
+   **下一步 = N2**（脏记账 + 上传/回读窗口 + 显式屏障，判据 G1/G2）。
 
 1. ★ **主线回到第一台（Adreno）**（2026-10-16「M3-3e」第九节，**口径变更**）—— 第二台的 AHB 线**暂停**：
    分级复量**已做完**（读数与结论见 ANDROID_PLAN「M3-3e」第八节）：分配 / mmap / 导入 / 撤销都安全、
