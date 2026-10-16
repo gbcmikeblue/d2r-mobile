@@ -223,18 +223,22 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
 > **这一节会过期。** 记于 2026-10-15（M3-3c 的内容基线 `ed900fb`；前几轮「M3-3b」/「M3-3a」/「M3-2z」）；
-> **最新提交**：`4780b9a`（2026-10-16，**纯文档**：**新路径文档独立成 `docs/rewrite/`** ——
-> 设计正本移入该文件夹，新增索引 `README.zh-CN.md`、工具与仪器清单 `TOOLS.zh-CN.md`、
-> 新会话提示词 `NEWSESSION.zh-CN.md`；其前 `3113763` = README 与 `ANDROID.zh-CN.md` 改口径、
-> `9a74398` = 里程碑 **N0~N6**（`ANDROID_REWRITE` §十一））—— 新机器从这之后接手，恢复步骤照第三节；
+> **最新提交**：`945f7d7`（2026-10-16，**新路径的第一个里程碑 N0**：常数标定 —— 新探针
+> `dm/android/vk2/vk2_probe.c`（只问不接管）+ 第一台四轮真机读数，§9.9 四个常数全部落地
+> （块大小 960 MB / 脏位图 4 KiB 起步 / `VK2_INFLIGHT` 3 起步 / 暂存环 16 MiB 起步）；
+> 其前 `4780b9a` = **新路径文档独立成 `docs/rewrite/`**（设计正本移入该文件夹，新增索引 `README.zh-CN.md`、
+> 工具与仪器清单 `TOOLS.zh-CN.md`、新会话提示词 `NEWSESSION.zh-CN.md`）、`3113763` = README 与
+> `ANDROID.zh-CN.md` 改口径、`9a74398` = 里程碑 **N0~N6**（`ANDROID_REWRITE` §十一））
+> —— 新机器从这之后接手，恢复步骤照第三节；
 > 进度细节与结论以 [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 的「七、下一步」与「八、进度记录」为准。
 > **★ 新路径的入口（开新会话从这里进）**：先看 [rewrite/README.zh-CN.md](rewrite/README.zh-CN.md)（那个文件夹的索引），
 > 开新会话时把 [rewrite/NEWSESSION.zh-CN.md](rewrite/NEWSESSION.zh-CN.md) 里的提示词**整段复制**过去即可；
 > 开工前照 [rewrite/TOOLS.zh-CN.md](rewrite/TOOLS.zh-CN.md) 的清单一一点。
 > **★ 现在的方向**：按 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)（「七、下一步」第 0 条，架构口径变更）
-> 的**里程碑 N0~N6** 走 —— **开工第一件事是 N0（常数标定）**：
-> 先用自证探针把 §9.9 的四个待实测常数（块大小 / 脏位图粒度 / `VK2_INFLIGHT` / 暂存环）量成真机读数，
-> **只问不接管**；之后 N1 影子 + 分块后备 + 地址反查 → N2 脏记账 + 上传/回读窗口 → N3 帧批提交 →
+> 的**里程碑 N0~N6** 走 —— **N0（常数标定）已完成**（2026-10-16，`945f7d7`）：自证探针把 §9.9 的四个待实测常数
+> 量成了真机读数（**块大小 960 MB / 脏位图粒度 4 KiB 起步 / `VK2_INFLIGHT` 3 起步 / 暂存环 16 MiB 起步**），
+> **只问不接管**（游戏路径一行未动），读数 `.work/logs/probe-8b1f1e50-vk2_probe.txt`；
+> 之后 N1 影子 + 分块后备 + 地址反查 → N2 脏记账 + 上传/回读窗口 → N3 帧批提交 →
 > **N4 接管出画面（顶替 M2 的验收）** → N5 两台设备都过 → N6 旧路退场。
 > 每块判据是 **G1~G5**，每块照"自证探针 → 读数落盘 → 再接管"三件套；旧路全留（`DM_GFX2` 缺省关）。
 > **N0~N4 都在第一台上做**，第二台保持暂停到 N5。
@@ -243,7 +247,16 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 现在停在哪
 
-- **★ 本轮（「M3-3f」，2026-10-16）停在**：**主线在第一台**（Adreno），第二台的 AHB 线**暂停**
+- **★ 最新一轮（「N0」，2026-10-16，提交 `945f7d7`）停在**：**新路径的第一个里程碑 N0 = 常数标定，已完成**。
+  新目录 `dm/android/vk2/` 建起来，第一个文件是**自证探针** `vk2_probe.c`（编成独立可执行文件，接进
+  `dm/android/CMakeLists.txt` 与 `.work/probes.py` 的 `ALL`），第一台**四轮**（三轮完整、结果一致）把 §9.9 的
+  四个常数各量成真机读数：**块大小 960 MB**（纸面上限 = `maxMemoryAllocationSize` 1024 MB，由"1088 MB 失败 /
+  1024 MB 成功"证明）、**脏位图粒度 4 KiB 起步**（= 本机页大小）、**`VK2_INFLIGHT` 3 起步**、
+  **暂存环 16 MiB 起步**（一池全搬一遍 4096 MB ≈ 160 ms ⇒ 24~26 GB/s）。**只问不接管**：`nvn_vk.c` / `vk_tex.c` /
+  `vk_region.c` 一行未动、没写 `vk2_pool/dirty/xfer/sub`、没引入任何开关（`DM_GFX2` 归 N1）。
+  读数 `.work/logs/probe-8b1f1e50-vk2_probe.txt`（前三轮 `…-r1/-r2/-r3.txt` 留档），结论与"探针自身的两个错"见
+  `ANDROID_PLAN` §八·N0。**下一步 = N1**（影子 + 分块后备 + 地址反查，判据 **G3**；块大小按 960 MB 写进代码常量）。
+- **上一轮（「M3-3f」，2026-10-16）停在**：**主线在第一台**（Adreno），第二台的 AHB 线**暂停**
   （见下一段）。旧口径的两支臂**做完且都是负结果** ⇒ **用法侧四刀全为负**（上传环 / 摘前端 / 上传提交 / 喂空活）
   ⇒ **卡点 B 的触发点不在我们这一侧的用法里**。**方向**：按「七、下一步」第 0 条的**架构口径变更**施工
   （正本 `docs/rewrite/ANDROID_REWRITE.zh-CN.md`）：影子内存 + 分块后备资源 → 显式屏障 + 上传/回读窗口 →
