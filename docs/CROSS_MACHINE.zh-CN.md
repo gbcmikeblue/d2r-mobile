@@ -223,7 +223,7 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
 > **这一节会过期。** 记于 2026-10-15（M3-3c 的内容基线 `ed900fb`；前几轮「M3-3b」/「M3-3a」/「M3-2z」）；
-> **最新提交**：`<待 docs 收尾提交回填>`（2026-10-16，**A1 = 真机装上 Vulkan 校验层 —— 答案是"有帮助"，
+> **最新提交**：`ab52812`（2026-10-16，**A1 = 真机装上 Vulkan 校验层 —— 答案是"有帮助"，
 > 而且它给出一条决定性的负结果**）：层的 `libVkLayer_khronos_validation.so`（**27,684,688 字节**，
 > `android-binaries-1.4.363.0.zip`）进 APK 的 `lib/arm64-v8a/`（`build_apk.cmd` 里新增的**缺省关**的
 > `DM_VKLAYER=1` 可选段），用 `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用
@@ -452,7 +452,7 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 现在停在哪
 
-- **★ 最新一轮（「A1」，2026-10-16，提交 `<待 docs 收尾提交回填>`）停在**：**真机装上 Vulkan 校验层，
+- **★ 最新一轮（「A1」，2026-10-16，提交 `ab52812`）停在**：**真机装上 Vulkan 校验层，
   答案是"有帮助"**。做法：层 `.so`（27,684,688 字节）进 APK 的 `lib/arm64-v8a/`（`DM_VKLAYER=1` 时才进），
   `setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用 —— **不用 root、不改代码**。
   一轮照出 **218 条 Error / 16 种 VUID**，**修掉一条真误用**（`shaderDrawParameters`，1839 份着色器在用
