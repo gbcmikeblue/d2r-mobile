@@ -809,7 +809,13 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
     // "M3-2n"; walked into once). And "sharing one command buffer" disappears by construction once each section has its
     // own, so this site needs no lock and cannot collide with the readback path. The only thing left to serialise is the
     // queue submit, which has the queue lock already.
-    if (!one_begin_on(&g_cb_up)) { up_rel(&u); return 0; }
+    // `DM_UP_NOSUB=1`：**只解排布，不拷贝、不提交**（破坏性取证，说明见下面收尾那段）。这一臂**整条命令缓冲都不碰**，
+    // 所以先判它、再决定要不要开录制。
+    // `DM_UP_NOSUB=1`: **deswizzle only -- no copy, no submit** (destructive evidence; the note is at the tail of this
+    // function). This arm **never touches the command buffer**, so it is decided first.
+    static int nosub = -1;
+    if (nosub < 0) { const char *e2 = getenv("DM_UP_NOSUB"); nosub = (e2 && *e2 && *e2 != '0'); }
+    if (!nosub && !one_begin_on(&g_cb_up)) { up_rel(&u); return 0; }
     // 拷贝前的布局转换：新建是 UNDEFINED，目标 TRANSFER_DST
     // Layout transition before the copy: newly created is UNDEFINED, the target is TRANSFER_DST
     VkImageMemoryBarrier b0 = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -817,7 +823,8 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = e->img,
         .subresourceRange = { aspect, 0, e->levels, 0, e->layers },
         .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
-    vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
+    if (!nosub)
+        vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
 
     VkDeviceSize off = 0; int ok = 1;
     for (uint32_t l = 0; l < e->levels && ok; l++) {
@@ -830,17 +837,34 @@ static int ent_upload(const tex_t *t, ent_t *e, VkImageAspectFlags aspect) {
             VkBufferImageCopy r = { .bufferOffset = u.off + off, .bufferRowLength = 0, .bufferImageHeight = 0,
                 .imageSubresource = { aspect, l, layer, 1 },
                 .imageOffset = { 0, 0, 0 }, .imageExtent = { w, h, 1 } };
-            vkCmdCopyBufferToImage(g_cb_up, u.buf, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            if (!nosub)
+                vkCmdCopyBufferToImage(g_cb_up, u.buf, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
             off += (VkDeviceSize)row_bytes * rows * (slices ? slices : 1);
         }
     }
     if (!ok) { step_fail("解排布失败（格式 %#x 目标 %d）", t->d.format, t->d.target); static int said; if (!said++) LOG("【红】解排布失败：格式 %#x 目标 %d（见 nvn_deswizzle.c 的限制）", t->d.format, t->d.target); }
-    VkImageMemoryBarrier b1 = b0;
-    b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
-    int done = ok && one_end_on(g_cb_up, 1);   // M3-3a：1 = 上传（站点名与读回分开）| M3-3a: 1 = upload (site name split from readback)
+    int done;
+    if (nosub) {
+        // 破坏性取证臂（plan §10 第 3 条 / §14「第一台上还能做的两支」之一）：**解排布照做（CPU 侧照跑），
+        // 但一次 `vkCmdCopyBufferToImage` 都不录、也不提交** ⇒ 图里还是旧内容/未定义内容。它要回答的是：
+        // 卡点 B 的那 ~10 秒落在这条路的"提交 + 等驱动"上，还是落在 CPU 侧的"解排布"上。
+        // 记账照旧（计数、`e->lay`），所以心跳与读数可与老配方直接比。
+        // The destructive-evidence arm (plan section 10 item 3 / section 14 "two arms left on device 1"):
+        // **the deswizzle still runs** (the CPU side is unchanged) but **not one vkCmdCopyBufferToImage is recorded and
+        // nothing is submitted**, so the image keeps stale/undefined content. It answers whether blocker B's ~10
+        // seconds sit in this path's "submit + wait for the driver" or in the CPU-side deswizzle. Bookkeeping is
+        // unchanged (counters, e->lay), so the heartbeat and readings stay comparable with the old recipe.
+        static int said;
+        if (!said++) LOG("【黄】上传：DM_UP_NOSUB=1 —— **只解排布，不拷贝、不提交**（破坏性取证：图里不是这次的内容）");
+        done = ok;
+    } else {
+        VkImageMemoryBarrier b1 = b0;
+        b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_cb_up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
+        done = ok && one_end_on(g_cb_up, 1);   // M3-3a：1 = 上传（站点名与读回分开）| M3-3a: 1 = upload (site name split from readback)
+    }
 
     up_rel(&u);   // 环里那段偏移在 up_acq 里已经推进（本轮到这里队列已空闲）；只有老路才真的销毁 | the slice was released in up_acq (the queue is idle by now); only the old path actually destroys anything
     if (done) { atomic_fetch_add(&g_uploads, 1); atomic_fetch_add(&g_upload_bytes, (uint64_t)total); e->lay = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }

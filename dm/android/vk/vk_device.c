@@ -379,6 +379,8 @@ uint32_t vk_memory_type(VkMemoryPropertyFlags want, uint32_t need_bits) {
     return UINT32_MAX;
 }
 
+static void vk_gpu_keepalive_start(void);   // 定义在文件末尾（见那里的说明）| defined at the end of the file (see the note there)
+
 void vk_device_init(void) {
     if (g_tried) return;
     g_tried = 1;
@@ -583,4 +585,107 @@ void vk_device_init(void) {
     if (g_zero_copy_cached != UINT32_MAX && g_zero_copy_cached != g_zero_copy)
         LOG("零拷贝内存类型另有一份带 HOST_CACHED 的：类型 %u（不在缓冲声明的可用位里；DM_ZC_CACHED=1 才用它，见「九」第 2 项）",
             g_zero_copy_cached);
+
+    vk_gpu_keepalive_start();
+}
+
+// ---------- GPU 保活臂（`DM_GPU_KEEPALIVE=<毫秒>`，缺省关）：隔 N 毫秒往客体队列上发一次**空提交** ----------
+// 依据（plan §10.1 /「M3-2z」「M3-3a」）：卡点 B 的形状是"**提交在飞、GPU 却在等新活**"（提交早已发出、只是没人
+// 执行），恢复瞬间是 GMU 中断 + 整套 GPU/GMU 时钟与带宽重编程 ⇒ 值得试"别让队列闲下来"。
+// ⚠ **只当 A/B 臂，不得当修复**（plan §10）：它不解释原因，只回答"让 GPU 一直有活，那 ~10 秒还会不会来"。
+// 三处细节：① 空提交也要**走队列锁**（与客体每帧提交共用一条队列，见 vk_device.h）；② 用一支栅栏保证"上一笔
+// 做完才复用命令缓冲"（拿不到就跳过这一拍并计数，不阻塞）；③ **不进 B3 流水**（原因见下面循环里的注释 ——
+// vk_ops.c 还依赖出图计数，探针链不了它），失败按条数限频直打日志。
+// ---------- The GPU keep-alive arm (DM_GPU_KEEPALIVE=<ms>, off by default): an **empty submit** on the guest queue
+// every N ms. Basis (plan 10.1, "M3-2z", "M3-3a"): blocker B looks like "submissions are in flight while the GPU waits
+// for new work" (the submit was sent long ago, nobody executes it) and recovery is a GMU interrupt plus a full GPU/GMU
+// clock and bandwidth reprogramming, so "never let the queue go idle" is worth a try. ⚠ **An A/B arm only, never a
+// fix** (plan section 10): it explains nothing; it only answers whether that ~10 seconds still shows up when the GPU
+// always has work. Three details: (1) an empty submit still takes the **queue lock** (it shares the guest's queue, see
+// vk_device.h); (2) a fence makes sure the command buffer is only reused after the previous submit finished (when it is
+// not available this tick is skipped and counted, never blocked on); (3) successful ones go on the B3 ledger, so a -4
+// report shows the keep-alive submits among the preceding operations.
+static VkCommandBuffer g_ka_cb;
+static VkFence g_ka_fence;
+static atomic_ullong g_ka_n, g_ka_skip, g_ka_err, g_ka_tick;
+
+static void *keepalive_main(void *arg) {
+    long ms = (long)(intptr_t)arg;
+    VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_qfi };
+    VkCommandPool cp = VK_NULL_HANDLE;
+    if (vkCreateCommandPool(g_dev, &pci, NULL, &cp) != VK_SUCCESS) { LOG("【红】GPU 保活：命令池建不出来，这一臂作废"); return NULL; }
+    VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = cp, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    if (vkAllocateCommandBuffers(g_dev, &ai, &g_ka_cb) != VK_SUCCESS) { LOG("【红】GPU 保活：空命令缓冲建不出来，这一臂作废"); return NULL; }
+    // ⚠ 栅栏**必须建成"已信号"**：复用判据就是 `vkGetFenceStatus() == VK_SUCCESS`，未信号的栅栏会让**第一拍**
+    // 就判成"上一笔还没做完"而跳过，于是**一次也发不出去**（实测：70 秒一轮里全是"跳过"，一行"已提交"都没有 ——
+    // 这一臂会变成彻底的假阴性，比不跑还坏）。
+    // ⚠ The fence **must be created already signalled**: reuse is gated on `vkGetFenceStatus() == VK_SUCCESS`, so an
+    // unsignalled fence makes the **very first** tick look like "the previous one is still pending" and be skipped, so
+    // **not one submit ever goes out** (measured: a 70 s round was all "skipped", not a single "submitted" line --
+    // making this arm a thorough false negative, worse than not running it at all).
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                              .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+    if (vkCreateFence(g_dev, &fci, NULL, &g_ka_fence) != VK_SUCCESS) { LOG("【红】GPU 保活：栅栏建不出来，这一臂作废"); return NULL; }
+    LOG("【黄】GPU 保活臂：每 %ld 毫秒一次空提交（DM_GPU_KEEPALIVE；**只当 A/B 臂，不得当修复**，见 plan §10）", ms);
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_ka_cb };
+    for (;;) {
+        struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        if (vk_dev() == VK_NULL_HANDLE) continue;
+        uint64_t tick = atomic_fetch_add(&g_ka_tick, 1) + 1;
+        // 上一笔还没做完就跳过这一拍（空提交一般微秒级完成；跳过次数进读数，不减慢任何东西）
+        if (vkGetFenceStatus(g_dev, g_ka_fence) != VK_SUCCESS) {
+            unsigned long long sk = atomic_fetch_add(&g_ka_skip, 1) + 1;
+            if (tick <= 5 || (sk % 200) == 0)
+                LOG("【黄】保活：第 %llu 拍**跳过**（上一笔的栅栏还没信号；累计跳过 %llu 次）",
+                    (unsigned long long)tick, sk);
+            continue;
+        }
+        vkResetFences(g_dev, 1, &g_ka_fence);
+        if (vkResetCommandBuffer(g_ka_cb, 0) != VK_SUCCESS) continue;
+        if (vkBeginCommandBuffer(g_ka_cb, &bi) != VK_SUCCESS) continue;
+        // ⚠ **不能提交一条真·空的命令缓冲**：这台设备（Adreno）是**惰性提交**，空提交可能被挂着不执行，
+        // 栅栏于是永远不信号，后面每一拍都被"跳过"（实测：70 秒一轮里"已发 100 次"那行一次都没出现，
+        // 说明实际发出量远低于预期，这一臂会变成假阴性）。加一条**零屏障**：一条真命令、不改任何状态。
+        // ⚠ **A truly empty command buffer must not be submitted**: this device (Adreno) does **lazy submission**,
+        // so an empty submit may be left hanging, its fence never signals, and every later tick is skipped (measured:
+        // in a 70 s round the "100 submits" line never appeared, i.e. far fewer went out than intended and the arm
+        // would be a false negative). A **zero barrier** is added instead: a real command that changes no state.
+        vkCmdPipelineBarrier(g_ka_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, NULL, 0, NULL, 0, NULL);
+        if (vkEndCommandBuffer(g_ka_cb) != VK_SUCCESS) continue;
+        vk_queue_note("保活：空提交");
+        vk_queue_lock();
+        VkResult r = vkQueueSubmit(g_queue, 1, &si, g_ka_fence);
+        vk_queue_unlock();
+        if (r == VK_SUCCESS) {
+            uint64_t n = atomic_fetch_add(&g_ka_n, 1) + 1;
+            if (tick <= 5 || (tick % 20) == 0)
+                LOG("保活：第 %llu 拍已提交；累计发 %llu、跳过 %llu、失败 %llu（每 %ld 毫秒一拍）",
+                    (unsigned long long)tick, (unsigned long long)n,
+                    (unsigned long long)atomic_load(&g_ka_skip), (unsigned long long)atomic_load(&g_ka_err), ms);
+        } else {
+            // 这里**不进 B3 流水**：`vk_ops.c` 还依赖出图计数（定义在 nvn_vk.c），几个探针只链 vk_device.c，
+            // 一进流水就把它们的链接弄断（真踩过）。保活提交失败按条数限频直接打日志，够看。
+            // These are **not** recorded in the B3 ledger: vk_ops.c also depends on the present counter (defined in
+            // nvn_vk.c) and several probes link only vk_device.c, so referencing the ledger breaks their link (walked
+            // into once). Keep-alive submit failures are logged directly, rate-limited by count.
+            unsigned long long n = atomic_fetch_add(&g_ka_err, 1) + 1;
+            if (n <= 8 || (n % 32) == 0) LOG("【红】保活：空提交失败 VkResult %d（第 %llu 次）", (int)r, n);
+        }
+    }
+    return NULL;
+}
+
+static void vk_gpu_keepalive_start(void) {
+    const char *e = getenv("DM_GPU_KEEPALIVE");
+    if (!e || !*e) return;
+    long ms = atol(e);
+    if (ms <= 0) return;
+    pthread_t th;
+    if (pthread_create(&th, NULL, keepalive_main, (void *)(intptr_t)ms) == 0) pthread_detach(th);
+    else LOG("【红】GPU 保活：线程起不来");
 }
