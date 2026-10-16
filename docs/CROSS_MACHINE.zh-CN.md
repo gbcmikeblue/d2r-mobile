@@ -223,11 +223,14 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
 > **这一节会过期。** 记于 2026-10-15（M3-3c 的内容基线 `ed900fb`；前几轮「M3-3b」/「M3-3a」/「M3-2z」）；
-> **最新提交**：`3113763`（2026-10-16，**纯文档**：README（中英）与 `docs/ANDROID.zh-CN.md` 改口径 ——
-> 「**宿主可复用、图形层不可照搬**」，两份 README 的索引加入新正本，`ANDROID.zh-CN.md` 加两处 ⚠ 勘误；
-> 其前 `9a74398` = 新架构的实现计划与目标里程碑 **N0~N6**（`ANDROID_REWRITE` §十一，该文同日入库）、
-> `1d31891` = 收尾）—— 新机器从这之后接手，恢复步骤照第三节；
+> **最新提交**：`4780b9a`（2026-10-16，**纯文档**：**新路径文档独立成 `docs/rewrite/`** ——
+> 设计正本移入该文件夹，新增索引 `README.zh-CN.md`、工具与仪器清单 `TOOLS.zh-CN.md`、
+> 新会话提示词 `NEWSESSION.zh-CN.md`；其前 `3113763` = README 与 `ANDROID.zh-CN.md` 改口径、
+> `9a74398` = 里程碑 **N0~N6**（`ANDROID_REWRITE` §十一））—— 新机器从这之后接手，恢复步骤照第三节；
 > 进度细节与结论以 [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 的「七、下一步」与「八、进度记录」为准。
+> **★ 新路径的入口（开新会话从这里进）**：先看 [rewrite/README.zh-CN.md](rewrite/README.zh-CN.md)（那个文件夹的索引），
+> 开新会话时把 [rewrite/NEWSESSION.zh-CN.md](rewrite/NEWSESSION.zh-CN.md) 里的提示词**整段复制**过去即可；
+> 开工前照 [rewrite/TOOLS.zh-CN.md](rewrite/TOOLS.zh-CN.md) 的清单一一点。
 > **★ 现在的方向**：按 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)（「七、下一步」第 0 条，架构口径变更）
 > 的**里程碑 N0~N6** 走 —— **开工第一件事是 N0（常数标定）**：
 > 先用自证探针把 §9.9 的四个待实测常数（块大小 / 脏位图粒度 / `VK2_INFLIGHT` / 暂存环）量成真机读数，
