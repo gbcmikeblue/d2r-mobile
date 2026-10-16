@@ -486,6 +486,33 @@ static int nodepth_on(void) {
     return v;
 }
 
+// DM_RASTER_BRUTE=1：把"可能把全部片元吃掉"的**光栅化侧**状态一起放开（诊断，缺省关；N4-e）。
+// 背景：N4-e 已经证明**附件/视图/布局/存储归属成立**（`:end` 通道探针的已知色落到了读回的那张图上），
+// 而**不带 `:end` 的探针**说明"通道从已知色开始、游戏绘制往上画"之后整片仍是已知色
+// ⇒ **游戏那些绘制一个像素都没落下**。剩下能吃光片元的只有这几处：深度/模板测试、面剔除、
+// 颜色写掩码与混合、以及视口/裁剪（视口/裁剪那一半在 nvn_vk.c 里按同一个开关铺满附件）。
+// 判读：打开它之后目标上出现内容 ⇒ 就能把范围收到这几处，再逐个单独放开来定位；仍是全零 ⇒
+// 光栅化侧全被排除，去查顶点/着色器/几何（顶点流、属性、索引、着色器输出）。
+// DM_RASTER_BRUTE=1 opens up every **raster-side** state that could eat all fragments (a diagnostic,
+// off by default; N4-e). N4-e has already proven the attachment/view/layout/storage chain works, and the
+// non-`:end` probe says the game's draws leave not one pixel, so only these few places can be eating them:
+// depth/stencil test, face culling, colour write mask and blending, plus viewport/scissor (that half lives
+// in nvn_vk.c under the same switch). Content appearing then narrows the search to those; all zero still
+// means the raster side is cleared and the vertex/shader/geometry side is next.
+static int brute_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_RASTER_BRUTE");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_RASTER_BRUTE=1：深度/模板测试关、面剔除关、混合关、写掩码全开"
+                   "（视口/裁剪在 nvn_vk.c 里铺满附件）——诊断用");
+    }
+    return v;
+}
+
+// 给 nvn_vk.c 用（那半边要把动态视口/裁剪铺满附件，见那边的调用点）
+int vk_pipe_brute(void) { return brute_on(); }
+
 VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_gfx_state *st) {
     if (!vs || !st || vs->mod == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     vk_device_init();
@@ -627,7 +654,7 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         .rasterizerDiscardEnable = nsh == 1 ? VK_TRUE : VK_FALSE,
         .polygonMode = (st->poly == VK_POLYGON_MODE_FILL || vk_have_fill_non_solid())
                      ? st->poly : (poly_warn_once(st->poly), VK_POLYGON_MODE_FILL),
-        .cullMode = st->cull, .frontFace = st->front,
+        .cullMode = brute_on() ? VK_CULL_MODE_NONE : st->cull, .frontFace = st->front,
         .depthBiasEnable = st->bias_en ? VK_TRUE : VK_FALSE,
         .depthBiasConstantFactor = st->bias_factor, .depthBiasClamp = st->bias_clamp, .depthBiasSlopeFactor = st->bias_units,
         .lineWidth = 1.0f };
@@ -635,10 +662,10 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         .rasterizationSamples = st->samples ? st->samples : VK_SAMPLE_COUNT_1_BIT,
         .alphaToCoverageEnable = st->a2c ? VK_TRUE : VK_FALSE };
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        .depthTestEnable = (nodepth_on() ? VK_FALSE : (st->depth_test ? VK_TRUE : VK_FALSE)),
+        .depthTestEnable = ((nodepth_on() || brute_on()) ? VK_FALSE : (st->depth_test ? VK_TRUE : VK_FALSE)),
         .depthWriteEnable = st->depth_write ? VK_TRUE : VK_FALSE,
-        .depthCompareOp = (nodepth_on() || !st->depth_test) ? VK_COMPARE_OP_ALWAYS : st->depth_op,
-        .stencilTestEnable = st->stencil_en ? VK_TRUE : VK_FALSE };
+        .depthCompareOp = (nodepth_on() || brute_on() || !st->depth_test) ? VK_COMPARE_OP_ALWAYS : st->depth_op,
+        .stencilTestEnable = (brute_on() ? VK_FALSE : (st->stencil_en ? VK_TRUE : VK_FALSE)) };
     if (st->stencil_en) {
         ds.front = (VkStencilOpState){ .failOp = st->stencil_fail[0], .passOp = st->stencil_zpass[0],
             .depthFailOp = st->stencil_zfail[0], .compareOp = st->stencil_func[0],
@@ -650,11 +677,11 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
     VkPipelineColorBlendAttachmentState cb[8];
     memset(cb, 0, sizeof cb);
     for (uint32_t i = 0; i < st->color_count && i < 8; i++) {
-        cb[i].blendEnable = st->blend_en[i] ? VK_TRUE : VK_FALSE;
+        cb[i].blendEnable = (brute_on() ? VK_FALSE : (st->blend_en[i] ? VK_TRUE : VK_FALSE));
         cb[i].srcColorBlendFactor = st->src_rgb[i]; cb[i].dstColorBlendFactor = st->dst_rgb[i];
         cb[i].srcAlphaBlendFactor = st->src_a[i]; cb[i].dstAlphaBlendFactor = st->dst_a[i];
         cb[i].colorBlendOp = st->eq_rgb[i]; cb[i].alphaBlendOp = st->eq_a[i];
-        cb[i].colorWriteMask = (VkColorComponentFlags)st->write_mask[i];
+        cb[i].colorWriteMask = (VkColorComponentFlags)(brute_on() ? 0xf : st->write_mask[i]);
     }
     VkPipelineColorBlendStateCreateInfo cbs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = st->color_count > 8 ? 8 : st->color_count, .pAttachments = cb };

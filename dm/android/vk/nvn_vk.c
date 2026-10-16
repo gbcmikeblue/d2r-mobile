@@ -654,6 +654,31 @@ static _Atomic uint64_t g_pass_n, g_clear_n, g_draw_skip, g_shadow_n;
 // really set no targets or we dropped them cannot be told from counts alone, only from **the op sequence in front of
 // that draw**.
 static _Atomic uint64_t g_draw_nc0, g_draw_ncN;
+// N4-e：**顶点/几何侧**的读数（光栅化侧已被排除 —— 深度/模板、剔除、混合、写掩码、视口/裁剪全放开之后
+// 游戏那 3.9 万次绘制在"已知色底子"上仍一个像素都没落下，见 `DM_RASTER_BRUTE` 的说明）。
+// `g_vb_fail` = "管线要用这条顶点流、但 `mtl_addr` 没反查出缓冲（于是**没绑上**）"的次数；
+// 那种绘制在 Vulkan 里就是**不带顶点缓冲的绘制**，一个片元都不会产生，而在这之前**一条记录都没有**。
+// N4-e: the **vertex/geometry side** counters (the raster side is excluded -- with depth/stencil, culling,
+// blending, write mask and viewport/scissor all opened up, the game's 39k draws still left not one pixel on
+// the known-colour base). g_vb_fail counts "the pipeline wants this vertex stream but mtl_addr found no
+// buffer", i.e. a draw with that stream unbound -- such a draw cannot produce a single fragment, and until
+// now there was not one line about it.
+static _Atomic uint64_t g_vb_ok, g_vb_fail, g_vb_none;   // 顶点流：绑上 / 没绑上 / 一条都没绑
+static _Atomic uint64_t g_draw_v0, g_draw_i0;            // 顶点数 0 / 索引数 0 的绘制
+// 按**顶点流号**分账：只报"没绑上"的总数不够用 —— 管线要的是哪一条流决定后果（位置流没绑 = 这个绘制
+// 一个片元都不会产生；颜色流没绑可能只是少了点细节）。位置流一般是第 0 条。
+// Per **stream index**: the total only is not enough -- which stream is missing decides the consequence
+// (an unbound position stream means the draw cannot produce one fragment; an unbound colour stream may only
+// lose detail). The position stream is usually index 0.
+static _Atomic uint64_t g_vb_fail_s[16];
+static int vb_fail_breakdown(char *buf, size_t cap) {   // 「没绑上（按流）」那一段
+    int o = 0;
+    for (int s = 0; s < 16 && o < (int)cap - 24; s++) {
+        uint64_t v = atomic_load(&g_vb_fail_s[s]);
+        if (v) o += snprintf(buf + o, cap - (size_t)o, "%s流%d=%llu", o ? "、" : "", s, (unsigned long long)v);
+    }
+    return o;
+}
 static uint8_t g_opring[32];
 static _Atomic unsigned g_opring_i;
 static uint64_t g_last_rt[8];
@@ -1126,6 +1151,24 @@ int vk_diag_line(char *buf, size_t cap) {
                       (unsigned long long)g_fence, (unsigned long long)ss.reaped_max,
                       (unsigned long long)vk2_sub_frame(), vk2_sub_pending(),
                       (unsigned long long)vk_tex_reads_gpu_written());
+    }
+    // N4-e：**顶点/几何侧**那几格（光栅化侧已排除；这几格以前一条读数都没有）。
+    // 判读：`没绑上` > 0 ⇒ 有绘制是"管线要用这条流、但缓冲没反查出来 ⇒ 没绑"，那种绘制产不出片元，
+    // 与"画了什么都没有"直接对上；`顶点数 0 / 索引数 0` > 0 ⇒ 几何本身是空的（另一种直接成因）。
+    if (n > 0 && (size_t)n < cap) {
+        // 心跳这一行**有长度上限**（调用方给 640 字节）⇒ 这里只放四个总数；"没绑上**按哪条流**"那一段
+        // 放进"每 60 次提交"的判据行（没有这个上限）。**2026-10-16 实测过**：把分账塞进心跳之后，
+        // 这一行的尾巴（`查看器 读成 / 跳过`、`出图在推进`）被截掉了 —— 那是把一条既有判据弄丢，
+        // 比多报一格更糟（第 ⑩ 条的同类：统计快照的位置会改读数）。
+        // The heartbeat line has a length cap (640 bytes from the caller), so only the four totals go here; the
+        // "which stream" breakdown goes into the every-60-submissions criterion line, which has no such cap.
+        // Measured on 2026-10-16: putting the breakdown into the heartbeat truncated the tail (the viewer's
+        // "read/skipped" counters and "present advancing") -- losing an existing criterion is worse than adding one.
+        n += snprintf(buf + n, cap - (size_t)n,
+                      "；顶点流 绑上 %llu / **没绑上 %llu** / 一条都没 %llu；顶点数 0 的 %llu、索引数 0 的 %llu",
+                      (unsigned long long)atomic_load(&g_vb_ok), (unsigned long long)atomic_load(&g_vb_fail),
+                      (unsigned long long)atomic_load(&g_vb_none), (unsigned long long)atomic_load(&g_draw_v0),
+                      (unsigned long long)atomic_load(&g_draw_i0));
     }
     return n;
 }
@@ -1777,9 +1820,63 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 
 #define SH_BIND 16
 
+// ---------- DM_PASS_PROBE=<序号>：**通道级**对照实验（缺省关，诊断用；N4-e）----------
+// 要回答的那句话：**"通道里的附件写入，到底有没有落到我们读回来的那张图上"**。
+// 为什么非要有它：`DM_GFX_PROBE` 的清是 `vkCmdClearColorImage`（**在通道之外**、直接对图像），
+// 它只能证明"我们的命令 → 图像 → 读回"这一段；而游戏那些绘制是**在通道里**写的 —— 一旦"通道挂的附件
+// 不是我们读的那张图 / 那一级"（视图、mip、层、存储归属任一处不一致），就会出现"绘制全都下发了、
+// 读回仍是零"而**不报任何错**（真机没有校验层，看不见）。这正是 N4-e 的扫描读数（13 次读成功全 0）
+// 之后要分的那一半。
+// 做法（**只**在这个序号上，其余一律不动）：
+//   ① 以它为 `color0` 的通道，`loadOp` **强制**成 CLEAR + 已知色 `(0, 0.6, 1)`（⇒ 亮度 152/136，按格式的伽马）；
+//   ② **`DM_PASS_PROBE=<序号>:end`** 时，通道收尾（`pass_end`）再用 `vkCmdClearAttachments` 把附件 0
+//      清成同一个已知色 —— 于是这一帧它**最后的状态就是已知色**（后面的通道不会再动它）。
+// 判读（两件事分开问，正是 N4-e 要分的那一刀）：
+//   · **`:end` 那种**：读到已知色 ⇒ **通道附件写入能到达我们读回的那张图**（附件/视图/布局/存储归属这一层成立）
+//     ⇒ 剩下的只能是"游戏那些绘制在附件里产不出片元"。读到 0 ⇒ 这一层不成立，先修这里。
+//   · **不带 `:end`**（不清收尾）：通道**从已知色开始、游戏的绘制往上画** ⇒ 最后读到的内容就是"游戏画了什么"：
+//     整片等于已知色 ⇒ **一个像素都没落下**；出现别的值 ⇒ **落下过**，读到的就是它写的颜色。
+// 只清颜色附件 0，不碰深度/模板；`vkCmdClearAttachments` 是核心 1.0 入口（直接调，不必取设备指针）。
+static uint64_t g_pp_serial;       // 0 = 关
+static int g_pp_endclear;          // 1 = 通道收尾再补一刀（`:end`）
+static int g_pp_armed;             // 这条通道上已经挂了探针
+static uint32_t g_pp_w, g_pp_h;    // 补清那一次的矩形（附件有效尺寸）
+// DM_RASTER_BRUTE 的另一半：把**动态视口/裁剪**铺满附件（光栅化侧那几项在 vk_pipe.c 里按同一个开关放开）。
+// 为什么要它：视口/裁剪是"吃光片元"最直接的一处，而它们是**动态状态**、由客体经 OP_VIEWPORTS / OP_SCISSOR 设，
+// 所以只能在记录绘制的这一刻覆盖（`pass_begin` 里那两行只在开通道时补一次，之后客体还能再改）。
+// The other half of DM_RASTER_BRUTE: make the **dynamic viewport/scissor** cover the whole attachment (the
+// other raster-state items are opened up in vk_pipe.c under the same switch). Viewport/scissor are the most
+// direct way to lose every fragment, and they are dynamic state set by the guest via OP_VIEWPORTS/OP_SCISSOR,
+// so they can only be overridden where the draw is recorded.
+static uint32_t g_pass_w, g_pass_h;   // 本通道的渲染区（附件尺寸），brute 模式下当满屏视口用
+static uint64_t pass_probe_serial(void) {
+    static int once;
+    if (!once) {
+        once = 1;
+        const char *v = getenv("DM_PASS_PROBE");
+        g_pp_serial = (v && *v) ? strtoull(v, NULL, 10) : 0;
+        if (v && strstr(v, ":end")) g_pp_endclear = 1;
+        if (g_pp_serial)
+            LOG("【查】DM_PASS_PROBE=%llu%s：以它为 color0 的通道 loadOp 强制 CLEAR + 已知色 (0,0.6,1)%s"
+                "（不带 `:end` ⇒ 通道从已知色开始、游戏的绘制往上画：整片仍是已知色 = 一个像素都没落下）",
+                (unsigned long long)g_pp_serial, g_pp_endclear ? ":end" : "",
+                g_pp_endclear ? "；并在通道收尾用 vkCmdClearAttachments 再补一刀（读到已知色 = 通道写入能到达读回的那张图）" : "");
+    }
+    return g_pp_serial;
+}
+
 static void pass_end(void) {
-    if (!g_rs.open || g_cur_slot < 0) { g_rs.open = 0; return; }
+    if (!g_rs.open || g_cur_slot < 0) { g_rs.open = 0; g_pp_armed = 0; return; }
     gpu_pass_ts(g_cur_slot, g_inf[g_cur_slot].cb, 1);   // 结束时间戳要在收通道之前写（之后写就不在这段里了）| the end timestamp goes in before the pass is closed (afterwards it would be outside the pass)
+    if (g_pp_armed && g_pp_endclear && g_pp_w && g_pp_h) {
+        VkClearAttachment ca = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0,
+                                 .clearValue = { .color = { { 0.0f, 0.6f, 1.0f, 1.0f } } } };
+        VkClearRect r = { { { 0, 0 }, { g_pp_w, g_pp_h } }, 0, 1 };
+        vkCmdClearAttachments(g_inf[g_cur_slot].cb, 1, &ca, 1, &r);
+        static int said;
+        if (!said++) LOG("【查】DM_PASS_PROBE：已在通道收尾对附件 0（%ux%u）补清成已知色（亮度 152/136）", g_pp_w, g_pp_h);
+    }
+    g_pp_armed = 0;
     if (dm_vkCmdEndRendering) dm_vkCmdEndRendering(g_inf[g_cur_slot].cb);
     // 关通道后把附件转回可采样：下一帧可能拿它当贴图读
     // Turn the attachments back into a sampleable layout after closing: the next frame may sample them
@@ -2536,12 +2633,17 @@ static void pass_begin(void) {
         vk_tex_transition(t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, cb);
         vk_tex_gpu_written(t);
         int clr = g_rs.cc_have && (g_rs.cc_mask & (1 << i));
+        // DM_PASS_PROBE：color0 命中时把 loadOp 强制成"清成已知色"（见 pass_probe_serial 的说明）
+        int probe = (i == 0 && pass_probe_serial() && t->serial == pass_probe_serial());
+        if (probe) { clr = 1; g_pp_armed = 1; }
         VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = iv, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = clr ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = { .color = { { clr ? g_rs.cc[i][0] : 0.f, clr ? g_rs.cc[i][1] : 0.f,
-                                        clr ? g_rs.cc[i][2] : 0.f, clr ? g_rs.cc[i][3] : 0.f } } } };
+            .clearValue = { .color = { { clr ? (probe ? 0.0f : g_rs.cc[i][0]) : 0.f,
+                                        clr ? (probe ? 0.6f : g_rs.cc[i][1]) : 0.f,
+                                        clr ? (probe ? 1.0f : g_rs.cc[i][2]) : 0.f,
+                                        clr ? (probe ? 1.0f : g_rs.cc[i][3]) : 0.f } } } };
         att[natt++] = a;   // 布局由纹理层记着（vk_tex_transition），这里不再单独维护 | layouts are tracked by the texture layer (vk_tex_transition), so nothing extra is kept here
         // 限了 mip/层的视图，附件尺寸不是底图尺寸：有效尺寸 = 底图 >> base_level（层范围不影响二维尺寸）
         // A view that limits mip levels or layers does not have the base image's size: the effective size is the
@@ -2554,6 +2656,8 @@ static void pass_begin(void) {
         if (!att_w || aw < att_w) att_w = aw;
         if (!att_h || ah < att_h) att_h = ah;
     }
+    // DM_PASS_PROBE：这个矩形要落在附件里（与渲染区同源，用附件有效尺寸）
+    if (g_pp_armed) { g_pp_w = att_w; g_pp_h = att_h; }
     if (!natt && !g_rs.depth) return;
     VkRenderingAttachmentInfo datt = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     int has_d = 0;
@@ -2592,6 +2696,8 @@ static void pass_begin(void) {
     // no validation layers to show it).
     if (att_w && w > att_w) { static int said; if (!said++) LOG("【黄】渲染区宽 %u 超出附件 %u（限了 mip 的视图）：已按附件钳住", w, att_w); w = att_w; }
     if (att_h && h > att_h) { static int said; if (!said++) LOG("【黄】渲染区高 %u 超出附件 %u（限了 mip 的视图）：已按附件钳住", h, att_h); h = att_h; }
+    // DM_RASTER_BRUTE 用：本通道的渲染区（= 附件尺寸）当满屏视口/裁剪用（见 g_pass_w/g_pass_h 的说明）
+    g_pass_w = w; g_pass_h = h;
     // ---- 渲染区取证 + 对照（说明见 pass_area_mode）----
     // 四个累计数各回答一件事：比附件小（渲染区外的片元被丢）、退成 1x1 级（几乎什么都不画）、
     // 开通道时**根本没设视口**（那份状态还没到，渲染区只能由裁剪或 1x1 兜底）、视口带偏移（"x+width" 算法失真）。
@@ -3086,6 +3192,16 @@ void mtl_exec(const uint8_t *p) {
             int wrote = 0;
             if (pl && g_rs.open && g_cur_slot >= 0) {
                 VkCommandBuffer cb = g_inf[g_cur_slot].cb;
+                // DM_RASTER_BRUTE：绘制前把动态视口/裁剪**铺满本通道的渲染区**（客体设的视口/裁剪仍可能吃掉
+                // 全部片元；这一覆盖只在这个诊断开关下发生，缺省一行都不走）
+                if (g_pass_w && g_pass_h && vk_pipe_brute()) {
+                    VkViewport bv = { 0.0f, 0.0f, (float)g_pass_w, (float)g_pass_h, 0.0f, 1.0f };
+                    VkRect2D bs = { { 0, 0 }, { g_pass_w, g_pass_h } };
+                    static int said;
+                    if (!said++) LOG("【查】DM_RASTER_BRUTE：绘制前把视口/裁剪铺成 %ux%u", g_pass_w, g_pass_h);
+                    vkCmdSetViewport(cb, 0, 1, &bv);
+                    vkCmdSetScissor(cb, 0, 1, &bs);
+                }
                 // 两个空间都取（set 0 = 顶点、set 1 = 片元），每个绘制固定分配两个集：其中一个没有绑定时
                 // 它是个**空布局**（写入侧跳过它，但仍然要绑——管线布局里它有位置）。
                 // Both spaces are fetched (set 0 = vertex, set 1 = fragment) and each draw allocates two sets fixed:
@@ -3107,15 +3223,19 @@ void mtl_exec(const uint8_t *p) {
                     // from the constant fallback that lives on VK_PIPE_DUMMY_BIND
                     uint8_t used[16] = { 0 };
                     for (int i2 = 0; i2 < 16; i2++) if (stv.attr[i2].valid) used[stv.attr[i2].stream & 15] = 1;
+                    int nused = 0;
                     for (int s2 = 0; s2 < 16; s2++) if (used[s2]) {
+                        nused++;
                         void *bb = NULL; uint64_t bo = 0;
                         if (mtl_addr(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size, &bb, &bo)) {
                             VkBuffer vb = (VkBuffer)bb; VkDeviceSize vo = (VkDeviceSize)bo;
                             // N4-b：顶点流要被 GPU 读 ⇒ 保证后备是最新的（标 CPU 脏；帧开头搬）
                             vk2_touch_cpu_(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size);
                             vkCmdBindVertexBuffers(cb, (uint32_t)s2, 1, &vb, &vo);
-                        }
+                            atomic_fetch_add(&g_vb_ok, 1);
+                        } else { atomic_fetch_add(&g_vb_fail, 1); atomic_fetch_add(&g_vb_fail_s[s2], 1); }   // N4-e：没绑上（这种绘制产不出片元）
                     }
+                    if (!nused) atomic_fetch_add(&g_vb_none, 1);
                     VkBuffer dum = vk_pipe_dummy_buffer();
                     if (dum) { VkDeviceSize z = 0; vkCmdBindVertexBuffers(cb, VK_PIPE_DUMMY_BIND, 1, &dum, &z); }
                     if (h.op == OP_DRAW_IDX) {
@@ -3137,6 +3257,7 @@ void mtl_exec(const uint8_t *p) {
                             it_ok = 0;
                         }
                         if (it_ok && mtl_addr(di->ibuf, 4, &ib, &io)) {
+                            if (!di->count) atomic_fetch_add(&g_draw_i0, 1);   // N4-e：索引数为 0 的绘制
                             // N4-b：索引缓冲要被 GPU 读 ⇒ 保证后备最新。反查只问了 4 字节（旧路如此），
                             // 标脏按"最多 4 字节一个索引"取上界（多标只多搬，不会少搬）。
                             vk2_touch_cpu_(di->ibuf, (uint64_t)(di->count > 0 ? di->count : 1) * 4);
@@ -3146,6 +3267,7 @@ void mtl_exec(const uint8_t *p) {
                             wrote = 1;
                         } else atomic_fetch_add(&g_desc_skip, 1);
                     } else {
+                        if (!d->count) atomic_fetch_add(&g_draw_v0, 1);   // N4-e：顶点数为 0 的绘制
                         vkCmdDraw(cb, (uint32_t)d->count, 1, (uint32_t)d->first, 0);
                         wrote = 1;
                     }
@@ -3155,11 +3277,17 @@ void mtl_exec(const uint8_t *p) {
             if (k < 8 || (k & 2047) == 2047) {
                 uint64_t nlay = 0, nlay2 = 0, ncpso = 0, gpso = 0, nfail = 0;
                 vk_pipe_stats(&nlay, &nlay2, &ncpso, &gpso, &nfail);
-                LOG("%s 第 %llu 次：顶点 %s 片元 %s → 管线 %s；目标 %u 个、拓扑 %d、属性 %u 条；%s；图形管线累计 %llu 条（失败 %llu）；真下发 %llu 次",
+                char fbs[128]; int fbo = vb_fail_breakdown(fbs, sizeof fbs);
+                LOG("%s 第 %llu 次：顶点 %s 片元 %s → 管线 %s；目标 %u 个、拓扑 %d、属性 %u 条；%s；图形管线累计 %llu 条（失败 %llu）；真下发 %llu 次"
+                    "；**顶点流** 绑上 %llu / 没绑上 %llu（%s）/ 一条都没 %llu；顶点数 0 的 %llu、索引数 0 的 %llu",
                     g_opname[h.op], (unsigned long long)(k + 1), shs[0] ? shs[0]->key : "无", shs[1] ? shs[1]->key : "无",
                     pl ? "建得成" : "建不出", stv.color_count, (int)stv.topo, shs[0] ? shs[0]->nin : 0,
                     wrote ? "已下发" : "未下发",
-                    (unsigned long long)gpso, (unsigned long long)nfail, (unsigned long long)atomic_load(&g_desc_draws));
+                    (unsigned long long)gpso, (unsigned long long)nfail, (unsigned long long)atomic_load(&g_desc_draws),
+                    (unsigned long long)atomic_load(&g_vb_ok), (unsigned long long)atomic_load(&g_vb_fail),
+                    fbo ? fbs : "无",
+                    (unsigned long long)atomic_load(&g_vb_none), (unsigned long long)atomic_load(&g_draw_v0),
+                    (unsigned long long)atomic_load(&g_draw_i0));
             }
             break; }
 

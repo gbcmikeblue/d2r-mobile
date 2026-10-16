@@ -53,6 +53,13 @@ VkPipeline vk_pipe_compute_variant(const vk_shader *cs, int variant);
 // Counters: descriptor set layouts, pipeline layouts, compute pipelines and graphics pipelines created, plus failures
 void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uint64_t *gpso, uint64_t *fail);
 
+// DM_RASTER_BRUTE（诊断，缺省关）：光栅化侧那几个开关的总闸。nvn_vk.c 用它决定"要不要在绘制前把
+// 动态视口/裁剪铺满附件"（另一半在 vk_pipe.c 里打开深度/模板/剔除/混合/写掩码）。
+// DM_RASTER_BRUTE (a diagnostic, off by default): the master switch for the raster-side ones. nvn_vk.c uses
+// it to decide whether to override the dynamic viewport/scissor across the whole attachment before a draw
+// (the other half opens depth/stencil/cull/blend/write-mask in vk_pipe.c).
+int vk_pipe_brute(void);
+
 // ---------- 图形管线 ----------
 // ---------- Graphics pipelines ----------
 // 一次绘制需要的图形管线状态。由回放层从**影子状态**解释出来（位域对象 → Vulkan 枚举，照苹果侧同一套映射），

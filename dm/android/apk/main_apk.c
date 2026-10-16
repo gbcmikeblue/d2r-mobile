@@ -808,7 +808,17 @@ void android_main(struct android_app *app) {
                 // backgrounding, so TERM_WINDOW / DESTROY never arrive and only the foreground can reach disk.
                 vk_device_pcache_tick();
                 uint64_t p = vk_present_count();
-                static char dl[640];
+                // 这一行的容量：640 → **1024**（N4-e，**只是余量**）。真实读数：加了"顶点流 绑上/没绑上/
+                // 顶点数 0/索引数 0"之后，最长的一条心跳是 **643 字节**（`.work/logs/n4-n4e-vtx2.log`），
+                // 换算到 `dl` 里约 613 字节 —— **640 其实还装得下、从来没被截断过**（我一度以为它被截了，
+                // 那是 `.work/poll.py` 显示时会截短每行所致；判"某行有没有被截"必须读**落盘日志**量字节，
+                // 见 `.work/n4e_hb_len.py`）。提到 1024 是给后面的格位留余量，不是修 bug。
+                // The capacity of this line went 640 -> 1024 (N4-e, **headroom only**). Real reading: with the
+                // vertex counters added, the longest heartbeat is **643 bytes** (n4-n4e-vtx2.log), ~613 inside
+                // `dl`, so 640 still fitted and it was never truncated -- I briefly thought it was, because
+                // `.work/poll.py` shortens every line when printing. To tell whether a line was truncated you
+                // must read the log on disk and measure bytes (see `.work/n4e_hb_len.py`).
+                static char dl[1024];
                 vk_diag_line(dl, sizeof dl);
                 if (p == g_hb_present) g_hb_stall_s++;
                 else { g_hb_stall_s = 0; g_hb_present = p; }
