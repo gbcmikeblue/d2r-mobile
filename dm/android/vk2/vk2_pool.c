@@ -58,9 +58,24 @@ static vk2_pool *g_pools;
 static int      g_npool;
 static vk2_pool_stats g_st;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+// N4：后备预算（0 = 一块都不建；缺省 = 不限）。见 vk2_pool.h 的说明 | N4: the backing budget (0 = census only)
+static uint64_t g_backing_budget = UINT64_MAX;
+static uint64_t g_backing_bytes;         // 已经建出来的后备资源总字节 | backing built so far
 
 int      vk2_pool_ready(void) { return g_ready; }
 uint64_t vk2_pool_chunk_bytes(void) { return g_chunk; }
+void     vk2_pool_set_backing_budget(uint64_t bytes) {
+    pthread_mutex_lock(&g_mu);
+    g_backing_budget = bytes;
+    pthread_mutex_unlock(&g_mu);
+}
+uint64_t vk2_pool_backing_bytes(void) {
+    uint64_t n;
+    pthread_mutex_lock(&g_mu);
+    n = g_backing_bytes;
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
 int      vk2_pool_count(void) { int n; pthread_mutex_lock(&g_mu); n = g_npool; pthread_mutex_unlock(&g_mu); return n; }
 const vk2_pool *vk2_pool_at(int i) {
     const vk2_pool *p = NULL;
@@ -266,6 +281,8 @@ int vk2_pool_init(const vk2_dev *d, uint64_t chunk_bytes) {
         want = max_ok;
     }
     g_chunk = want;
+    g_backing_bytes = 0;
+    g_backing_budget = UINT64_MAX;     // 新的一轮：预算复位成"不限"，调用方（N4 的选路点/探针）再给
     if (!g_pools) {
         g_pools = calloc(VK2_MAX_POOLS, sizeof *g_pools);
         if (!g_pools) {
@@ -290,6 +307,8 @@ void vk2_pool_fini(void) {
     }
     free(g_pools);
     g_pools = NULL; g_npool = 0; g_ready = 0;
+    g_backing_bytes = 0;
+    g_backing_budget = UINT64_MAX;
     memset(&g_st, 0, sizeof g_st);
     pthread_mutex_unlock(&g_mu);
 }
@@ -345,17 +364,33 @@ int vk2_pool_add(void *mem, uint64_t size, const char *tag) {
     }
     vk2_chunk *cs = calloc((size_t)nb, sizeof *cs);
     if (!cs) { g_st.pool_fail++; pthread_mutex_unlock(&g_mu); return 0; }
-    uint64_t built = 0;
+    uint64_t built = 0, built_bytes = 0, skipped = 0, skip_bytes = 0;
     for (uint64_t k = 0; k < nb; k++) {
         uint64_t remain = size - k * g_chunk;
         uint64_t sz = remain < g_chunk ? remain : g_chunk;
+        // N4：**后备预算** —— 建到预算为止，剩下的块不建。**池照样登记**（反查对缺掉的块 miss，计数看得见），
+        // 这与"一块都建不出来 ⇒ 整个池失败"是两回事：前者是调用方主动限的，后者是设备/驱动建不出来。
+        // N4's backing budget: build up to the budget, skip the rest -- but still register the pool.
+        uint64_t room = (g_backing_budget == UINT64_MAX)
+                        ? UINT64_MAX
+                        : (g_backing_bytes < g_backing_budget ? g_backing_budget - g_backing_bytes : 0);
+        if (sz > room) {
+            skipped = nb - k;
+            skip_bytes = size - k * g_chunk;
+            break;
+        }
         g_st.chunk_try++;
         if (!chunk_make(&cs[k], sz)) break;      // 失败点名在上面那条日志里 | the failure is named in the log
         cs[k].off = k * g_chunk;
+        g_backing_bytes += sz;
+        built_bytes += sz;
         g_st.chunk_ok++;
         built++;
     }
-    if (!built) {
+    g_st.chunk_skipped += skipped;
+    g_st.skipped_bytes += skip_bytes;
+    g_st.backing_bytes = g_backing_bytes;
+    if (!built && !skipped) {
         free(cs);
         g_st.pool_fail++;
         pthread_mutex_unlock(&g_mu);
@@ -367,6 +402,8 @@ int vk2_pool_add(void *mem, uint64_t size, const char *tag) {
     if (g_npool >= VK2_MAX_POOLS) {
         for (uint64_t k = 0; k < built; k++) chunk_free(&cs[k]);
         free(cs);
+        g_backing_bytes -= built_bytes;          // 建了又退掉，账还回去 | built then dropped: return the bytes
+        g_st.backing_bytes = g_backing_bytes;
         pthread_mutex_unlock(&g_mu);
         V2LOG("【红】池表已满（%d），池 %p 未登记", VK2_MAX_POOLS, mem);
         return 0;
@@ -380,6 +417,8 @@ int vk2_pool_add(void *mem, uint64_t size, const char *tag) {
     if (!vk2_dirty_init(&pool->dirty, size, 0)) {
         for (uint64_t k = 0; k < built; k++) chunk_free(&cs[k]);
         free(cs);
+        g_backing_bytes -= built_bytes;          // 同上：账还回去 | same: return the bytes
+        g_st.backing_bytes = g_backing_bytes;
         g_st.dirty_fail++;
         uint64_t n = g_st.dirty_fail;
         pthread_mutex_unlock(&g_mu);
@@ -422,9 +461,15 @@ void vk2_pool_del(void *mem) {
     for (int i = 0; i < g_npool; i++) {
         if (g_pools[i].lo != want) continue;
         uint64_t sz = g_pools[i].hi - g_pools[i].lo;
-        for (int k = 0; k < g_pools[i].nchunk; k++) chunk_free(&g_pools[i].chunk[k]);
+        uint64_t rel = 0;
+        for (int k = 0; k < g_pools[i].nchunk; k++) {
+            rel += g_pools[i].chunk[k].size;     // chunk_free 会把 size 清零，先求和 | sum before chunk_free zeroes it
+            chunk_free(&g_pools[i].chunk[k]);
+        }
         free(g_pools[i].chunk);
         vk2_dirty_fini(&g_pools[i].dirty);
+        g_backing_bytes -= rel;
+        g_st.backing_bytes = g_backing_bytes;
         g_st.bytes -= sz;
         g_pools[i] = g_pools[--g_npool];
         g_st.pools = (uint64_t)g_npool;
@@ -567,7 +612,7 @@ const char *vk2_route_line(void) {
     if (vk2_gfx2_enabled())
         snprintf(line, sizeof line,
                  "这次走**新地基**（DM_GFX2=1）：影子内存 + 分块后备资源（块 %llu MB）；"
-                 "选路点尚未接管（N4），本轮只有 vk2_pool 这一块可用",
+                 "**回放层正在接管**（N4：`mtl_pool_add/del` 那一步只登记与记账，GPU 侧仍走旧路）",
                  (unsigned long long)mb);
     else
         snprintf(line, sizeof line,

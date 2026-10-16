@@ -29,6 +29,7 @@
 #include "vk_tex.h"
 #include "vk_png.h"
 #include "vk_ops.h"
+#include "vk2_pool.h"      // N4：新地基（Vulkan 原生显式实现）的池模块 —— 选路点与真机池账 | N4: the new pool module
 #include "dm.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -81,9 +82,96 @@ static VkBuffer make_pool_buffer(uint64_t size, int *fell_back) {
     return b;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// N4-a：新地基（`DM_GFX2=1`）的**选路点与真机池账** —— 缺省关，关着时这一段一次都不执行、旧路一行不变。
+//
+// 新地基的第一块接管（§9.7 表的 `mtl_pool_add / mtl_pool_del / mtl_addr`）这一步**只做登记与记账**：
+// 池内存照旧交给旧路（零拷贝那条路一行不改），新模块**并行**登记一份「影子 + 分块后备资源」，把真机上
+// 「游戏实际开了哪些池、各多少字节、**是不是本进程可读写的普通内存**」量出来 —— 后者是新地基的**唯一前提**
+// （旧路的前提是"落在我们铺过的换轨区间里"），计数里的 `no_region` 必须为 0 才说明这条前提在真机游戏里成立。
+//
+// 两件刻意的事：① **GPU 侧一律仍走旧路**（`mtl_addr` 这一步不接管）⇒ 本轮不可能改变画面/崩溃率，
+// 读数只回答"账"；② 后备资源由 `DM_GFX2_BACKING_MB` 限（**0 = 一块都不建**，先只量账 —— 池预算按
+// 后备资源字节数算，见 ANDROID_PLAN §八·N1，先把"要多少"问清楚再决定"给不给"）。
+// N4-a: the route switch plus the real-machine pool ledger, off by default. It registers a shadow pool and its
+// chunked backing in parallel with the old road (which keeps drawing), so the reading is the ledger itself: how
+// many pools the game opens, how big they are, and whether each one is ordinary readable/writable memory (the new
+// foundation's single precondition). The GPU side still goes through the old road, so this step cannot change
+// behaviour; DM_GFX2_BACKING_MB caps the backing (0 = census only) because the pool budget is counted in backing
+// bytes and "how much is needed" has to be measured before "whether to give it".
+static int      g_vk2_up;              // 新地基池模块起来了吗 | the new pool module is up
+static uint64_t g_vk2_adds;            // 经新地基登记过的池数（含旧路会拒的那些）| pools registered via the new module
+static uint64_t g_vk2_bytes;           // 它们的总字节 | their total bytes
+static uint64_t g_vk2_route_logged;    // 选路行只打一次 | log the route line once
+
+static void vk2_boot(void) {
+    if (g_vk2_up) return;
+    if (!vk2_gfx2_enabled()) return;                       // 缺省关：一次都不进来
+    VkPhysicalDevice phys = vk_phys();
+    if (vk_dev() == VK_NULL_HANDLE || phys == VK_NULL_HANDLE) {
+        LOG("【红】N4：设备还没起来，新地基先不登记（DM_GFX2=1）");
+        return;
+    }
+    vk2_dev d;
+    memset(&d, 0, sizeof d);
+    d.dev = vk_dev(); d.phys = phys; d.q = vk_queue(); d.qfi = vk_queue_family();
+    const VkPhysicalDeviceMemoryProperties *mp = vk_mem_props();
+    if (mp) d.mp = *mp;
+    VkPhysicalDeviceProperties2 p2;
+    memset(&p2, 0, sizeof p2);
+    d.m3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &d.m3;
+    vkGetPhysicalDeviceProperties2(phys, &p2);
+    d.props = p2.properties;
+    if (!vk2_pool_init(&d, 0)) {
+        LOG("【红】N4：新地基池模块起不来（DM_GFX2=1 但 vk2_pool_init 失败）⇒ 后面的池账不会有");
+        return;
+    }
+    // 后备预算：未设 = 不限（与 N1 起的语义一致）；0 = 只登记不建后备（本轮的"池账"模式）
+    const char *s = getenv("DM_GFX2_BACKING_MB");
+    uint64_t mb = (s && *s) ? strtoull(s, NULL, 0) : UINT64_MAX;
+    vk2_pool_set_backing_budget(mb == UINT64_MAX ? UINT64_MAX : mb * 1024ull * 1024ull);
+    g_vk2_up = 1;
+    LOG("N4 选路：%s", vk2_route_line());
+    LOG("N4 池账开始：后备预算 = %s；块 %llu MB；**GPU 侧仍走旧路**（本步只登记与记账）",
+        mb == UINT64_MAX ? "不限" : (mb ? "见 DM_GFX2_BACKING_MB" : "0（只登记不建后备）"),
+        (unsigned long long)(vk2_pool_chunk_bytes() >> 20));
+}
+
+// 池账一行（自证：池地址、大小、新地基收没收、以及"要多少/给了多少"）
+// One ledger line: the pool address, its size, whether the new module took it, and needed-versus-given bytes.
+static void vk2_pool_ledger(const void *mem, uint64_t size, int ok) {
+    vk2_pool_stats st;
+    vk2_pool_stats_get(&st);
+    uint64_t need = g_vk2_bytes;                       // 累计"要多少"（按池字节数算）| cumulative "needed"
+    LOG("【地基】池账 #%llu：%p+%llu MB ⇒ 新地基%s；累计 %llu 个池 / %llu MB；"
+        "后备已建 %llu MB（跳过 %llu 块 / %llu MB）；no_region=%llu small=%llu pool_fail=%llu dirty_fail=%llu",
+        (unsigned long long)g_vk2_adds, mem, (unsigned long long)(size >> 20),
+        ok ? "登记成功" : "【红】登记失败", (unsigned long long)g_vk2_adds,
+        (unsigned long long)(need >> 20), (unsigned long long)(st.backing_bytes >> 20),
+        (unsigned long long)st.chunk_skipped, (unsigned long long)(st.skipped_bytes >> 20),
+        (unsigned long long)st.no_region, (unsigned long long)st.small,
+        (unsigned long long)st.pool_fail, (unsigned long long)st.dirty_fail);
+}
+
 void mtl_pool_add(const void *mem, uint64_t size) {
     vk_device_init();
     if (vk_dev() == VK_NULL_HANDLE || !mem || !size) return;
+
+    // N4-a：新地基**并行**登记（DM_GFX2=1 才动）。放在旧路的区间判断**之前**：旧路拒掉的池（栈/预留段）
+    // 也要进账 —— "新地基收不收得下"与"旧路铺没铺到"是两件事，这条正是要量的区别。
+    // N4-a: register in parallel, before the old road's range test, so pools the old road rejects are still
+    // counted -- "can the new foundation take it" and "did the overlay cover it" are two different questions.
+    if (vk2_gfx2_enabled()) {
+        vk2_boot();
+        if (g_vk2_up) {
+            if (!g_vk2_route_logged) { g_vk2_route_logged = 1; LOG("N4 选路自证：%s", vk2_route_line()); }
+            int ok = vk2_pool_add((void *)(uintptr_t)mem, size, "guest");
+            g_vk2_adds++; g_vk2_bytes += size;
+            if (g_vk2_adds <= 12 || (g_vk2_adds % 32) == 0 || !ok) vk2_pool_ledger(mem, size, ok);
+        }
+    }
 
     VkDeviceMemory dm = VK_NULL_HANDLE;
     uint64_t off = 0;
@@ -131,6 +219,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 
 void mtl_pool_del(const void *mem) {
+    if (g_vk2_up) vk2_pool_del((void *)(uintptr_t)mem);   // N4-a：新地基那边也拆掉（缺省关时 g_vk2_up = 0）
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++)
         if (g_pools[i].key == mem) {

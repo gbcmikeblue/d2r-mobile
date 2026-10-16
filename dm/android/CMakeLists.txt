@@ -98,6 +98,10 @@ target_link_libraries(dmhost_android PUBLIC vulkan nativewindow)
 
 target_include_directories(dmhost_android PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  # 新地基（vk2/）也要能被回放层看见：N4 起 `nvn_vk.c` 在 `mtl_pool_add/del` 上挂新地基的选路点与池账。
+  # The new foundation has to be visible to the replay layer: from N4 on, nvn_vk.c hangs the route switch and the
+  # pool ledger off mtl_pool_add/del.
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2
   ${DM}/host
   ${DM}/gfx/nvn
   ${DM}/gfx/nvn/include

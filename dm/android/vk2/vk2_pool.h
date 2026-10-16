@@ -136,6 +136,9 @@ typedef struct {
     uint64_t overlap;       // 登记时发现地址区间重叠的池数（调用方 bug，只报计数）| overlapping registrations
     uint64_t tagged;        // 池地址带高位标记（TBI/PAC）的登记次数——掩掉最高字节之后照样成立 | tagged pool addresses
     uint64_t dirty_fail;    // N2：脏位图建不出来 ⇒ 整个池登记失败的次数（应当一直是 0）| dirty bitmap alloc failures
+    uint64_t chunk_skipped; // N4：因为**后备预算**而不建的块数（0 = 预算不限）| chunks skipped because of the backing budget
+    uint64_t skipped_bytes; // 那些块合计本该覆盖的字节数 | bytes those skipped chunks would have covered
+    uint64_t backing_bytes; // 已经建出来的后备资源总字节（**池预算按它算**，见 ANDROID_PLAN §八·N1）| backing built so far
     uint64_t bytes;         // 当前所有池覆盖的总字节 | total bytes covered by the pools
     uint64_t lookups, hits, misses, cross;   // 地址反查：总次数 / 命中 / 没落在池内 / 跨块
     uint64_t cross_hist[VK2_XLEN_BUCKETS];   // 跨块请求的**长度分布**（§9.3 要求的那份日志）
@@ -150,6 +153,15 @@ int  vk2_pool_init(const vk2_dev *d, uint64_t chunk_bytes);
 void vk2_pool_fini(void);                  // 删掉所有池并清状态（单线程收尾用）| drop every pool and reset
 uint64_t vk2_pool_chunk_bytes(void);       // 实际生效的块大小（夹过之后）| the chunk size actually in use
 int  vk2_pool_ready(void);
+
+// 后备预算（**N4** 的"先量账再建后备"用）：累计建出来的后备资源超过这个字节数就不再建块 ——
+// **池照样登记**（反查对缺掉的块会 miss，计数看得见），与"建不出来就整个池失败"是两回事。
+// `0` = 一块都不建（"只登记不建后备"的池账模式）；缺省 = 不限（与 N1 起的语义一致）。
+// 每次 `vk2_pool_init` 会把它复位成"不限"（新的一轮由调用方重新给）。
+// Backing budget (N4): past this many bytes of backing no more chunks are built -- the pool is still registered,
+// the missing chunks simply make vk2_addr miss and are counted. 0 means census only. Default is unlimited.
+void     vk2_pool_set_backing_budget(uint64_t bytes);
+uint64_t vk2_pool_backing_bytes(void);     // 已经建出来的后备资源总字节 | backing built so far
 
 // ---------------------------------------------------------------- 池登记 / 反查（§9.2、§9.3）
 // 登记一个客体池：`mem` 是宿主给的普通内存（页对齐不是前提），`size` 是字节数。

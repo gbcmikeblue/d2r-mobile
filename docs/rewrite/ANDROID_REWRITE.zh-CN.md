@@ -419,6 +419,43 @@ typedef struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; uint64_t
 | `nvn_dirty.c`（iOS 用、安卓未接） | `vk2_dirty.c` | 修 `is_write` 那条路（见 9.4） |
 | `vk_pipe.c` 的绑定绑定 | **SPIR-V 反射为唯一真源**（原则 4） | 不一致就报红，指出是哪个 binding |
 
+> **N4 开工前的核对（2026-10-16，逐行对着代码走了一遍；原文保留在上面，更正批注在下面）**
+>
+> **① 四处的行号已经漂了（功能没漂）**：`vk_region_use` 在 **`vk_region.c:552`**（`:248` 是 `overlay_export`，
+> 表把两个函数压成了一个行号）；`vk_tex_grab` 在 **`vk_tex.c:1264`**（`vk_tex_grab_ser` 在 `1254`；`grab_ser_locked`
+> 的 `1083` 是对的，表把 `vk_tex_grab` 的行号并到了它上面）；`one_end_on` 定义在 **`vk_tex.c:511`**
+> （`519` 是函数体里的 `vk_queue_lock()`，差 8 行）；`vk_queue_lock` 定义在 **`vk_device.c:282`**
+> （`278` 是 `g_qmu` 的声明，差 4 行）。其余六行（`nvn_vk.c:84/133/149`、`:832/802/938`、`:172-173`、
+> `vk_tex.c:785`、`grab_ser_locked` "1083"、`vk_region.c:362`）**与代码一致**。
+>
+> **② "`nvn_dirty.c`（iOS 用、安卓未接）"这条已经过时**：安卓**已经接**了 —— `dm/gfx/nvn/hle_nvn.c:204/209`
+> 就在 `mtl_pool_add/del` 的伴生路径上调 `nvn_dirty_add_range` / `nvn_dirty_remove_range`。新地基要替代的是它的
+> **判读写那一半**（`is_write` 在安卓恒 0，见 9.4），不是"接入"本身。
+>
+> **③ 表里没写、但属于 N4 范围的三件事**（都是这轮探索照出来的）：
+> - **核心回放层的 `vkQueueWaitIdle` 一共只有 5 处**（`nvn_vk.c:172/173`、`vk_tex.c:539/1167/1321`）——
+>   接提交侧（N4-c）时对着这五行收口即可，G4 的"计数为 0"才有意义（`vk_tex.c:1321` 是**对照清除**那条路，
+>   表里没提，但它同样是"等队列空闲"）。
+> - **`mtl_addr` 的调用点一共 8 处**，其中"一次绘制里的绑定点"是 **`nvn_vk.c:1627`**（UBO/SSBO 动态描述符）、
+>   **`:2478`**（顶点缓冲）、**`:2503`**（索引缓冲），外加 **`vk_tex.c:1549`**（texel buffer 视图）、
+>   `nvn_vk.c:967`（`COPY_B2B`）、`:2185`（`UPDATE_UB`）与两处只做判定的诊断日志。**换 `mtl_addr` 一处，
+>   这八处一起变**，所以它是"一处改、八处生效"的接管点（也因此必须先想清楚上传策略再动手）。
+> - **`UPDATE_UB` / `COPY_B2B` 在旧路就已经是显式 GPU 拷贝**（`nvn_vk.c:2171-2192` / `:967`：payload 先进本槽的
+>   4 MiB 暂存缓冲，再 `vkCmdCopyBuffer` 到池）。⇒ 新地基下它们的目标从"池（= GPU 内存）"变成"后备资源"，
+>   且 `COPY_B2B` 的**目标**要标 `GPU_DIRTY`（影子从此过期，CPU 再读它必须先回读）。
+>
+> **④ 一处设计缺口（本表原先没覆盖，N4 必须给答案）**：**往返型（渲染目标）在旧路没有对应物** —— GPU 写进的是
+> `ent_build` 建的 `VkImage`，**从来没有把图像写回池内存**（`vk_tex.c:1629 mtl_read_texels` 直读池内存，对 GPU
+> 写过的贴图读到陈旧值，代码用 `g_reads_gw` 计数记着这件事）。所以"往返型 = GPU 写后备资源、CPU 读之前显式回读"
+> 这半条路**要在 N4 里第一次被真正实现**（图像型目标：后备是 `VkImage`，回读 = 图像 → 缓冲 → 影子）。
+> 另：`OP_COPY_B2T / COPY_T2B / COPY_STRIDE / CLEAR_TEX` 这几条 op 在旧路**只统计不执行**
+> （`nvn_vk.c:2542-2543` 只 `atomic_fetch_add(&g_shadow_n,1)`）—— 接 N4 时要决定它们是否仍然只记账。
+>
+> **⑤ N4-a 已做（2026-10-16）**：表里第一行的**前半**（`mtl_pool_add/del`）已经挂上选路点与并行的**池登记**
+> （`DM_GFX2=1`、`DM_GFX2_BACKING_MB=0` = 只登记不建后备）；**`mtl_addr` 仍未接管**（GPU 侧全走旧路）。
+> 真机读数：7 个池 / 1675 MB、**`no_region = 0`**（新地基的唯一前提在游戏路径上成立）。见
+> `ANDROID_PLAN.zh-CN.md` §八·N4-a。
+
 ### 9.8 快路（PINNED）与降级
 
 - `PINNED`：设备支持"可导出不透明 fd"（Adreno 830 有）时，可把某些池钉到 GPU 内存上，省掉搬运。
@@ -493,9 +530,14 @@ GPU 活）；`wait_all` 等的是所有在飞槽（不是队列空闲）；**提
 读数 `.work/logs/probe-8b1f1e50-vk2_sub_probe.txt`（前三轮 `…-r1/-r2/-r3.txt`；旧判定规则版四份
 `…-pre-r1~-pre-r4.txt` 留档；`…-dry.txt`/`…-dry2.txt` 是探针自己两个坑的现场），
 N2 的探针在 N3 代码上重跑一轮、判据字段逐项相同（`…-n3regress.txt`），结论见 `ANDROID_PLAN.zh-CN.md` §八·N3。
-**N4~N6 未开工**，下一个 = **N4**（接管回放层、出画面，顶替 M2 的验收）。
+**N4 已开工（只走了第一小步 = N4-a）**：`mtl_pool_add/del` 上挂了选路点 + 并行的**池登记**（`DM_GFX2=1`、
+`DM_GFX2_BACKING_MB=0` = 只登记不建后备，新增 Vulkan 占用 0），A/B 两臂真机各一轮 ⇒ **7 个池 / 1675 MB、
+`no_region = 0`**（新地基"池是普通内存"这条唯一前提在真机游戏路径上**成立**）、两臂红黄行逐条相同（零副作用）。
+**`mtl_addr` 仍未接管**（GPU 侧全走旧路）⇒ 画面/崩溃率与本步无关；G1~G4 与六个新基线字段**仍是"待 N4-b/c"**。
+读数与四条"下一步必须一起想清楚的事"见 `ANDROID_PLAN.zh-CN.md` §八·N4-a。**下一个 = N4-b**
+（`mtl_addr` → `vk2_addr` + 上传窗口接进提交路径）。
 （原文：~~N0~N6 全部未开工~~ / ~~N0 已完成，N1~N6 未开工~~ / ~~N1 已完成，N2~N6 未开工~~ /
-~~N2 已完成，N3~N6 未开工~~。）
+~~N2 已完成，N3~N6 未开工~~ / ~~N3 已完成，N4~N6 未开工~~。）
 
 ### 11.2 每个里程碑内部怎么走（三件套，不许跳步）
 
