@@ -79,6 +79,9 @@ add_library(dmhost_android STATIC
   # New foundation N2: interval dirty accounting and the upload/readback windows; made available now, N4 takes over.
   ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_dirty.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_xfer.c
+  # 新地基 N3：帧批提交 + 有界在飞（§9.6）。同样"先让它可用"（没有任何调用方）：接管回放层的提交是 N4。
+  # New foundation N3: frame-batch submission with bounded in-flight work; also made available only, N4 takes over.
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_sub.c
   ${HOST_SRC}
   ${DM}/host/entry.S
   ${GFX_SRC}
@@ -255,6 +258,25 @@ add_executable(vk2_xfer_probe
 target_link_libraries(vk2_xfer_probe PRIVATE vulkan)
 target_link_options(vk2_xfer_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk2_xfer_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
+
+# 新地基 N3（帧批提交 + 有界在飞）的自证探针：把判据 **G4** 拆成可判定的几问一答 —— 一个客体提交 = 一次
+# `vkQueueSubmit`（记账与探针各数一遍）、`vkQueueWaitIdle` 计数恒 0、"有界在飞"的 D = 1/2/3/4/8 各量一遍
+# （故意让 GPU 忙起来）给出槽等待率与长等条数、`vk2_sub_wait_all()` 等的是所有在飞槽而不是队列空闲、
+# 以及"提交槽能被 N2 的搬运窗口复用"（顺带量出暂存环是单窗口的这一限制）。不进宿主也不进 APK。
+# 读数落 .work/logs/probe-<串号>-vk2_sub_probe[-tag].txt（走 .work/probes.py run）。
+# The self-proving probe of N3: gate G4 as a question-and-answer run -- one guest submission is one vkQueueSubmit,
+# vkQueueWaitIdle stays at zero, bounded in-flight work is measured for D = 1/2/3/4/8 with the GPU kept busy (slot
+# wait rate and long-wait count), wait_all waits the in-flight slots rather than queue idle, and a submission slot
+# can carry an N2 upload window (which incidentally measures that the staging ring is single-window).
+add_executable(vk2_sub_probe
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_sub_probe.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_sub.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_dirty.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_xfer.c)
+target_link_libraries(vk2_sub_probe PRIVATE vulkan)
+target_link_options(vk2_sub_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk2_sub_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
 
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；

@@ -81,6 +81,13 @@ uint64_t vk2_upload(VkCommandBuffer cb, uint64_t frame, int pool_index);
 // Called when a window is finished: the ring write position returns to 0, so the next window cannot overwrite
 // the data of an in-flight one.
 void vk2_xfer_window_done(void);
+// 现在有没有一个窗口占着暂存环（**只读**，用于 N3/N4 判断"环能不能交出去"）。
+// 背景（N3 量出来的事实）：**环是单窗口的** —— 在飞深度 3 时，第 2、3 个槽想录上传窗口会看到环还被占着
+// ⇒ 那时不该调 `vk2_upload`（它会把"上一个窗口还没收尾"报成【红】），而应该等载着窗口的那个槽回收。
+// Whether a window currently holds the staging ring (read-only). The ring is single-window: with several
+// submissions in flight only one of them can carry an upload window -- N3's probe measures this and N4 has to
+// give the ring per-slot storage.
+int  vk2_xfer_window_open(void);
 
 // ---- 回读窗口（§9.5）---------------------------------------------------------------------------
 // 指定"这次回读要等谁的栅栏"（N2：调用方给；N4：由 `vk2_sub` 给）。不指定 ⇒ `vk2_readback` 返回 0 并报【黄】。

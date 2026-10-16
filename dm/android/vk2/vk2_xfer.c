@@ -294,6 +294,9 @@ void vk2_xfer_window_done(void) {
     g_ring_used = 0;
 }
 
+// 只读：环现在被一个窗口占着吗（N3 用它判断"这个槽能不能录上传窗口"）| read-only: is the ring held by a window
+int vk2_xfer_window_open(void) { return g_window_open; }
+
 // ---------------------------------------------------------------- 回读窗口（§9.5）
 void vk2_readback_after(VkFence producer) { g_producer = producer; }
 
