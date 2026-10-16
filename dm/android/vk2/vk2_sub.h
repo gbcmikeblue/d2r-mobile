@@ -71,6 +71,7 @@ typedef struct {
     uint64_t        frame;      // 这一槽承载的客体提交序号（1 起）；不在飞时无意义 | the frame it carries
     int             in_flight;  // 1 = 已提交、栅栏还没被观察到 | submitted, fence not yet observed
     int             has_upload; // 1 = 这一槽里录过 N2 的上传窗口（回收时要把环交还）| carries an upload window
+    int             bank;       // N4：这一槽用暂存环的哪一段（缺省 0 = N3 的单环行为）| which ring bank
     uint64_t        uses;       // 这一槽被取用过多少次 | how often this slot has been acquired
 } vk2_slot;
 
@@ -95,6 +96,8 @@ typedef struct {
     uint64_t wait_all_us, wait_all_max_us, wait_all_long;
     uint64_t upload_marks;        // vk2_sub_note_upload 调用次数 | note_upload calls
     uint64_t upload_recycled;     // 回收时真的把上传窗口交还（vk2_xfer_window_done）的次数 | windows recycled
+    uint64_t banks;               // N4：环按槽分了几段（0 = 没分，所有槽共用第 0 段 = N3 行为）| ring banks
+    uint64_t use_banks_calls;     // vk2_sub_use_banks 调用次数 | use_banks calls
     uint64_t idle_calls;          // **必须恒为 0**：本文件里出现 vkQueueWaitIdle 的次数（G4 的硬判据）
     uint64_t reaped_max;          // 已确认完成的最大 frame（**单队列 ⇒ 栅栏按提交序 signal**）
 } vk2_sub_stats;
@@ -137,6 +140,16 @@ VkFence vk2_sub_fence(uint64_t frame);
 // 标记"当前这个槽里录了 N2 的上传窗口"：该槽被回收时本模块自动 `vk2_xfer_window_done()` 把环交还。
 // Mark the slot being recorded as carrying an N2 upload window; the ring is handed back when the slot is reaped.
 void vk2_sub_note_upload(void);
+
+// ---------------------------------------------------------------- N4：环按槽分
+// 把暂存环切成"每个槽一段"（`vk2_xfer_set_banks(槽数)`），并让第 i 个槽用第 i 段 —— 这样**在飞深度 3 时
+// 三个槽可以同时载着各自的上传窗口**（N3 量出来的限制：单环会把上传与在飞深度串行化）。
+// 缺省**不调用** ⇒ 所有槽都用第 0 段（= N3 的一模一样的行为，N3 的回归读数因此不变）。
+// 返回实际段数；0 = 没分成（xfer 没就绪 / 有段被占着）。
+// N4: split the ring per slot so that several in-flight slots can each carry an upload window (N3's limit was that
+// a single ring serialised uploads against the in-flight depth). Not calling it keeps every slot on bank 0.
+int  vk2_sub_use_banks(void);
+int  vk2_sub_slot_bank(int i);     // 第 i 个槽用哪一段（只读，诊断用）| which bank slot i uses
 
 // ---------------------------------------------------------------- 读数与日志
 void vk2_sub_stats_get(vk2_sub_stats *out);

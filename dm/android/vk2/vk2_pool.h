@@ -46,19 +46,21 @@
 // 一个进程最多登记多少个池 | how many pools one process may register
 #define VK2_MAX_POOLS         256
 
-// 块的「全功能」用法位：SSBO / 上传 / 回读 / 顶点 / 索引 / 间接 / 缓冲区贴图（texel）。
-// **故意不含 `UNIFORM_BUFFER`**：规范对 VkBufferCreateInfo 有一条 VU 要求「带 UNIFORM_BUFFER 的缓冲，
-// size ≤ maxUniformBufferRange（本机 64 KB）」，而我们的块是 960 MB ⇒ 带上它等于明知故犯地走在规范外
-// （旧路把 UBO 位给了整池，走的正是这条路）。块内当 UBO 用的那些小段要怎么处理属 N4 的绑定问题；
-// 探针另有一条子问专门量"960 MB 带 UBO 位建不建得出来"，只为把旧路的宽容度记成读数。
-// The "full-featured" usage set, deliberately without UNIFORM_BUFFER: a spec VU requires a buffer with
-// UNIFORM_BUFFER to be <= maxUniformBufferRange (64 KB here) while our chunks are 960 MB, so giving it the bit
-// would knowingly step outside the spec (which is exactly what the old road did by handing the bit to a whole
-// pool). How UBO-sized ranges inside a chunk are bound is an N4 question; the probe has a sub-question that
-// measures whether a 960 MB buffer with the UBO bit is even creatable, purely to record that tolerance.
+// 块的「全功能」用法位：SSBO / 上传 / 回读 / 顶点 / 索引 / 间接 / 缓冲区贴图（texel）/ **UBO**。
+// **UBO 位是 N4-b 才加上的**（N1~N3 故意不含它）：规范对 VkBufferCreateInfo 有一条 VU 要求「带
+// UNIFORM_BUFFER 的缓冲 size ≤ maxUniformBufferRange（本机 64 KB）」，而块是 960 MB ⇒ 带上它走在规范外。
+// 但**旧路的池缓冲本来就带 UBO 位**（`nvn_vk.c` 的 `make_pool_buffer`），而 N1 的探针已经在真机上把这条
+// 宽容度量成读数（`VK2_UNIFORM_BUFFER_BIT_960MB=ok`：960 MB 带 UBO 位能建出来）⇒ N4-b 的绑定接管先照
+// **与旧路一致**的这条走（描述符里的 UBO 直接指向块），把"块内小段另绑一个小缓冲"这条**合规**做法留档待将来
+// （它要按 (块, 偏移, 大小) 建一整套小 VkBuffer，属独立一块）。**判据**：块建出来仍要 `small = 0`。
+// The UBO bit arrives with N4-b: a spec VU wants a UNIFORM_BUFFER buffer to be <= maxUniformBufferRange (64 KB
+// here) while chunks are 960 MB, so this steps outside the spec -- but the old road's pool buffer already carried
+// the bit, and N1's probe measured this driver's tolerance on the device (960 MB with the UBO bit creates fine).
+// Binding a small separate buffer for UBO-sized ranges inside a chunk is the compliant alternative, left on file.
 #define VK2_FULL_USAGE (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | \
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | \
                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | \
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | \
                         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)
 // 建不出全功能时退到的那一档（**要计数**：这就是旧路的 `g_pool_small`）| the fallback tier, which must be counted
 #define VK2_MIN_USAGE  (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
@@ -179,6 +181,21 @@ void vk2_pool_del(void *mem);
 // histogram and logs (details for the first few). len == 0 is treated as one byte.
 int  vk2_addr(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off);
 
+// N4：按**客体地址**标脏（回放层的绑定点与拷贝点用的就是这两个）。反查 → 把对应的池内偏移标脏；
+// 命中返回 1，没落在池里返回 0（**不报红**：绑定点的地址常常落在池外，那是正常情形）。
+//   ① `vk2_touch_cpu`：**"这段接下来要被 GPU 用了，而它可能被 CPU 写过"** —— 绑定点（VB/IB/UBO/SSBO/贴图）
+//      与 `COPY_B2B` 的**源**都要标它，否则上传窗口不知道要搬（新地基里没有"写完即可见"）。
+//   ② `vk2_touch_gpu`：**"GPU 直写了后备，影子从此过期"** —— 旧路 `UPDATE_UB` / `COPY_B2B` 的目标就是这条路。
+// N4: mark by guest address (the replay layer's binding and copy sites). A miss outside every pool returns 0 and is
+// not an error -- pool-relative addresses are the common case but not the only one.
+int vk2_touch_cpu(uint64_t addr, uint64_t len);
+int vk2_touch_gpu(uint64_t addr, uint64_t len);
+// 把一个池**整段**标 CPU_DIRTY（池刚登记时 / 接管初始化时用）：新地基的后备资源在第一次上传之前是未定义的，
+// 所以"登记时全脏"是"第一帧就把整池搬上去"的机制。返回 1 = 成功。
+// Mark one whole pool CPU_DIRTY (on registration / takeover start): the backing store is undefined before its first
+// upload, so this is what makes the first frame push the whole pool.
+int vk2_pool_mark_all_cpu(int i);
+
 // 探针/诊断用：看池的内部形状 | for the probe and diagnostics: the pool's internal shape
 int             vk2_pool_count(void);
 const vk2_pool *vk2_pool_at(int i);
@@ -222,6 +239,10 @@ void vk2_pool_shutdown_log(void);          // 交回给 stderr | hand logging ba
 // 认得的值：1 / on / yes / true（大小写不敏感）；其余（含未设）都是旧路。
 // Recognised values: 1 / on / yes / true (case-insensitive); anything else (including unset) means the old road.
 int         vk2_gfx2_enabled(void);
+// N4-b：回放层**真的接管了 GPU 侧**之后调一次（`mtl_addr` 回后备 + 帧开头上传都起来了）。
+// 它只影响 `vk2_route_line()` 的自证措辞 —— 让读数一眼看出"这次是只登记，还是真的接管了"。
+// N4-b: called once the replay layer really took the GPU side over; it only changes what vk2_route_line says.
+void        vk2_pool_set_gpu_takenover(int on);
 const char *vk2_route_line(void);
 
 #endif // DM_VK2_POOL_H

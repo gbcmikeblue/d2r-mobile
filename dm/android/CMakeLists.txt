@@ -282,6 +282,24 @@ target_link_libraries(vk2_sub_probe PRIVATE vulkan)
 target_link_options(vk2_sub_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk2_sub_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
 
+# 新地基 **N4-b**（把 GPU 侧的内存接管下来）的自证探针：**`mtl_addr` → `vk2_addr` 的形状**（块缓冲 + 块内偏移、
+# 跨块/越界/无后备都返回 0）、**环按槽分**（3 个槽同时各载一个上传窗口 —— N3 量出来的待办）、
+# **接管闭环**（帧开头上传 → 提交 → 等这个 frame 的栅栏 → 回读 → 与逐字节独立重算比对；再做「没标脏就不上传」
+# 这一半与「再触碰就重传」这条不变量）、以及 GPU_DIRTY 不被上传覆盖。不进宿主也不进 APK。
+# 读数落 .work/logs/probe-<串号>-vk2_takeover_probe[-tag].txt（走 .work/probes.py run）。
+# The self-proving probe of N4-b (taking over the GPU-side memory): the shape of the address lookup, the ring split
+# per slot so several in-flight slots each carry an upload window (N3's to-do), the takeover round trip through the
+# submission path, the re-dirty invariant and the fact that a GPU-written range survives an upload.
+add_executable(vk2_takeover_probe
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_takeover_probe.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_sub.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_dirty.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_pool.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_xfer.c)
+target_link_libraries(vk2_takeover_probe PRIVATE vulkan)
+target_link_options(vk2_takeover_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk2_takeover_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vk2 ${COMPAT})
+
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；
 # 打成 APK 留到 M2 之后（那时才有画面）。

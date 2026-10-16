@@ -93,9 +93,10 @@ static void slot_reap(vk2_slot *s) {
     if (s->has_upload) {
         s->has_upload = 0;
         g_st.upload_recycled++;
-        // 环的窗口必须交还，否则下一个窗口会被 vk2_upload 拒绝（"上一个窗口还没收尾"）
-        // The window must be handed back, otherwise the next vk2_upload is refused.
-        if (vk2_xfer_ready()) vk2_xfer_window_done();
+        // 环的窗口必须交还，否则下一个窗口会被 vk2_upload 拒绝（"上一个窗口还没收尾"）。
+        // N4：交还的是**这一槽自己那一段**（`vk2_sub_use_banks()` 没调时 bank = 0 = N3 的行为）。
+        // The window must be handed back, and N4 hands back the slot's own bank (bank 0 unless use_banks was called).
+        if (vk2_xfer_ready()) vk2_xfer_window_done_bank(s->bank);
         else XLOG("【黄】这一槽载着上传窗口，但 vk2_xfer 没就绪 ⇒ 环的窗口没人交还（调用方要自己 vk2_xfer_window_done）");
     }
 }
@@ -182,7 +183,7 @@ int vk2_sub_init(const vk2_dev *d, int inflight) {
             XLOG("【红】第 %d 个槽的栅栏建不出来", i);
             vk2_sub_fini(); return 0;
         }
-        s->in_flight = 0; s->has_upload = 0; s->frame = 0; s->uses = 0;
+        s->in_flight = 0; s->has_upload = 0; s->bank = 0; s->frame = 0; s->uses = 0;
     }
     g_rec = NULL;
     g_frame_seq = 0;
@@ -337,4 +338,28 @@ void vk2_sub_note_upload(void) {
     if (!g_rec) { XLOG("【红】vk2_sub_note_upload：没有正在录制的槽（先 vk2_sub_begin）"); return; }
     g_rec->has_upload = 1;
     g_st.upload_marks++;
+}
+
+// ---------------------------------------------------------------- N4：环按槽分
+// 让第 i 个槽用暂存环的第 i 段（`vk2_xfer_set_banks`）。**不调用就还是 N3 的单环行为**（所有槽第 0 段）。
+// Point each slot at its own ring bank; not calling this keeps the N3 single-ring behaviour.
+int vk2_sub_use_banks(void) {
+    if (!g_ready) { XLOG("【红】vk2_sub_use_banks：模块没就绪"); return 0; }
+    if (!vk2_xfer_ready()) { XLOG("【红】vk2_sub_use_banks：vk2_xfer 没就绪 ⇒ 没有环可分"); return 0; }
+    g_st.use_banks_calls++;
+    int n = vk2_xfer_set_banks(g_n);
+    if (n <= 0) {
+        XLOG("【红】vk2_sub_use_banks：分环被拒（多半是有段还被在飞窗口占着）⇒ 所有槽继续共用第 0 段");
+        return 0;
+    }
+    for (int i = 0; i < g_n; i++) g_slots[i].bank = (i < n) ? i : 0;
+    g_st.banks = (uint64_t)n;
+    XLOG("N4 环按槽分：%d 个槽各用一段（每段 %llu KB）⇒ 上传不再把在飞深度串行化",
+         n, (unsigned long long)(vk2_xfer_bank_bytes(0) >> 10));
+    return n;
+}
+
+int vk2_sub_slot_bank(int i) {
+    if (i < 0 || i >= g_n) return -1;
+    return g_slots[i].bank;
 }

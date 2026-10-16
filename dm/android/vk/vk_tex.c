@@ -11,6 +11,9 @@
 // buffer, so it is needed here (see vk_tex_bufview).
 #include "nvn_mtl.h"
 #include "vk_ops.h"
+// N4-b：缓冲区贴图的视图建在**后备资源**上 ⇒ 采样之前要保证后备是最新的（标 CPU 脏，帧开头上传）。
+// N4-b: a buffer-texture view is built on the **backing store**, so it has to be up to date before sampling.
+#include "vk2_pool.h"
 #include "dm.h"
 #include <math.h>
 #include <pthread.h>
@@ -1551,6 +1554,9 @@ VkBufferView vk_tex_bufview(const tex_t *t) {
                              t->mem, (unsigned long long)((uint64_t)bpb * elems), (unsigned long long)t->serial);
         goto fail;
     }
+    // N4-b：这张缓冲区贴图要被 GPU 采样 ⇒ 标 CPU 脏（帧开头把它所在的那一段搬进后备资源）。
+    // 新地基没接管时这一步什么也不做（模块没就绪就直接返回 0）。
+    vk2_touch_cpu((uint64_t)(uintptr_t)t->mem, (uint64_t)bpb * elems);
     {
         VkPhysicalDeviceProperties pp;
         uint64_t al = 0;

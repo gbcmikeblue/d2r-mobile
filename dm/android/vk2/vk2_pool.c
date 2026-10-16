@@ -525,6 +525,44 @@ int vk2_addr(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) {
     return ok;
 }
 
+// ---------------------------------------------------------------- N4：按客体地址标脏
+// 反查池（与 vk2_addr 同一套掩码与遍历），把池内偏移交给脏位图。**只做标记，不搬东西**：
+// 搬是上传窗口（vk2_xfer）的事，标记是回放层在"这段要被 GPU 用"的时刻做的。
+// Mark by guest address: resolve the pool (the same mask and walk as vk2_addr) and hand the pool-relative offset to
+// the dirty bitmap. Marking only -- moving is the upload window's job, and the replay layer marks at "this range is
+// about to be used by the GPU" time.
+static int touch_at(uint64_t addr, uint64_t len, int gpu) {
+    if (!g_ready) return 0;
+    if (len == 0) len = 1;
+    addr = vk2_ptr_mask((uintptr_t)addr);
+    int ok = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_npool; i++) {
+        vk2_pool *p = &g_pools[i];
+        if (addr < p->lo || addr + len > p->hi) continue;
+        if (gpu) vk2_dirty_mark_gpu(&p->dirty, addr - p->lo, len);
+        else     vk2_dirty_mark_cpu(&p->dirty, addr - p->lo, len);
+        ok = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return ok;
+}
+int vk2_touch_cpu(uint64_t addr, uint64_t len) { return touch_at(addr, len, 0); }
+int vk2_touch_gpu(uint64_t addr, uint64_t len) { return touch_at(addr, len, 1); }
+
+int vk2_pool_mark_all_cpu(int i) {
+    if (!g_ready) return 0;
+    pthread_mutex_lock(&g_mu);
+    int ok = 0;
+    if (i >= 0 && i < g_npool) {
+        vk2_dirty_mark_cpu(&g_pools[i].dirty, 0, g_pools[i].hi - g_pools[i].lo);
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return ok;
+}
+
 // ---------------------------------------------------------------- 快路（§9.8）：只落降级规则
 int vk2_pin_capable(const char **why) {
     if (!g_ready) { if (why) *why = "池模块未就绪"; return 0; }
@@ -606,14 +644,20 @@ int vk2_gfx2_enabled(void) {
             strcasecmp(v, "yes") == 0 || strcasecmp(v, "true") == 0);
 }
 
+static int g_gpu_takenover;
+void vk2_pool_set_gpu_takenover(int on) { g_gpu_takenover = on ? 1 : 0; }
+
 const char *vk2_route_line(void) {
-    static char line[320];
+    static char line[360];
     uint64_t mb = (g_ready ? g_chunk : VK2_CHUNK_BYTES) >> 20;
     if (vk2_gfx2_enabled())
         snprintf(line, sizeof line,
                  "这次走**新地基**（DM_GFX2=1）：影子内存 + 分块后备资源（块 %llu MB）；"
-                 "**回放层正在接管**（N4：`mtl_pool_add/del` 那一步只登记与记账，GPU 侧仍走旧路）",
-                 (unsigned long long)mb);
+                 "回放层的接管范围 = %s",
+                 (unsigned long long)mb,
+                 g_gpu_takenover
+                   ? "**GPU 侧已接管**（N4-b：`mtl_addr` 回后备资源 + 帧开头上传；提交与贴图仍走旧路）"
+                   : "只登记池（N4-a：GPU 侧仍走旧路的零拷贝）");
     else
         snprintf(line, sizeof line,
                  "这次走**旧路**（DM_GFX2 未设/关）：mmap 换轨 + 8 槽 + vkQueueWaitIdle；"

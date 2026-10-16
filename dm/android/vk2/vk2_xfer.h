@@ -36,6 +36,17 @@
 
 // 暂存环 = 16 MiB 起步（N0 的读数：与旧路 `DM_UP_RING` 同档）| the staging ring, 16 MiB to start (N0's reading)
 #define VK2_RING_BYTES_DEFAULT (16ull * 1024ull * 1024ull)
+// ---------------------------------------------------------------------------------------------------------------
+// N4：**环按槽分**（N3 量出来的待办）。N2/N3 的环是**一份**、同一时刻只允许一个在飞窗口 ⇒ 在飞深度 3 时
+// 第 2、3 个槽想录上传窗口会看到"环还被占着"，上传会把在飞深度**串行化**。N4 把它切成 `banks` 段（每个
+// 槽一段，段内是一个**环形分配器**：一帧里可以录很多次上传，只要总和不超过这一段）。
+//   ① 缺省 = **1 段**（= N2/N3 的一模一样的行为，N2/N3 的探针与回归读数因此不变）；
+//   ② `vk2_xfer_set_banks(n)` 只在**没有任何段被占着**时能改（改法是把环均分，所以必须没有在飞窗口）。
+// 环的**总**字节数还是 `ring_bytes`（上面那个常数 / 调用方给的值），切段只改"每段多少"。
+// N4: the ring is split per slot (the to-do N3 measured). The ring was a single window, so only one in-flight slot
+// could carry an upload; splitting it into banks (one per slot, each an allocator for a whole frame) is what keeps
+// uploads from serialising the in-flight depth. One bank by default, which is exactly the N2/N3 behaviour.
+#define VK2_BANKS_MAX 16
 // 回读用的 host-visible 暂存缓冲 = 4 MiB 起步（一次 `vk2_readback` 内部按它切片循环）| readback staging, 4 MiB
 #define VK2_RB_BYTES_DEFAULT   (4ull * 1024ull * 1024ull)
 // 提交与等待的超时（毫秒）；超时 = 报失败，**不重试**（纪律：不许用加超时掩盖同步问题）
@@ -58,7 +69,21 @@ typedef struct {
     uint64_t rb_no_fence;      // 没指定要等谁就调回读（报【黄】、返回 0）| readback with no producer fence
     uint64_t fence_timeouts;   // 等栅栏超时次数（如实报失败）| fence timeouts (reported as failure)
     uint64_t idle_calls;       // **必须恒为 0**：模块里调 vkQueueWaitIdle 的次数（G4 的前置自检）
+    uint64_t banks;            // N4：当前分了几段（1 = N2/N3 的单环）| N4: how many banks the ring is split into
+    uint64_t initial_rounds;   // N4-b：初始同步用了几轮"录一批 → 提交 → 等栅栏"（末次）| initial-sync rounds, last call
+    uint64_t initial_bytes;    // N4-b：初始同步累计搬了字节 | bytes moved by initial sync, cumulative
 } vk2_xfer_stats;
+
+// 一段（给一个提交槽用的那一份环）的读数：N4 要证明"在飞 3 个槽各载着一个上传窗口"。
+// Per-bank readings: N4 has to show that three in-flight slots each carry an upload window.
+typedef struct {
+    uint64_t bytes;      // 这一段的容量 | capacity of this bank
+    uint64_t used;       // 本帧已用（对齐后）| used so far in this frame
+    uint64_t windows;    // 这一段上开过的窗口数 | windows opened on this bank
+    uint64_t moved;      // 这一段搬过的字节 | bytes moved through this bank
+    uint64_t ring_full;  // 这一段环满的次数（拒绝，不是静默截断）| times this bank ran out
+    int      open;       // 现在被一个在飞窗口占着吗（只读）| held by an in-flight window right now
+} vk2_bank_stats;
 
 // 初始化：`d` 里的设备事实会被拷走；ring_bytes / rb_bytes = 0 用缺省。返回 0 = 失败。
 // Initialise from the device facts; ring_bytes/rb_bytes of 0 mean the defaults.
@@ -66,6 +91,18 @@ int  vk2_xfer_init(const vk2_dev *d, uint64_t ring_bytes, uint64_t rb_bytes);
 void vk2_xfer_fini(void);
 uint64_t vk2_xfer_ring_bytes(void);
 int  vk2_xfer_ready(void);
+
+// ---- N4：环按槽分（见文件头那段）----------------------------------------------------------------
+// 把环均分成 n 段（n 夹到 [1, VK2_BANKS_MAX]）；**有任何一段被占着时拒绝改动**（返回 0 并报【红】）。
+// 返回实际生效的段数。缺省 = 1（N2/N3 的单环行为）。
+// Split the ring into n banks (clamped); refused while any bank is held. Returns the effective count; 1 by default.
+int      vk2_xfer_set_banks(int n);
+int      vk2_xfer_banks(void);
+uint64_t vk2_xfer_bank_bytes(int bank);              // 这一段的容量（banks 未设时 = 环的全部）
+void     vk2_xfer_bank_stats_get(int bank, vk2_bank_stats *out);
+// 交还一段（它的窗口真的做完了）：使用位置回到 0、段回到空闲。缺省段的 `vk2_xfer_window_done()` 就是它。
+void     vk2_xfer_window_done_bank(int bank);
+int      vk2_xfer_window_open_bank(int bank);        // 只读：这一段现在被占着吗
 
 // ---- 上传窗口（§9.5）----------------------------------------------------------------------------
 // 把一个池里所有 CPU_DIRTY 的 run 搬上去：
@@ -77,6 +114,28 @@ int  vk2_xfer_ready(void);
 // after each run; runs crossing chunk boundaries are split into several copies. Pages are marked CLEAN once
 // copied. The caller submits the command buffer, waits on its own fence, then calls vk2_xfer_window_done().
 uint64_t vk2_upload(VkCommandBuffer cb, uint64_t frame, int pool_index);
+
+// ---- N4：按段上传（回放层真正用的入口）----------------------------------------------------------
+// 与 `vk2_upload` 同一件事，但走**指定那一段**，而且**一段里可以录很多次**（一帧要搬好几个池、
+// 一帧里还会因为"绑定点的触碰标记"再搬几次）：第一次调用开这一段的窗口，之后往同一段里追加。
+// 段装满 ⇒ 记账 `ring_full` 并**停**（剩下的页仍然是脏的，下一个窗口/下一帧继续），**不静默截断**。
+// 返回这一次搬上去的字节数（0 = 没搬 or 段满/没就绪）。
+// Same as vk2_upload but into one named bank, and a bank can host several uploads in one frame (several pools, and
+// the re-uploads caused by binding-point touches). A full bank counts ring_full and stops, leaving the rest dirty.
+uint64_t vk2_upload_into(int bank, VkCommandBuffer cb, uint64_t frame, int pool_index);
+// 把**所有**登记着的池都按段搬一遍（回放层的帧开头上传就是它）：逐池调上面那个，累加返回。
+// 一帧的搬运字节数（11.3 的第一个字段）由调用方累加它拿到。
+uint64_t vk2_upload_all_into(int bank, VkCommandBuffer cb, uint64_t frame);
+
+// N4-b：**初始同步** —— 池刚登记时整池是脏的（后备资源在第一次上传之前未定义），而"一帧一段环"的节奏
+// 要几百帧才搬完，那几百帧里游戏读到的是没搬上去的部分。所以第一次提交之前先把脏页**整批搬完**：
+// 循环"录一批（环装满为止）→ 提交 → 等它自己的栅栏 → 交还这一段"，直到没有可搬的脏页。
+// 用它自己的命令缓冲与栅栏（**不与回读那条路共用**：回读可能同时从前端线程发出来）。
+// 返回搬上去的总字节；0 = 没有脏页或失败（失败会如实报）。
+// N4-b initial sync: push the whole dirty set in one batch before the first submission, looping
+// record-submit-wait-hand-back. Uses its own command buffer and fence so it cannot collide with readbacks.
+uint64_t vk2_xfer_initial_sync(int bank);
+
 // 一个窗口结束后调用：环的使用位置回到 0（**下一次窗口的 memcpy 不能盖掉在飞窗口的环内容**）。
 // Called when a window is finished: the ring write position returns to 0, so the next window cannot overwrite
 // the data of an in-flight one.

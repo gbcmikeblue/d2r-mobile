@@ -30,6 +30,12 @@
 #include "vk_png.h"
 #include "vk_ops.h"
 #include "vk2_pool.h"      // N4：新地基（Vulkan 原生显式实现）的池模块 —— 选路点与真机池账 | N4: the new pool module
+#include "vk2_xfer.h"      // N4-b：上传窗口 —— 帧开头把 CPU 脏页搬进后备资源（GPU 侧从此读的是后备）| the upload window
+
+// N4-b：暂存环按**提交槽**分段（一段一个槽 ⇒ 在飞几个槽就能同时各载一个上传窗口，N3 量出来的待办）。
+// 段数与槽数必须一致：下面 `MAX_INFLIGHT` 那里有一条 `_Static_assert` 把这条纪律做成编译期检查。
+// N4-b: the staging ring is split per submission slot; the counts must agree, checked at compile time below.
+#define VK2_UPLOAD_BANKS 8
 #include "dm.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -100,9 +106,20 @@ static VkBuffer make_pool_buffer(uint64_t size, int *fell_back) {
 // behaviour; DM_GFX2_BACKING_MB caps the backing (0 = census only) because the pool budget is counted in backing
 // bytes and "how much is needed" has to be measured before "whether to give it".
 static int      g_vk2_up;              // 新地基池模块起来了吗 | the new pool module is up
+static int      g_vk2_gpu;             // **N4-b：GPU 侧接管了吗**（`mtl_addr` 回后备资源 + 帧开头上传）| GPU side taken over
 static uint64_t g_vk2_adds;            // 经新地基登记过的池数（含旧路会拒的那些）| pools registered via the new module
 static uint64_t g_vk2_bytes;           // 它们的总字节 | their total bytes
 static uint64_t g_vk2_route_logged;    // 选路行只打一次 | log the route line once
+// N4-b 的读数（11.3 的"每帧搬运字节数"就从这几笔来）| N4-b readings (the per-frame upload bytes come from here)
+static uint64_t g_vk2_frames;          // 走过"帧开头"的次数 | how often the frame head ran
+static uint64_t g_vk2_up_frames;       // 其中真的搬了东西的帧数 | frames that actually moved bytes
+static uint64_t g_vk2_up_windows;      // 上传窗口数（一段一帧算一个）| upload windows
+static uint64_t g_vk2_up_bytes;        // 累计搬上去的字节 | cumulative bytes uploaded
+static uint64_t g_vk2_up_max;          // 单帧最多搬了多少 | the most bytes in one frame
+static uint64_t g_vk2_touch_hit;       // 触碰命中池的次数（标脏成功）| touches that hit a pool
+static uint64_t g_vk2_touch_miss;      // 触碰没落在池里的次数（正常情形，只计数）| touches outside every pool (normal)
+static uint64_t g_vk2_gpu_writes;      // GPU 直写后备（UPDATE_UB / COPY_B2B 的目标）的标脏次数 | GPU-direct writes marked
+static uint64_t g_vk2_synced_pools;    // 上次初始同步时已登记几个池（多出来的池要再同步一次）| pools covered so far
 
 static void vk2_boot(void) {
     if (g_vk2_up) return;
@@ -128,15 +145,50 @@ static void vk2_boot(void) {
         LOG("【红】N4：新地基池模块起不来（DM_GFX2=1 但 vk2_pool_init 失败）⇒ 后面的池账不会有");
         return;
     }
-    // 后备预算：未设 = 不限（与 N1 起的语义一致）；0 = 只登记不建后备（本轮的"池账"模式）
+    // 后备预算：未设 = 不限（与 N1 起的语义一致）；0 = 只登记不建后备（N4-a 的"池账"模式）
     const char *s = getenv("DM_GFX2_BACKING_MB");
     uint64_t mb = (s && *s) ? strtoull(s, NULL, 0) : UINT64_MAX;
     vk2_pool_set_backing_budget(mb == UINT64_MAX ? UINT64_MAX : mb * 1024ull * 1024ull);
+    // N4-b：上传窗口（暂存环按提交槽分段）。**它起不来就不接管 GPU 侧** —— 宁可整块退回旧路的零拷贝，
+    // 也不要"一半走后备、一半走池缓冲"这种半接管（那会读到未定义的字节）。
+    // N4-b: the upload window (ring split per submission slot). If it cannot come up, the GPU side is **not** taken
+    // over at all -- a half-takeover would read undefined bytes.
+    // 缺省 256 MB = 8 段 × 32 MB（N0 的"暂存环 16 MiB 起步"是**单环**时代的口径；N4-b 的真机轮量到
+    // "一帧要搬的量超过每段 16 MB" ⇒ 每段给 32 MB，仍可用 DM_GFX2_RING_MB 逐档试）
+    const char *rs = getenv("DM_GFX2_RING_MB");
+    uint64_t rmb = (rs && *rs) ? strtoull(rs, NULL, 0) : 256;
+    if (!rmb) rmb = 128;
+    if (!vk2_xfer_init(&d, rmb * 1024ull * 1024ull, 0)) {
+        LOG("【红】N4：上传窗口起不来（DM_GFX2=1 但没有搬运窗口）⇒ **GPU 侧不接管**（整块退回旧路的零拷贝）");
+        vk2_pool_fini();
+        return;
+    }
+    int banks = vk2_xfer_set_banks(VK2_UPLOAD_BANKS);
+    if (banks != VK2_UPLOAD_BANKS)
+        LOG("【黄】N4：暂存环只分到 %d 段（要 %d 段）⇒ 多出来的槽会共用第 0 段",
+            banks, (int)VK2_UPLOAD_BANKS);
     g_vk2_up = 1;
+    g_vk2_gpu = 1;
+    vk2_pool_set_gpu_takenover(1);   // 只影响路由行的自证措辞（"只登记" vs "GPU 侧已接管"）
     LOG("N4 选路：%s", vk2_route_line());
-    LOG("N4 池账开始：后备预算 = %s；块 %llu MB；**GPU 侧仍走旧路**（本步只登记与记账）",
+    LOG("N4 池账开始：后备预算 = %s；块 %llu MB", 
         mb == UINT64_MAX ? "不限" : (mb ? "见 DM_GFX2_BACKING_MB" : "0（只登记不建后备）"),
         (unsigned long long)(vk2_pool_chunk_bytes() >> 20));
+    LOG("N4-b **GPU 侧接管**：暂存环 %llu MB / %d 段（按提交槽分）；`mtl_addr` 起回**后备资源**"
+        "（块缓冲 + 块内偏移）；帧开头把 CPU 脏页搬上去",
+        (unsigned long long)rmb, banks);
+}
+
+// N4-b：标脏的两个小包装（回放层的绑定点与拷贝点用）。关着时一次都不动；命中/未命中都记账
+// —— 未命中是**正常情形**（绑定的地址常常落在池外），所以只计数、不报红。
+// N4-b: the two marking wrappers the replay layer's binding and copy sites use. Misses are normal, so they count.
+static inline void vk2_touch_cpu_(uint64_t a, uint64_t n) {
+    if (!g_vk2_gpu) return;
+    if (vk2_touch_cpu(a, n)) g_vk2_touch_hit++; else g_vk2_touch_miss++;
+}
+static inline void vk2_touch_gpu_(uint64_t a, uint64_t n) {
+    if (!g_vk2_gpu) return;
+    if (vk2_touch_gpu(a, n)) g_vk2_gpu_writes++;
 }
 
 // 池账一行（自证：池地址、大小、新地基收没收、以及"要多少/给了多少"）
@@ -169,6 +221,10 @@ void mtl_pool_add(const void *mem, uint64_t size) {
             if (!g_vk2_route_logged) { g_vk2_route_logged = 1; LOG("N4 选路自证：%s", vk2_route_line()); }
             int ok = vk2_pool_add((void *)(uintptr_t)mem, size, "guest");
             g_vk2_adds++; g_vk2_bytes += size;
+            // N4-b：新池**整段标 CPU_DIRTY** —— 后备资源在第一次上传之前是未定义的，所以"登记时全脏"是
+            // "第一帧就把整池搬上去"的机制（否则第一帧里没被触碰过的部分读到的是垃圾）。
+            // N4-b: mark the whole new pool CPU_DIRTY -- the backing store is undefined before its first upload.
+            if (ok) vk2_pool_mark_all_cpu(vk2_pool_count() - 1);
             if (g_vk2_adds <= 12 || (g_vk2_adds % 32) == 0 || !ok) vk2_pool_ledger(mem, size, ok);
         }
     }
@@ -236,6 +292,19 @@ void mtl_pool_del(const void *mem) {
 // (= addr - the pool base). Same contract as the Metal side: 1 on success, 0 on failure; on Vulkan *buf is a
 // VkBuffer handle (used inside the replay layer).
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    // N4-b：**GPU 侧接管之后，反查给的是后备资源**（块缓冲 + 块内偏移）—— 池自己那份零拷贝缓冲不再被 GPU 读。
+    // 跨块 / 不在池内 / 没有后备都返回 0（`vk2_addr` 已经把这些记了账，前 16 条明细打在日志里）。
+    // N4-b: after the takeover the lookup hands back the **backing store** (chunk buffer + in-chunk offset); a
+    // cross-chunk or unresolved request returns 0 and has already been counted and logged by vk2_addr.
+    if (g_vk2_gpu) {
+        VkBuffer b = VK_NULL_HANDLE; uint64_t o = 0;
+        if (vk2_addr(addr, len, &b, &o)) {
+            if (buf) *buf = (void *)(uintptr_t)b;
+            if (off) *off = o;
+            return 1;
+        }
+        return 0;
+    }
     int ok = 0;
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++)
@@ -305,6 +374,7 @@ enum { POST_EVENT, POST_COUNTER, POST_MEMCPY };
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; void *src, *dst; size_t n; } post_op;
 
 #define MAX_INFLIGHT 8
+_Static_assert(VK2_UPLOAD_BANKS == MAX_INFLIGHT, "暂存环段数必须等于提交槽数（N4-b）");
 #define MAX_POST 512
 #define STAGE_SIZE (4u << 20)
 typedef struct {
@@ -313,6 +383,9 @@ typedef struct {
     VkBuffer stage; void *stage_map; uint64_t stage_off;
     uint64_t value;
     int pending, cur;
+    // N4-b：这一槽里录过上传窗口吗（回收时要把**这一段**暂存环交还；环的存活期 ≤ 槽的存活期）
+    // N4-b: did this slot record an upload window? The ring bank is handed back when the slot is reaped.
+    int vk2_up;
     post_op post[MAX_POST]; int npost;
 } inflight_t;
 static inflight_t g_inf[MAX_INFLIGHT];
@@ -902,6 +975,10 @@ static void inflight_reap(void) {
         }
         g_inf[i].npost = 0;
         g_inf[i].pending = 0;
+        // N4-b：这一槽载着上传窗口 ⇒ **这一段暂存环现在才能交还**（环的存活期 ≤ 槽的存活期：
+        // 环里的字节是那次拷贝的源，GPU 没做完之前不能被下一帧的 memcpy 盖掉）。
+        // N4-b: this slot carried an upload window, so its ring bank is handed back only now.
+        if (g_inf[i].vk2_up) { g_inf[i].vk2_up = 0; if (vk2_xfer_ready()) vk2_xfer_window_done_bank(i); }
         // 槽已回收（栅栏过了）：这个槽的描述符池可以整池重置——池里所有集都被 GPU 用完且再也不用了
         // The slot is reaped (fence signalled): this slot's descriptor pool can be reset whole -- every set in it
         // has been consumed by the GPU and never will be again
@@ -1024,6 +1101,43 @@ static int vk_sub_ready(void) {
     return 1;
 }
 
+// N4-b：**一帧的开头** —— 把"帧开头这一刻影子已经写好、而 GPU 那边还没有"的字节搬进后备资源。
+// 录在命令缓冲的**最前面**：这一帧里所有"读池内存"的命令（顶点/索引/常量/贴图绑定、拷贝）都排在它后面。
+// 为什么是帧开头而不是绑定点：NVN 的模型是"CPU 先把内存写好，再提交命令流"，而我们的回放就发生在提交那一刻
+// ⇒ 帧开头时影子已经含这一帧的全部 CPU 写。标记（哪一段要搬）来自**上一次绑定/拷贝的触碰**（见 vk2_touch_*）。
+// N4-b: the head of a frame -- push the bytes the shadow already has (and the GPU does not) into the backing store,
+// recorded before anything else in the command buffer. The replay runs at submission time, so the shadow already
+// holds every CPU write of this frame; which ranges to move is what the previous frame's touches marked.
+static void vk2_frame_upload(int slot) {
+    if (!g_vk2_gpu || !vk2_xfer_ready() || slot < 0 || slot >= MAX_INFLIGHT) return;
+    // N4-b：**初始同步**（含"运行中新开的池"）—— 池刚登记时整池是脏的，而"一帧一段环"的节奏要几百帧才搬完，
+    // 那几百帧里游戏读到的是没搬上去的部分。所以第一次提交之前先把脏页整批搬完（一次，~0.4 s 量级）。
+    // N4-b: initial sync (including pools opened later): a fresh pool is entirely dirty and one ring's worth per
+    // frame would take hundreds of frames, so the whole dirty set is pushed once before the first submission.
+    if (g_vk2_adds && g_vk2_adds != g_vk2_synced_pools) {
+        uint64_t t0 = now_ns();
+        uint64_t total = vk2_xfer_initial_sync(MAX_INFLIGHT - 1);
+        g_vk2_synced_pools = g_vk2_adds;
+        vk2_xfer_stats xs;
+        vk2_xfer_stats_get(&xs);
+        LOG("【地基】初始同步：%llu 个池 / 搬 %llu MB、%llu 轮、耗时 %llu ms（让后备资源与影子一次一致）",
+            (unsigned long long)g_vk2_adds, (unsigned long long)(total >> 20),
+            (unsigned long long)xs.initial_rounds, (unsigned long long)((now_ns() - t0) / 1000000));
+    }
+    g_vk2_frames++;
+    uint64_t moved = vk2_upload_all_into(slot, g_inf[slot].cb, g_fence + 1);
+    if (!moved) return;
+    g_inf[slot].vk2_up = 1;                       // 回收这个槽时才能把这**一段**环交还
+    g_vk2_up_frames++; g_vk2_up_windows++; g_vk2_up_bytes += moved;
+    if (moved > g_vk2_up_max) g_vk2_up_max = moved;
+    if (g_vk2_up_frames <= 6 || (g_vk2_frames % 30) == 0)
+        LOG("【地基】帧开头上传：第 %llu 帧（槽 %d / 段 %d）搬 %llu KB；累计 %llu 帧里 %llu 帧搬过、"
+            "共 %llu MB（最多一帧 %llu KB）",
+            (unsigned long long)g_vk2_frames, slot, slot, (unsigned long long)(moved >> 10),
+            (unsigned long long)g_vk2_frames, (unsigned long long)g_vk2_up_frames,
+            (unsigned long long)(g_vk2_up_bytes >> 20), (unsigned long long)(g_vk2_up_max >> 10));
+}
+
 void mtl_sub_begin(void) {
     if (!vk_sub_ready()) return;
     int i = inflight_take();
@@ -1041,6 +1155,8 @@ void mtl_sub_begin(void) {
     g_rs.cc_have = 0; g_rs.cc_mask = 0; g_rs.cd_have = 0; g_rs.cs_have = 0;
     g_rs.open = 0;
     g_cur_slot = i;
+    // N4-b：帧开头把 CPU 脏页搬上去（`DM_GFX2=1` 且 GPU 侧已接管时才动；关着时一行都不执行）
+    vk2_frame_upload(i);
 }
 
 static void post_add(const post_op *o) {
@@ -1063,9 +1179,18 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     if ((so & 3) || (dof & 3)) {
         post_op o = { .kind = POST_MEMCPY, .src = (void *)(uintptr_t)src, .dst = (void *)(uintptr_t)dst, .n = (size_t)n };
         post_add(&o);
+        // N4-b：退成"栅栏到了 CPU memcpy"，那是**写影子** ⇒ 目标标 CPU 脏（下一帧开头会上传它）
+        vk2_touch_cpu_(dst, n);
         static int said; if (!said++) LOG("【黄】有缓冲拷贝偏移不是 4 字节对齐（%#llx→%#llx），退成完成后搬", (unsigned long long)so, (unsigned long long)dof);
         return;
     }
+    // N4-b（`COPY_B2B`）：这是一次 **GPU 拷贝** —— 源必须先在**后备**里是最新的（标 CPU 脏 ⇒ 帧开头搬它；
+    // 因为旧路的源是池内存本身、CPU 写完 GPU 就能看见，而新地基里"看见"必须显式买回来），
+    // 目标是 GPU 直写后备 ⇒ **影子从此过期**（标 GPU 脏：上传不许碰它，谁要读它必须先回读）。
+    // N4-b (COPY_B2B): a GPU copy. The source must be up to date in the backing store (marked CPU-dirty so the
+    // frame head uploads it), and the destination is written by the GPU, so the shadow goes stale (GPU-dirty).
+    vk2_touch_cpu_(src, n);
+    vk2_touch_gpu_(dst, n);
     VkBufferCopy r = { .srcOffset = so, .dstOffset = dof, .size = n };
     vkCmdCopyBuffer(g_inf[g_cur_slot].cb, (VkBuffer)sb, (VkBuffer)db, 1, &r);
 }
@@ -1185,6 +1310,17 @@ uint64_t mtl_sub_commit(void) {
         // the host's log has a length limit and appending to another line truncates it (learned the hard way)
         LOG("[vk] ReadTexels 读到 GPU 写过的贴图 %llu 次（0 = 从 VkImage 读回那套暂时还只是工具）",
             (unsigned long long)vk_tex_reads_gpu_written());
+        // N4-b：**每帧搬运字节数**（11.3 的第一个字段）—— 新地基唯一的代价读数，单独一行。
+        // N4-b: bytes uploaded per frame, the first of the six baseline fields, on its own line.
+        if (g_vk2_gpu && g_vk2_frames)
+            LOG("【地基】上传：%llu 帧里 %llu 帧搬过（%llu 个窗口）、共 %llu MB（最多一帧 %llu KB、"
+                "平均每帧 %llu KB）；触碰命中 %llu / 未命中 %llu；GPU 直写后备标脏 %llu 次",
+                (unsigned long long)g_vk2_frames, (unsigned long long)g_vk2_up_frames,
+                (unsigned long long)g_vk2_up_windows, (unsigned long long)(g_vk2_up_bytes >> 20),
+                (unsigned long long)(g_vk2_up_max >> 10),
+                (unsigned long long)(g_vk2_up_bytes / (g_vk2_frames ? g_vk2_frames : 1) >> 10),
+                (unsigned long long)g_vk2_touch_hit, (unsigned long long)g_vk2_touch_miss,
+                (unsigned long long)g_vk2_gpu_writes);
         for (int k = 0; k < OP_COUNT_; k++) atomic_store(&g_opcount[k], 0);
     }
     return g_fence;
@@ -1763,6 +1899,10 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 // A special constant segment: the host's own buffer, with no dynamic offset
                 bi[nw] = (VkDescriptorBufferInfo){ hb, 0, VK_WHOLE_SIZE };
             } else {
+                // N4-b：这条 UBO / SSBO 要被 GPU 读 ⇒ 保证后备是最新的（标 CPU 脏，帧开头搬它）。
+                // 这是"绑定以 SPIR-V 反射为唯一真源"之外的另一件事：**读写的位置**由绑定决定，而"到没到 GPU
+                // 眼前"由这一句负责（原则 2）。
+                vk2_touch_cpu_(a, sz);
                 // 动态偏移之和必须落在 minUniform/StorageBufferOffsetAlignment 的整数倍上，而规范保证这个
                 // 界限不超过 256，所以按 256 对齐一定成立；客体自己的缓冲地址本该对齐，没对齐就记一次。
                 // The sum of offset and dynamic offset must be a multiple of the alignment limit, which the spec
@@ -2275,6 +2415,9 @@ void mtl_exec(const uint8_t *p) {
                 static int said2; if (!said2++) LOG("【红】常量更新落不到池子里或偏移未对齐：%#llx +%llx（偏移 %#llx）", (unsigned long long)dst, (unsigned long long)n, (unsigned long long)dof);
                 break;
             }
+            // N4-b：**这是一次 GPU 直写后备**（载荷经暂存缓冲 → `vkCmdCopyBuffer`）⇒ 目标在那一段的**影子
+            // 从此过期**：标 GPU 脏，帧开头的上传不许碰它（否则会把刚写进后备的常量用旧影子盖掉）。
+            vk2_touch_gpu_(dst, n);
             VkBufferCopy r = { .srcOffset = in->stage_off, .dstOffset = dof, .size = n };
             vkCmdCopyBuffer(in->cb, in->stage, (VkBuffer)db, 1, &r);
             in->stage_off += padded;
@@ -2566,6 +2709,8 @@ void mtl_exec(const uint8_t *p) {
                         void *bb = NULL; uint64_t bo = 0;
                         if (mtl_addr(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size, &bb, &bo)) {
                             VkBuffer vb = (VkBuffer)bb; VkDeviceSize vo = (VkDeviceSize)bo;
+                            // N4-b：顶点流要被 GPU 读 ⇒ 保证后备是最新的（标 CPU 脏；帧开头搬）
+                            vk2_touch_cpu_(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size);
                             vkCmdBindVertexBuffers(cb, (uint32_t)s2, 1, &vb, &vo);
                         }
                     }
@@ -2590,6 +2735,9 @@ void mtl_exec(const uint8_t *p) {
                             it_ok = 0;
                         }
                         if (it_ok && mtl_addr(di->ibuf, 4, &ib, &io)) {
+                            // N4-b：索引缓冲要被 GPU 读 ⇒ 保证后备最新。反查只问了 4 字节（旧路如此），
+                            // 标脏按"最多 4 字节一个索引"取上界（多标只多搬，不会少搬）。
+                            vk2_touch_cpu_(di->ibuf, (uint64_t)(di->count > 0 ? di->count : 1) * 4);
                             vkCmdBindIndexBuffer(cb, (VkBuffer)ib, (VkDeviceSize)io, it);
                             vkCmdDrawIndexed(cb, (uint32_t)di->count, di->instances ? (uint32_t)di->instances : 1,
                                              0, di->base_vertex, di->base_instance > 0 ? (uint32_t)di->base_instance : 0);
