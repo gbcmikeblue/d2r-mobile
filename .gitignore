@@ -12,3 +12,5 @@
 
 # 本地工作区（游戏文件与中间产物，不进仓库）| Local workspace (game files and intermediates; not committed)
 .work/
+
+mac-evidence/
