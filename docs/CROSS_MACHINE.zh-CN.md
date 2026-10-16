@@ -223,7 +223,36 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
 > **这一节会过期。** 记于 2026-10-15（M3-3c 的内容基线 `ed900fb`；前几轮「M3-3b」/「M3-3a」/「M3-2z」）；
-> **最新提交**：`ab52812`（2026-10-16，**A1 = 真机装上 Vulkan 校验层 —— 答案是"有帮助"，
+> **最新提交**：`ff82ba9`（2026-10-16，**N4-g = 把"顶点输出"这一层两刀排掉**）：
+> ① **带层的 B 臂**（旧路对照；`.work/vklayer-b.conf` 与 A1 的 A 臂 conf **只差一行**：不设 `DM_GFX2`）
+> 用新脚本 `.work/vuid_species_diff.py` **按 VUID 名**逐项分堆 ⇒ **A 15 种 / B 15 种 / 两臂共有 15 种、
+> 只有 A 臂 0 种、只有 B 臂 0 种** ⇒ **新地基零新增误用**（15 种里**唯一落在"顶点输出那一层"的是
+> `VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710`**，A×20 / B×20；组 (a) 第一优先的
+> `vkBindBufferMemory-memory-01035/01508/02726` ×14 的原文显示它就是我们自己的**内存换轨**、**旧路一模一样**）。
+> ② **能力**（新探针 `dm/android/vk2/vk2_cap_probe.c`，只问不接管）：设备 **165 个扩展**、
+> **`VK_EXT_transform_feedback` 在（第 117 条）、`transformFeedback = 1`、`geometryStreams = 1`**；
+> **`VK_EXT_fragment_shader_interlock` 不在设备上**（层的 20 条抱怨 = 真没这个扩展）；
+> **`shaderClipDistance = 1` / `shaderCullDistance = 1`（设备支持）**、**`maxCombinedClipAndCullDistances = 8`**。
+> ③ **★ 一条路线判定**：**TF 这条路本轮不走** —— 离线扫 `.work/spv` 6923 份：**0 份**带
+> `XfbBuffer`/`Offset` 装饰 ⇒ 要用 TF 抓游戏的 `gl_Position` **必须给游戏那份 SPIR-V 加装饰**，
+> 与"不许改产物"冲突（能力本身在 ⇒ **要重开只需一句"允许加装饰"**）。
+> ④ **离线核对**（NDK 自带 `spirv-dis`）：主路径 `f88d27f131d71049` 的 `%gl_PerVertex` 成员
+> 0=Position / 1=PointSize / **2=BuiltIn ClipDistance** / **3=BuiltIn CullDistance**，而**全部取值链只有 9 条**
+> **没有一条点到成员 2/3**；全库 **2345 份顶点着色器声明 `Clip[8]`+`Cull[1]`（9 > 8）而"写"0 份"读"0 份**
+> （形状来自译文器 `Declarations.cs:454-476` 无条件产出）⇒ **驱动看到的是"9 个内容未定义的裁剪/剔除距离"**。
+> ⑤ **两刀**：`DM_CLIPDIST`（`vk_device.c`，把两个核心特性挂进特性链，**缺省关**）两轮
+> **亮度都是 0/0/0**（负结果）；**新探针 `vk2_tri_probe`** 的**我们自己的三角形** ——
+> A = `Clip[1]+Cull[1] = 2`（glslang 的默认形状）vs B = **照游戏那份** `Clip[8]+Cull[1] = 9`，
+> 两份都**不写**、其它完全相同 ⇒ **A 32640 红像素 / B 32640 红像素**（总 65536 = 半屏 49.8%），
+> **特性关/开两档都一样** ⇒ **"声明 9 个裁剪/剔除距离却从不写"不足以让图元消失**；
+> 顺带证明**我们自己的三角形落屏**（光栅化这一层是通的）。
+> ⑥ 回归：N1/N2/N3/N4-b 各一轮 + `vk2_sub_probe` 三轮 ⇒ **非时间判定键全一致**、
+> `VK2_INFLIGHT_CHOSEN` 三轮都是 3（⚠ `VK2_D3_TO_D4_GAIN_PM` 某档测成 ≈0 时给天文数字，**判据别读它**）。
+> **画面仍全零**（两轮查看器打开、亮度 0/0/0）⇒ **M2 的验收仍未过**。
+> 结论 `ANDROID_PLAN` §八·N4-g /「七、下一步」末条；仪器事实 `TOOLS` B¹²；**下一个 = N4-h**
+> （把"我们自己的三角形"画进**游戏的通道里**，`DM_TRI_IN_GAME=<绘制序号>`）。
+> **其前** `cac0a15`（docs：把"A1 之后推荐的下一步"写进提示词文档）；
+> **其前** `ab52812`（2026-10-16，**A1 = 真机装上 Vulkan 校验层 —— 答案是"有帮助"，
 > 而且它给出一条决定性的负结果**）：层的 `libVkLayer_khronos_validation.so`（**27,684,688 字节**，
 > `android-binaries-1.4.363.0.zip`）进 APK 的 `lib/arm64-v8a/`（`build_apk.cmd` 里新增的**缺省关**的
 > `DM_VKLAYER=1` 可选段），用 `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用
@@ -452,7 +481,32 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 现在停在哪
 
-- **★ 最新一轮（「A1」，2026-10-16，提交 `ab52812`）停在**：**真机装上 Vulkan 校验层，
+- **★ 最新一轮（「N4-g」，2026-10-16，提交 `ff82ba9`）停在**：**把"顶点输出"这一层两刀排掉**。
+  改了什么：**新探针** `dm/android/vk2/vk2_cap_probe.c`（**只问不接管**：设备扩展总数 + 点名扩展在第几条 +
+  特性结构体逐 bool + 一组上限 + 按游戏路径那份扩展清单建一次逻辑设备）与 `dm/android/vk2/vk2_tri_probe.c`
+  （**我们自己的三角形**：两份只差一处的顶点着色器 + 同一个片段着色器，画进 256×256 离屏图、读回来数像素）；
+  **另一处只在 `vk_device.c`**：新增 `DM_CLIPDIST`（**缺省关**）把 `shaderClipDistance`/`shaderCullDistance`
+  两个核心特性挂进特性链（此前从来没挂过），**缺省关 = 一字不改的既有行为**。
+  - 结论：① **带层的 B 臂** + `.work/vuid_species_diff.py` **按 VUID 名**分堆 ⇒ **两臂共有 15 种、只 A 臂 0 种**
+    ⇒ **新地基零新增误用**；② **能力**：`VK_EXT_transform_feedback` **在**（第 117/165 条、两个 bool 都 1）、
+    `VK_EXT_fragment_shader_interlock` **不在**、`shaderClipDistance`/`shaderCullDistance` 设备支持、
+    `maxCombinedClipAndCullDistances = 8`；③ **TF 没走**（抓游戏的 `gl_Position` 要给产物加
+    `XfbBuffer`/`Offset` 装饰，离线：6923 份里 0 份有 ⇒ 与"不许改产物"冲突）；④ 离线：**2345 份顶点着色器
+    声明 `Clip[8]`+`Cull[1]`（9 > 8）而"写"0 份"读"0 份**；⑤ **两刀都排掉这一层** —— `DM_CLIPDIST` 两轮
+    **亮度 0/0/0**、三角形 A/B **两格都是 32640/65536 红像素**（特性关/开一样）；
+    ⑥ 回归：四个探针 + `vk2_sub_probe` 三轮，**非时间判定键全一致**。
+  - 跑法：`& "<仓库>/.venv/Scripts/python.exe" -X utf8 .work/probes.py run vk2_cap_probe --serial 8b1f1e50`；
+    三角形的 SPIR-V 先生成再推：`.work/n4g_tri_spv.py`（NDK 自带 `glslc`，并 `spirv-dis` **自证**两份变体只差数组长度）
+    → `.work/n4g_tri_push.py`（推到 `/data/local/tmp/dm/tri/`）→ `.work/n4g_regress.py`（跑第二档 + 四个回归）；
+    游戏两轮 `.work/n4g_clip_rounds.py`（对照/实验各一轮，只差 conf 一行）。
+  - 读数：`.work/logs/probe-8b1f1e50-vk2_cap_probe.txt`、`vkjson-8b1f1e50.json`、
+    `vuid-diff-vk-a2-vk-b1.txt`、`logcat-vk-b1.txt`、`clipdist-use.txt`、`dis-f88d27f131d71049.txt`、
+    `tri-spv.txt`、`probe-…-vk2_tri_probe[-clipdist].txt`、`n4-shot-n4g-clip-a{0,1}.log`、
+    `n4b-n4g-clip-a{0,1}.png`、`…-vk2_{pool,xfer,sub,takeover}_probe-n4gregress.txt`、
+    `…-vk2_sub_probe-n4gsub{1,2,3}.txt`；结论 `ANDROID_PLAN` §八·N4-g，仪器事实 `TOOLS` B¹²。
+  - **下一步 = N4-h**：把"我们自己的三角形"画进**游戏的通道里**（`DM_TRI_IN_GAME=<绘制序号>`，缺省关）——
+    它落屏 ⇒ **通道与状态在那一刻是好的、只有游戏的绘制产不出片元**；它也不落屏 ⇒ **那一层本身有问题**。
+- **其前（「A1」，2026-10-16，提交 `ab52812`）停在**：**真机装上 Vulkan 校验层，
   答案是"有帮助"**。做法：层 `.so`（27,684,688 字节）进 APK 的 `lib/arm64-v8a/`（`DM_VKLAYER=1` 时才进），
   `setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用 —— **不用 root、不改代码**。
   一轮照出 **218 条 Error / 16 种 VUID**，**修掉一条真误用**（`shaderDrawParameters`，1839 份着色器在用
@@ -725,11 +779,16 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 下一步（细节在 ANDROID_PLAN「七、下一步」）
 
-> **新路径（Vulkan 原生重写）现在停在「N4-g」**：`N0 ~ N4-f` 已完成，台账里的 **A1（真机装 Vulkan 校验层）
+> **新路径（Vulkan 原生重写）现在停在「N4-h」**：`N0 ~ N4-g` 已完成，台账里的 **A1（真机装 Vulkan 校验层）
 > 也已完成**（它照出 16 种 VUID、修掉一条真误用，并给出一条决定性的负结果：**我们的 draw 在 API 层面合法**）。
-> **只剩"顶点着色器输出"**（`N4-f` 已把"顶点数据 / 常量缓冲"这一半答完：**都是正常的**）。
-> **下一轮第一件事 = 问设备能力 `VK_EXT_transform_feedback`**（有就抓 `gl_Position` 直接回答"经变换后
-> 在不在裁剪体里"）。细节见上面的"最新提交"段与 `ANDROID_PLAN`「七、下一步」第 0 条的最后两条回勾。
+> **"顶点输出"这一层已被 N4-g 用两刀排掉**（`DM_CLIPDIST` 特性开关 + **我们自己的三角形**的 A/B；
+> 顺带证明**我们自己的三角形能在这一层落屏** ⇒ 光栅化是通的）。
+> **下一轮第一件事 = 把"我们自己的三角形"画进游戏的通道里**（`DM_TRI_IN_GAME=<绘制序号>`，缺省关）：
+> 它落屏 ⇒ **通道与状态在那一刻是好的、只有游戏的绘制产不出片元**；它也不落屏 ⇒ **那一层本身有问题**。
+> ⚠ 另一条要记住的路线判定：`VK_EXT_transform_feedback` **能力在**（`transformFeedback = 1`、
+> `geometryStreams = 1`），但离线扫 6923 份 `.spv` **0 份**带 `XfbBuffer`/`Offset` 装饰 ⇒ 要用它抓游戏的
+> `gl_Position` **必须给游戏那份 SPIR-V 加装饰**，与"不许改产物"冲突 ⇒ **要重开先单独说清**。
+> 细节见上面的"最新提交"段与 `ANDROID_PLAN`「七、下一步」第 0 条的最后两条回勾。
 > **2026-10-16 现状更新：换设备对照做过了（「M3-3d」），结论是"卡点 B 的读数没拿到"** ——
 > 第二台不是"又一台骁龙"，而是 **Redmi `pearl` / MediaTek MT6896 / **Mali-G610 MC6** / Android 15 / Vulkan 1.1.177**。
 > 它在卡点 B 之前连撞两关：① **装机**（`adb install` / `pm install` 被 MIUI 拦：`INSTALL_FAILED_USER_RESTRICTED`；
