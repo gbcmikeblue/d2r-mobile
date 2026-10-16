@@ -55,6 +55,9 @@ add_library(dmhost_android STATIC
   # removes its stub from gfx_stub_android.c.
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_device.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region.c
+  # B3 仪器：GPU 操作流水（"最后一次成功提交 ↔ 第一条 -4"），见 vk_ops.h
+  # B3 instrument: the GPU-operation ledger (the last successful submit up to the first -4), see vk_ops.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_ops.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_tex.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_spv.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_shader.c

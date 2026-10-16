@@ -28,6 +28,7 @@
 #include "vk_shader.h"
 #include "vk_tex.h"
 #include "vk_png.h"
+#include "vk_ops.h"
 #include "dm.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -891,6 +892,12 @@ void mtl_wait_state_dump(void) {
                         (unsigned long long)(g_inf[i].pending ? g_inf[i].value : 0),
                         g_inf[i].pending ? (int)vkGetFenceStatus(vk_dev(), g_inf[i].fence) : -1);
       LOG("[vk] 槽的栅栏实况（槽:栅栏值/驱动状态，-1 = 槽空闲）：%s", st); }
+    // B3：GPU 操作流水也归在"现场"里 —— 看门狗转储、按需转储（dump.trigger）、崩溃现场都走到这个函数，
+    // 所以"停住/丢失之前最后几笔成功操作"在任何一份现场里都看得到（见 vk_ops.h 的开头）。
+    // B3: the GPU-operation ledger belongs in the scene too -- the watchdog dump, the on-demand dump (dump.trigger) and
+    // a crash scene all reach this function, so "the last few successful operations before the stall / loss" is in
+    // every scene (see the top of vk_ops.h).
+    vk_op_dump("等待点转储");
 }
 
 static int vk_sub_ready(void) {
@@ -1004,7 +1011,8 @@ uint64_t mtl_sub_commit(void) {
     r = vkQueueSubmit(vk_queue(), 1, &si, in->fence);
     dm_waitled_leave();
     vk_queue_unlock();
-    if (r != VK_SUCCESS) { LOG("【红】提交失败 VkResult %d", (int)r); return g_fence; }
+    if (r != VK_SUCCESS) { LOG("【红】提交失败 VkResult %d", (int)r); vk_op_result("vkQueueSubmit（客体：命令缓冲）", r); return g_fence; }
+    vk_op_note("客体：提交命令缓冲");   // B3：成功的那几笔进流水，-4 时连同"前序操作"一起打出来 | B3: successful ones go on the ledger for the -4 report
     in->pending = 1;
     in->value = ++g_fence;
     gpu_note_frame(i, atomic_load(&g_cur_frame));   // 这次提交属于哪一帧（完成是滞后的，回查靠帧号） | which frame this submission belongs to (completion is late; the lookup goes by frame number)

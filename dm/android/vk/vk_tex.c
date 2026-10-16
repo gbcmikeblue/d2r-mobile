@@ -10,6 +10,7 @@
 // mtl_addr: pool address -> (pool buffer, in-pool offset). A buffer texture's view is built straight on the pool
 // buffer, so it is needed here (see vk_tex_bufview).
 #include "nvn_mtl.h"
+#include "vk_ops.h"
 #include "dm.h"
 #include <math.h>
 #include <pthread.h>
@@ -519,7 +520,13 @@ static int one_end_on(VkCommandBuffer cb, int up) {
     dm_waitled_enter(up ? ONE_SUBMIT_UP : ONE_SUBMIT_RB);
     VkResult sr = vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE);
     dm_waitled_leave();
-    if (sr != VK_SUCCESS) { step_fail("vkQueueSubmit 返回 %d", (int)sr); vk_queue_unlock(); return 0; }
+    if (sr != VK_SUCCESS) {
+        step_fail("vkQueueSubmit 返回 %d", (int)sr);
+        vk_op_result("vkQueueSubmit（一次性提交：读回/对照/上传）", sr);
+        vk_queue_unlock(); return 0;
+    }
+    vk_op_note(up ? "一次性提交（上传）" : "一次性提交（读回/对照）");
+
     // M3-2w：读回 / 对照走的就是这条"一次性提交 + 等空闲"，而它**可能跑在客体线程上**
     // （「M3-2u」的采样 PC：`vk_tex_view ← mtl_exec ← dm_gfx_suspend`）—— 所以它是"轮询式等待"的头号嫌疑之一，记账。
     // M3-2w: readback / control clear go through this "one-off submit + wait idle", and it **can run on a guest thread**
@@ -532,7 +539,8 @@ static int one_end_on(VkCommandBuffer cb, int up) {
     VkResult r = vkQueueWaitIdle(vk_queue());
     dm_waitled_leave();
     vk_queue_unlock();
-    if (r != VK_SUCCESS) { step_fail("vkQueueWaitIdle 返回 %d", (int)r); LOG("【红】一次性提交等待失败 VkResult %d", (int)r); return 0; }
+    if (r != VK_SUCCESS) { step_fail("vkQueueWaitIdle 返回 %d", (int)r); LOG("【红】一次性提交等待失败 VkResult %d", (int)r); vk_op_result("vkQueueWaitIdle（一次性提交等空闲）", r); return 0; }
+    vk_op_note(up ? "一次性提交等空闲（上传）" : "一次性提交等空闲（读回/对照）");
     return 1;
 }
 static int one_begin(void) { return one_begin_on(&g_cb); }        // 读回 / 对照清除 | readback / control clear

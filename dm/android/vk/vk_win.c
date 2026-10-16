@@ -3,6 +3,7 @@
 // R8G8B8A8_UNORM, format 37).
 #include "vk_win.h"
 #include "vk_device.h"
+#include "vk_ops.h"
 #include "dm.h"
 #include <stdlib.h>
 #include <string.h>
@@ -324,13 +325,16 @@ int vk_win_present_rgba(const uint8_t *rgba, uint32_t w, uint32_t h) {
     dm_waitled_enter("vk：上屏提交（前端线程）");
     VkResult wsr = vkQueueSubmit(q, 1, &si, g_fence);
     dm_waitled_leave();
-    if (wsr != VK_SUCCESS) { if (lock) vk_queue_unlock(); return 0; }
+    if (wsr != VK_SUCCESS) { vk_op_result("vkQueueSubmit（上屏）", wsr); if (lock) vk_queue_unlock(); return 0; }
+    vk_op_note("上屏：提交");
     VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
         .pWaitSemaphores = &g_rdy, .swapchainCount = 1, .pSwapchains = &g_sc, .pImageIndices = &idx };
     dm_waitled_enter("vk：上屏呈现 vkQueuePresentKHR（前端线程）");
     VkResult pr = vkQueuePresentKHR(q, &pi);
     dm_waitled_leave();
     if (lock) vk_queue_unlock();   // 共用队列时：取图像 → 提交 → 上屏整段都在锁里 | when shared: acquire -> submit -> present is one critical section
-    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) sc_destroy();
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) { sc_destroy(); return 1; }
+    if (pr != VK_SUCCESS) { vk_op_result("vkQueuePresentKHR（上屏呈现）", pr); return 0; }
+    vk_op_note("上屏：呈现");
     return 1;
 }

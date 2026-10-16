@@ -166,6 +166,15 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 - `MANAGE_EXTERNAL_STORAGE` 要在系统设置里手动打开；
 - 游戏资源放 `/data/local/tmp/dm/romfs`（读得快）或 `/sdcard/d2rm`（重启不丢）。
 
+**第二台（2026-10-16 备齐，`VC9TGM45MNJB8TSG` / Redmi `pearl` / MT6896 / **Mali-G610 MC6** / Android 15）**：
+同一份 9.1 GB 已按本节推上去（用时 5 分 12 秒、28.5 MB/s），`save` 也推了 10 个文件。
+做法上有两条与第一台不同、值得沿用（脚本 `.work/push_dev2.py`）：
+① **逐文件推 + 远端大小相等就跳过** ⇒ 断了可以整脚本重跑，只补没拿到的；
+② **`spv` 走 `spv.tar` + 设备端 `tar -xf`**（13847 项 **8 秒**解完；20770 个小文件逐个 `adb push` 会慢得多）。
+唯一的缺口：**这台 MIUI 拒绝 `adb install` / `pm install`**（`INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`，
+`settings put … verifier_verify_adb_installs` 又被 `WRITE_SECURE_SETTINGS` 拒）⇒ **必须在手机上人工打开
+"通过 USB 安装"**（第一台是开着的）。装包/装机脚本 `.work/mkapk.py`（出包走 `build_u8.cmd` 包装，装机先试设备端 `pm install -r`）。
+
 ## 六、容易踩的几点
 
 - **git 身份**：这台机器没有配 `user.name` / `user.email`（提交时用 `-c` 临时传与历史一致的身份：`gbcmikeblue <1061589622@qq.com>`）。新电脑先把身份配好，否则 `git commit` 直接以 `Author identity unknown` 失败。
@@ -316,15 +325,30 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 - **一条偶发**：约每轮 1 次 `【红】提交失败 VkResult -4`（`VK_ERROR_DEVICE_LOST`），后面跟上百条
   `贴图上传失败`。**与共用命令缓冲无关**（已排除，「M3-2o」）；「M3-2t」的 t2 里它之后窗口被拆、日志截断 ⇒
   与"停住"很可能是同一条线。
+  **2026-10-16「M3-3d」**：这件仪器补上了（`dm/android/vk/vk_ops.c` 的 24 笔 GPU 操作流水）——**第一条 -4** 现在自带
+  "出错的调用 + 设备信息 + 前 24 笔前序操作"，并进所有现场转储。真机两次读数**更正**了旧口径："谁先看见"**不止一个**
+  （一次 `vkQueueWaitIdle（一次性提交等空闲）`、一次 **`vkQueueSubmit（客体：命令缓冲）`**）。
+- **换设备对照（2026-10-16，「M3-3d」）= 卡点 B 的读数没拿到**：第二台是 **Mali**，① MIUI 不许 `adb install`
+  （要人工开"通过 USB 安装"）；② 零拷贝内存池的甲案（**可导出**外部句柄 → `mmap(MAP_FIXED)`）在 Mali 上不存在
+  ⇒ `dmhost` 冒烟在 `nnosInitialize` 就 `Break#1`。**第一台的干净臂 12 轮**：**健康 1 / 停顿型 7 / 设备丢失型 2 / 崩溃 2**
+  （健康那一轮 1154 帧 / 70 秒、op/帧 1276.5、零长等；生病轮 op/帧 96~107、每轮 2~4 条 10.1~11.8 秒长等；崩溃签名
+  `pc=libc.so+0xd6b18`，2/12）。
+  ⇒ 顺带更正一条口径：**"不写 `DM_WIN_SRC`"不等于关查看器**（缺省 28 就是开着），干净臂必须显式 `DM_WIN_SRC=0`。
 
 ### 下一步（细节在 ANDROID_PLAN「七、下一步」）
 
-> **2026-10-16 现状更新：第二台安卓设备已就位** ⇒ 上面第 1 条（换设备 / 换驱动对照，分辨力最强）现在可以做了。
-> 两个已知缺口，动手前先补：① `.work/` 里**没有** `ab-run.ps1`、也没有任何 `ab-*.conf`，只有 `dm.conf` —— 而它是
-> **M3-2w 的"A 轮复现"配置**（`DM_WIN_SRC=28` + `DM_NVN_SHOT_SCAN=50,54,57` + `DM_WATCH_STALL=600`），
-> **会污染健康 / 生病对照，不要推它**；要重建一份"最干净的臂"（两路诊断全关）的 conf 与跑轮脚本。
-> ② `.work/trace/` 不在，`stall.pftrace` 那条路要按配方重抓。跑轮脚本按新规则用 `.venv` Python 写
-> （`.codebuddy/rules/windows-python-only/RULE.mdc`）。
+> **2026-10-16 现状更新：换设备对照做过了（「M3-3d」），结论是"卡点 B 的读数没拿到"** ——
+> 第二台不是"又一台骁龙"，而是 **Redmi `pearl` / MediaTek MT6896 / **Mali-G610 MC6** / Android 15 / Vulkan 1.1.177**。
+> 它在卡点 B 之前连撞两关：① **MIUI 拒绝 `adb install` / `pm install`**（`INSTALL_FAILED_USER_RESTRICTED`；
+> `settings put global verifier_verify_adb_installs 0` 被 `WRITE_SECURE_SETTINGS` 拒）⇒ **要在手机上人工把
+> "通过 USB 安装"打开**；② `dmhost` 冒烟跑到 `nnosInitialize` 就报 **`内存换轨：建载体缓冲失败`**
+> —— 堆与别名区各只换到 0 MB，随后 `SVC 越出 alias 区` + `Break#1`。原因是 `vk_region.c` 的甲案依赖
+> **可导出**的外部句柄（不透明 fd / dma-buf），而 Mali 上两样都不可导出（dma-buf 只有 IMPORTABLE）。
+> 设备指纹与 4 份探针读数在 `.work/logs/devfp-*` / `probe-*`，结论与下一步见 `ANDROID_PLAN`「八、M3-3d」。
+> **尺子已经搭好，两台共用**：`.work/ab-clean.conf`（**注意：干净的臂必须显式写 `DM_WIN_SRC=0` —— 查看器缺省就是 28、开着**）
+> + `.work/ab_run.py`（推 conf → force-stop → `am start` → 等 N 秒 → 拉日志 → 判类；读数落 `.work/logs/ab-readings.tsv`）。
+> 第二台的设备侧数据**已备齐**（`/data/local/tmp/dm/` 9.1 GB + 存档 + 4 个探针），一旦上面两条清了就能直接开跑。
+> 另外 `.work/trace/` 仍不在，`stall.pftrace` 那条路要按配方重抓。
 
 1. ~~**里程碑 B：客体停住**（任务图侧）~~ —— **已结案（2026-10-15，「M3-2t」）**：三张位图的时间序列做完，
    真机三轮把甲（上膛 0 位）/ 乙（完成后被清）分开：**甲否掉、乙成立**（待派发最大 `0x3fffff`、已完成最大
@@ -377,6 +401,17 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 PC 侧的路径与工具见第二、三节；这里只说**跑一次并拿到读数**：
 
+**2026-10-16 起有现成脚本**（「M3-3d」，都用 `.venv` Python 跑）：
+
+| 脚本 | 干什么 |
+|---|---|
+| `.work/ab_run.py` | 跑 N 轮并判类：推 conf → `am force-stop` → `am start` → 等 N 秒 → 拉 `latest.log` → 出"出图 / op 每帧 / >1 秒长等 / `-4` 条数"并判成**健康 / 停顿型 / 设备丢失型 / 崩溃轮 / 启动受阻**；读数追加 `.work/logs/ab-readings.tsv`，逐轮日志 `.work/logs/ab-<tag>-<运行编号>-r<N>.log` |
+| `.work/ab-clean.conf` | **最干净的臂**：`DM_WIN_SRC=0`（查看器**显式**关）+ 不写扫描 / HUD / 看门狗 + `DM_TG_SERIES=0`。两台共用同一份 |
+| `.work/mkapk.py` | 出包（经 `.work/build_u8.cmd` 打 `chcp 65001`）+ 装机（先试设备端 `pm install -r`，MIUI 那个坑） |
+| `.work/probes.py` | 编 / 推 / 跑能力探针（`vk_probe` / `vk_hostmem_probe` / `vk_fdmap_probe` / `vk_region_probe`） |
+| `.work/push_dev2.py` | 把设备侧数据推齐（逐文件 + 跳过已存在 + 重试；`spv` 走 tar） |
+| `.work/bg.py` | 把长任务放后台并把输出落盘（前台一条命令会堵住整个回合） |
+
 ```powershell
 $adb = 'C:\Android\Sdk\platform-tools\adb.exe'
 cd <仓库>
@@ -397,7 +432,8 @@ Start-Sleep -Seconds 50
 `/sdcard/Android/data/ai.d2rm.dm/files/dm.conf`，每行 `key=value`（`#` 开头是注释），**推上去重启 app 即生效，不用重新装机**。
 当前那一份：
 
-设备上现在那一份**就是「M3-2u」的复现配方**（停下取现场用）——`.work/dm.conf` 里带注释的同一份：
+**2026-10-16 起**：设备上那一份是 **`.work/ab-clean.conf`（最干净的臂：`DM_WIN_SRC=0` + `DM_TG_SERIES=0`）**；
+要"停下取现场"就用 **`.work/dm.conf`（「M3-2w」的 A 轮复现配方，带注释）**。后者长这样：
 
 ```
 DM_WIN_SRC=28          # 贴图查看器的源序号（0 = 关，回测试图）
@@ -492,6 +528,10 @@ adb 要经 `run-as` 才看得到（`adb shell run-as ai.d2rm.dm ls -l files`）�
   四臂八轮里那 ~10 秒停顿**轮轮都有**（含 D），而同一份配置也出现过 13.5 帧/秒的一轮 ⇒ 停顿与诊断开关无关；
   真正决定读数的是**每次启动落在"健康 / 生病"哪一种**（op/帧 1234 vs 100）。"量帧预算时只开一个"仍可留着，
   但**别再把"停住"归因到"两路同时开"**（详见「M3-2y」）。
+- **"不写 `DM_WIN_SRC`"不等于关查看器**（2026-10-16，「M3-3d」实测量出）：`main_apk.c:749` 是
+  `g_src_ser = src ? strtoull(src,0,10) : 28;` ⇒ **缺省 28 就是开着**（启动头会自报 `DM_WIN_SRC=(缺省 28)`）。
+  所以"干净的臂"必须**显式写 `DM_WIN_SRC=0`**；`DM_NVN_SHOT_SCAN` 才是"写了才开"。判"这一轮是哪条臂"看启动头
+  那两行与心跳里的 `查看器 读成/跳过`（`.work/ab_run.py` 每轮会把 `查看器 <序号>` 打出来当自证）。
 - **要停住的现场就按需取**（同上）：`adb shell touch …/files/dump.trigger` ⇒ 一秒内打进现场（线程在等什么 +
   图形侧等待点），**进程不退出**，可以再取一次。看门狗那条是"导完就 `_exit`"，而直接发 `SIGALRM` 走 `on_crash`
   会把**转储的尾巴切掉**（它没有看门狗那 400 ms 的等待）—— 所以停住研究只用这个触发口。
