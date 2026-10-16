@@ -70,6 +70,9 @@ add_library(dmhost_android STATIC
   # Window, swapchain and present (M3): let the host's single device put a picture on the phone screen, see vk_win.h
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_win.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk/nvn_vk.c
+  # N4-h：把"我们自己的三角形"画进**游戏的通道里**（缺省关的诊断开关 `DM_TRI_IN_GAME`）—— 见 vk_tri_game.c
+  # N4-h: draw our own triangle into the **game's pass** (the off-by-default diagnostic DM_TRI_IN_GAME)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_tri_game.c
   # 新地基（Vulkan 原生显式实现）N1：影子内存 + 分块后备资源 + 地址反查。**先让它可用**，接管回放层是 N4
   # （§9.7 的接管点表）；在此之前没有任何调用方，所以它进来只是"编进构建、随时能用"，不改变旧路行为。
   # New foundation N1: shadow memory + chunked backing store + address lookup. Made available now; taking over

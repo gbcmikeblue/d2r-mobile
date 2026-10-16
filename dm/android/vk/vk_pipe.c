@@ -846,3 +846,7 @@ void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uin
     if (gpso) *gpso = g_n_gpso;
     if (fail) *fail = g_n_fail;
 }
+
+// N4-h：见 vk_pipe.h —— 只是让"我们自己的三角形"那条诊断管线也在这一格上有个 +1（含义写在日志里）
+// N4-h: see vk_pipe.h -- it only gives the diagnostic triangle's pipeline a +1 on this counter
+void vk_pipe_note_external_gfx(void) { g_n_gpso++; }

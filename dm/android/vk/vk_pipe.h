@@ -53,6 +53,17 @@ VkPipeline vk_pipe_compute_variant(const vk_shader *cs, int variant);
 // Counters: descriptor set layouts, pipeline layouts, compute pipelines and graphics pipelines created, plus failures
 void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uint64_t *gpso, uint64_t *fail);
 
+// N4-h：回放层**以外**的模块（诊断用的"我们自己的三角形"，见 vk_tri_game.c）自己建了一条图形管线时调一次。
+// 为什么要有它：心跳那一格的"图形管线 N 条"原本只统计游戏路径建的，混进去会让 N0~N4-g 的读数不可比；
+// 但"我们这条管线真的建成了"这条自证又需要一个**既有判据上的 +1**。两个要求分开满足：计数照加，
+// 含义写在日志与文档里（判据行会同时给出"含 N4-h 自绘 1 条"这层信息）。
+// N4-h: called once when a module **outside** the replay layer (the diagnostic triangle in vk_tri_game.c)
+// creates a graphics pipeline of its own. The heartbeat's "graphics pipelines" counter used to mean "built by
+// the game path" only, and mixing that in would make N0..N4-g's readings incomparable -- but the self-proof
+// that our pipeline really got built does want a +1 on an existing criterion, so the counter is bumped and the
+// meaning is stated in the log and the docs.
+void vk_pipe_note_external_gfx(void);
+
 // DM_RASTER_BRUTE（诊断，缺省关）：光栅化侧那几个开关的总闸。nvn_vk.c 用它决定"要不要在绘制前把
 // 动态视口/裁剪铺满附件"（另一半在 vk_pipe.c 里打开深度/模板/剔除/混合/写掩码）。
 // DM_RASTER_BRUTE (a diagnostic, off by default): the master switch for the raster-side ones. nvn_vk.c uses

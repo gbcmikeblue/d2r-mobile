@@ -29,6 +29,7 @@
 #include "vk_tex.h"
 #include "vk_png.h"
 #include "vk_ops.h"
+#include "vk_tri_game.h"   // N4-h：把"我们自己的三角形"画进游戏的通道里（缺省关的诊断开关）| N4-h: draw our own triangle into the game's pass (off by default)
 #include "vk2_pool.h"      // N4：新地基（Vulkan 原生显式实现）的池模块 —— 选路点与真机池账 | N4: the new pool module
 #include "vk2_xfer.h"      // N4-b：上传窗口 —— 帧开头把 CPU 脏页搬进后备资源（GPU 侧从此读的是后备）| the upload window
 #include "vk2_sub.h"       // N4-c：提交侧（帧批提交 + 有界在飞 + 定向栅栏）—— 回放层不再用旧路的 8 槽与队列空闲等待
@@ -1353,6 +1354,18 @@ int vk_diag_line(char *buf, size_t cap) {
             if (m > 0) n += m;
             if ((size_t)n > cap) n = (int)cap;
         }
+        // N4-h：**我们自己的三角形**那一格（插入次数 / 本模块自己建的管线数）。与 N4-f 同一套做法：
+        // 包在"只在开关打开时出现"里 ⇒ **缺省关时这一行与上一轮逐字节相同**（可用 `.work/n4e_hb_len.py` 核，
+        // 第 ㉓ 条）。明细（第几次插入、那一刻的通道与视口、管线创建结果）在 `vk_tri_game.c` 的【查】行里。
+        // N4-h: the "our own triangle" cell (inserts / pipelines built by this module). Same shape as N4-f: it only
+        // appears when the switch is on, so with the default off this line is byte-for-byte the previous round's.
+        char tgb[192];
+        int tgn = vk_tri_game_desc(tgb, sizeof tgb);
+        if (tgn > 0 && (size_t)n < cap) {
+            int m = snprintf(buf + n, cap - (size_t)n, "；%s", tgb);
+            if (m > 0) n += m;
+            if ((size_t)n > cap) n = (int)cap;
+        }
     }
     return n;
 }
@@ -2033,6 +2046,11 @@ static uint32_t g_pp_w, g_pp_h;    // 补清那一次的矩形（附件有效尺
 // direct way to lose every fragment, and they are dynamic state set by the guest via OP_VIEWPORTS/OP_SCISSOR,
 // so they can only be overridden where the draw is recorded.
 static uint32_t g_pass_w, g_pass_h;   // 本通道的渲染区（附件尺寸），brute 模式下当满屏视口用
+// N4-h：本通道**附件自身的有效尺寸**（限了 mip 的视图要右移；与渲染区不是一回事）——"我们自己的三角形"
+// 铺满附件时要用它（渲染区可能比附件小），读数里也要把两者都打出来才分得清"没落屏"是哪一种。
+// N4-h: the attachment's own effective size for this pass (a mip-limited view shifts right; not the same thing as
+// the render area). The diagnostic triangle fills this when covering the attachment, and both are logged.
+static uint32_t g_att_w0, g_att_h0;
 static uint64_t pass_probe_serial(void) {
     static int once;
     if (!once) {
@@ -2842,6 +2860,7 @@ static void pass_begin(void) {
     }
     // DM_PASS_PROBE：这个矩形要落在附件里（与渲染区同源，用附件有效尺寸）
     if (g_pp_armed) { g_pp_w = att_w; g_pp_h = att_h; }
+    g_att_w0 = att_w; g_att_h0 = att_h;   // N4-h：附件自身的有效尺寸（"我们自己的三角形"铺满用）
     if (!natt && !g_rs.depth) return;
     VkRenderingAttachmentInfo datt = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     int has_d = 0;
@@ -2921,6 +2940,8 @@ static void pass_begin(void) {
     gpu_pass_ts(g_cur_slot, cb, 0);   // 通道真的开成了，写起始时间戳 | the pass really opened, so write the start timestamp   // 桩库不导出，走 vkGetDeviceProcAddr 取的指针（见 vk_device.h）| not exported by the stub library, so it goes through the pointer fetched with vkGetDeviceProcAddr (see vk_device.h)
     g_rs.open = 1;
     atomic_fetch_add(&g_pass_n, 1);
+    // N4-h：新的一段通道 ⇒ "我们自己的三角形"在这段通道里还没插过（每段通道只插一次；缺省关时只清一个标志）
+    vk_tri_game_pass_begin();
 }
 
 // ========== 影子状态 → 图形管线状态（M2-6d-3 的解释层）==========
@@ -3455,6 +3476,17 @@ void mtl_exec(const uint8_t *p) {
                         vkCmdDraw(cb, (uint32_t)d->count, 1, (uint32_t)d->first, 0);
                         wrote = 1;
                     }
+                    // N4-h：这一次**游戏绘制刚录完** ⇒ 在同一段通道、同一批附件上插一次**我们自己的绘制**
+                    //（缺省关；设计、开关形状与判据见 vk_tri_game.h）。放在游戏绘制**之后**：我们那条管线
+                    // 关着剔除/混合/深度，所以它一定覆盖在游戏写过的地方之上，落屏与否看得最干净。
+                    // N4-h: right after a **game draw** is recorded, insert **our own draw** into the same pass with
+                    // the same attachments (off by default; see vk_tri_game.h). It goes *after* the game's draw
+                    // because our pipeline has culling/blending/depth off, so it lands on top of whatever the game
+                    // wrote -- which is the cleanest thing to read "did it land at all" from.
+                    if (wrote)
+                        vk_tri_game_try_draw(cb, k + 1, (const tex_t *const *)g_rs.color, g_rs.cview,
+                                             g_rs.has_cview, g_rs.ncolor, g_att_w0, g_att_h0, stv.samples,
+                                             g_rs.vp, g_rs.nvp, g_rs.sc, g_rs.nsc);
                 } else atomic_fetch_add(&g_desc_skip, 1);
             } else if (pl) atomic_fetch_add(&g_desc_skip, 1);
             if (wrote) atomic_fetch_add(&g_desc_draws, 1);
