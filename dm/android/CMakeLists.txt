@@ -197,6 +197,21 @@ target_link_libraries(vk_ahb_probe PRIVATE vulkan nativewindow android)
 target_link_options(vk_ahb_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk_ahb_probe PRIVATE ${COMPAT})
 
+# 新地基（Vulkan 原生显式实现）N0 的常数标定探针：把 docs/rewrite/ANDROID_REWRITE.zh-CN.md §9.9 那四个"待实测"
+# 常数量成真机读数（只问不接管：不建池、不写脏记账、不接管回放层，那些是 N1~N3）。独立可执行文件，不进宿主也不进 APK。
+# 一档尺寸派生一个自己的子进程：某档失败会把同进程之后的小分配也带坏（AHB 探针踩过），所以它要能复执行
+# /proc/self/exe；读数落 .work/logs/probe-<串号>-vk2_probe.txt（走 .work/probes.py run）。
+# N0 constant-calibration probe of the new foundation: turns the four "to be measured" constants of section 9.9 of
+# docs/rewrite/ANDROID_REWRITE.zh-CN.md into on-device readings (ask only, take over nothing: no pool, no dirty
+# accounting, no replay-layer take-over -- those are N1..N3). A standalone executable, part of neither the host nor
+# any APK. Each chunk-size rung is measured in a freshly spawned copy of itself (a failure poisons later small
+# allocations in the same process, as the AHB probe learned), hence the re-execution of /proc/self/exe; the readings
+# land in .work/logs/probe-<serial>-vk2_probe.txt via .work/probes.py run.
+add_executable(vk2_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk2/vk2_probe.c)
+target_link_libraries(vk2_probe PRIVATE vulkan)
+target_link_options(vk2_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk2_probe PRIVATE ${COMPAT})
+
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；
 # 打成 APK 留到 M2 之后（那时才有画面）。
