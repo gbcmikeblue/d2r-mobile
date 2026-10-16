@@ -228,7 +228,7 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 > 其前 `9a74398` = 新架构的实现计划与目标里程碑 **N0~N6**（`ANDROID_REWRITE` §十一，该文同日入库）、
 > `1d31891` = 收尾）—— 新机器从这之后接手，恢复步骤照第三节；
 > 进度细节与结论以 [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 的「七、下一步」与「八、进度记录」为准。
-> **★ 现在的方向**：按 [ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md)（「七、下一步」第 0 条，架构口径变更）
+> **★ 现在的方向**：按 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)（「七、下一步」第 0 条，架构口径变更）
 > 的**里程碑 N0~N6** 走 —— **开工第一件事是 N0（常数标定）**：
 > 先用自证探针把 §9.9 的四个待实测常数（块大小 / 脏位图粒度 / `VK2_INFLIGHT` / 暂存环）量成真机读数，
 > **只问不接管**；之后 N1 影子 + 分块后备 + 地址反查 → N2 脏记账 + 上传/回读窗口 → N3 帧批提交 →
@@ -243,7 +243,7 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 - **★ 本轮（「M3-3f」，2026-10-16）停在**：**主线在第一台**（Adreno），第二台的 AHB 线**暂停**
   （见下一段）。旧口径的两支臂**做完且都是负结果** ⇒ **用法侧四刀全为负**（上传环 / 摘前端 / 上传提交 / 喂空活）
   ⇒ **卡点 B 的触发点不在我们这一侧的用法里**。**方向**：按「七、下一步」第 0 条的**架构口径变更**施工
-  （正本 `docs/ANDROID_REWRITE.zh-CN.md`）：影子内存 + 分块后备资源 → 显式屏障 + 上传/回读窗口 →
+  （正本 `docs/rewrite/ANDROID_REWRITE.zh-CN.md`）：影子内存 + 分块后备资源 → 显式屏障 + 上传/回读窗口 →
   帧批提交（删掉全部 `vkQueueWaitIdle`）→ 绑定以 SPIR-V 反射为唯一真源；旧路全留（`DM_GFX2`，缺省关）。
   细节见 ANDROID_PLAN「M3-3f」。
 - **第二台（Mali）的 AHB 线已暂停**（2026-10-16 用户决定）：M3-3e 净结果 = 装机已验证、AHB 支路两台都成立

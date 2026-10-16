@@ -29,7 +29,7 @@
 | 已达成 | 改写产物在真机装载执行 → 进 `nnMain`；Vulkan 通路 + 零拷贝内存模型落地；出图与上屏链路真机通（窗口能显示主机像素）；绘制真下发（≈40 万次/轮、零失败） |
 | 未达成 | **M2 验收判据「屏幕出（游戏自己的）画面」未过**：渲染目标读回仍是全零 |
 | 当前卡点 | 每轮约 **10 秒**的「GPU/显示通路整体停摆」（提交在飞、GPU 却在等新活），会把交付节奏按帧率切成两半 |
-| 下一步 | **⓪ 架构口径变更（2026-10-16）：图形层改为 Vulkan 原生的显式实现 —— 见 [ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md) 与 §6.4 / §11 第 0 条**；① 换设备 / 换驱动对照；② 有 `trace_processor` 的机器上读停顿窗口的 trace；③ 若仍在这台机上：试「GPU 保活」（隔 N 毫秒空提交）；④ **卡点 A 侧**：真机装 Validation Layers（见 §14 A1，**不依赖换设备**） |
+| 下一步 | **⓪ 架构口径变更（2026-10-16）：图形层改为 Vulkan 原生的显式实现 —— 见 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md) 与 §6.4 / §11 第 0 条**；① 换设备 / 换驱动对照；② 有 `trace_processor` 的机器上读停顿窗口的 trace；③ 若仍在这台机上：试「GPU 保活」（隔 N 毫秒空提交）；④ **卡点 A 侧**：真机装 Validation Layers（见 §14 A1，**不依赖换设备**） |
 
 ---
 
@@ -48,7 +48,7 @@ Switch 1.0.34.0 = PC 3.3.94012）在 iPhone / iPad / Mac 上**原生执行**—�
 | 复用原则 | **不重写游戏逻辑**，复用现有宿主；只替换「面向平台」的两侧：**前端**与**图形后端** |
 
 > **⚠ 勘误（2026-10-16）**：这条原则**只对宿主与前端成立**。图形后端**不是"替换"，是"重写"**——
-> Metal 的三条平台语义在 Vulkan 上没有对应物，见 §6.4 与 [ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md)。
+> Metal 的三条平台语义在 Vulkan 上没有对应物，见 §6.4 与 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)。
 > 原文保留，作为立项口径留档。
 | 要换的两侧 | 前端：UIKit/CAMetalLayer → `NativeActivity` / `ANativeWindow`；图形：Metal 回放层 → **Vulkan 回放层** |
 | 交付物 | 一个可安装的 APK（包名 `ai.d2rm.dm`）+ 设备侧只读数据（改写产物 / SPIR-V / RomFS） |
@@ -98,7 +98,7 @@ flowchart LR
 | **M1** | 无窗口跑通宿主 | APK 装上真机、画面全黑，但日志里出现游戏的 `UNIMPL` 行 | ✅ 完成 |
 | **M2** | 最小 Vulkan 回放层 | 屏幕能出画面（先清屏成一个颜色，再逐步到主菜单） | ⚠️ **未验收**（链路通、画面未出） |
 | **M3** | 前端 + 触摸 + 音频 | 能建角、进局、有声音 | 🔄 进行中（底层已通、玩家面功能未开始） |
-| **N0~N6**（新地基，**取代旧图形层**） | 图形层改为 **Vulkan 原生的显式实现**（影子内存 + 显式可见性 + 帧批提交 + 反射绑定） | **G1~G5**（往返逐字节 / 可见性显式成立 / 4 GB 池全功能 / 一次客体提交=一次 `vkQueueSubmit` 且 `vkQueueWaitIdle` 为 0 / 两台设备都过）——判据与逐块计划见 **[ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md) §六 与 §十一** | ⬜ **未开工**（计划已写入 §十一；**N4 顶替 M2 的验收**） |
+| **N0~N6**（新地基，**取代旧图形层**） | 图形层改为 **Vulkan 原生的显式实现**（影子内存 + 显式可见性 + 帧批提交 + 反射绑定） | **G1~G5**（往返逐字节 / 可见性显式成立 / 4 GB 池全功能 / 一次客体提交=一次 `vkQueueSubmit` 且 `vkQueueWaitIdle` 为 0 / 两台设备都过）——判据与逐块计划见 **[rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md) §六 与 §十一** | ⬜ **未开工**（计划已写入 §十一；**N4 顶替 M2 的验收**） |
 | **M4** | 收尾 | 手柄、云同步、诊断、性能调优（对标 iOS 60 fps / 3.8 W） | ⬜ 未开始 |
 
 ---
@@ -122,7 +122,7 @@ flowchart LR
 | M3-仪器 | 安卓侧补齐「等待点 + 线程现场 + 采样」 | 每条客体线程报 `stat` 状态 / `wchan` 内核等待点 / `syscall` 号+参数+sp+pc | M3 第 3 步 6/7/8 |
 | M3-诊断链 | 12 轮真机排查（M3-2k → M3-3c） | 见 §5.6 时间线；结论：**「停住」= 驱动/GPU 约 10 秒不回答，会自愈** | §八 |
 | M3-3d 换设备 | **卡点 B 的对照没拿到**（第二台跑不起来），拿到的是"移植假设"：第二台 **Mali-G610 MC6** 上零拷贝内存池那条路不存在 | 4 份探针（71 扩展 / Vulkan 1.1.177 / 外部句柄**不可导出**）+ `dmhost` 冒烟（`建载体缓冲失败` → 堆与别名区各 0 MB → `Break#1`）+ 第一台干净臂 **12 轮**（健康 1 / 停顿型 7 / 设备丢失型 2 / 崩溃 2）+ `vk_ops` 的 -4「前序 24 笔」流水 | `ANDROID_PLAN` §八·M3-3d |
-| **新地基 N0~N6** | **未开工**（2026-10-16 立计划） | 逐块计划、每块判据、"新基线六个字段"与"开工前要确认的三件事"见 `ANDROID_REWRITE.zh-CN.md` §十一；本表自 N0 起逐项补真机读数 | — |
+| **新地基 N0~N6** | **未开工**（2026-10-16 立计划） | 逐块计划、每块判据、"新基线六个字段"与"开工前要确认的三件事"见 `rewrite/ANDROID_REWRITE.zh-CN.md` §十一；本表自 N0 起逐项补真机读数 | — |
 | M4 | 未开始 | — | — |
 
 **M3 任务清单的勾选状态与进度不一致**：`front_run` / `front_text_input` / 触摸 / 音频 /
@@ -358,7 +358,7 @@ mach-o 段查找一律返回找不到；安卓 SIGSEGV 拿不到 ESR 读写位�
 - §6.2 的「已排除面」要补一句：**已排除的每一项都是在前提 ② 之上做的**；这个前提本身在安卓上从未被验证。
 
 取代它的那一套（安卓原生：影子内存 + 分块后备资源 + 显式屏障 + 帧批提交，含实现规格、旧→新接管点、
-验收闸门 G1~G5）见 **[ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md)**。
+验收闸门 G1~G5）见 **[rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)**。
 
 **不推翻的**：安卓可行；宿主复用 ≈95%；SPIR-V / 改写产物 / RomFS / 触摸逻辑全部成立（探路 A / B 的读数不变）。
 
@@ -496,7 +496,7 @@ iCloud→Drive/自建；mach `vm_*`→`/proc/self/maps`、`__builtin___clear_cac
 
 0. ★★★ **架构口径变更：图形层改为 Vulkan 原生的显式实现**（2026-10-16，**最高优先级**）——
    推翻立项口径里关于图形层的那一半（「只换宿主与图形层里面对平台的那一侧」；**宿主那半仍成立**），
-   依据是三条地基假设的逐条证伪，全部读数与规格见 **[ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md)**。
+   依据是三条地基假设的逐条证伪，全部读数与规格见 **[rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)**。
    施工顺序（每块自带探针、先在真机自证再接管）：**影子内存 + 分块后备资源 → 显式屏障 + 上传/回读窗口 →
    帧批提交（删掉全部 `vkQueueWaitIdle`）→ 绑定以 SPIR-V 反射为唯一真源**。
    验收闸门 G1~G5 见该文 §六；**旧路全部保留**（`DM_GFX2` 开关，缺省关，可随时退回做 A/B）。
@@ -554,7 +554,7 @@ iCloud→Drive/自建；mach `vm_*`→`/proc/self/maps`、`__builtin___clear_cac
 | `docs/ANDROID.zh-CN.md` | 可行性分析与复用/改写/新增清单（立项口径） |
 | `docs/ANDROID_PLAIN.zh-CN.md` | 上面那份的通俗版（给不写代码的人） |
 | `docs/ANDROID_PLAN.zh-CN.md` | **主文档**：起点快照、总体路线、任务清单、已确认决定、风险、Windows 规范、下一步、进度记录（M2 各步 + M3-2k…M3-3c 逐轮） |
-| `docs/ANDROID_REWRITE.zh-CN.md` | **架构口径变更（2026-10-16）**：推翻「同种架构可照搬」，图形层改为 Vulkan 原生的显式实现（影子内存 + 分块后备 + 显式屏障 + 帧批提交）；含三条地基假设的逐条证伪、实现规格、旧→新接管点、验收闸门 G1~G5 |
+| `docs/rewrite/ANDROID_REWRITE.zh-CN.md` | **架构口径变更（2026-10-16）**：推翻「同种架构可照搬」，图形层改为 Vulkan 原生的显式实现（影子内存 + 分块后备 + 显式屏障 + 帧批提交）；含三条地基假设的逐条证伪、实现规格、旧→新接管点、验收闸门 G1~G5 |
 | `docs/CROSS_MACHINE.zh-CN.md` | 换机器继续：数据在手机上、恢复步骤、§7 当前现状与下一步、跑一轮的最小闭环 |
 | `.work/recon/handoff.md` | 本机事实、取证数据、反汇编配方、待删清单、**下一个窗口的施工说明** |
 | `.work/recon/pending_rm.md` | 待删清单 + "明确不要删" + 执行记录 |

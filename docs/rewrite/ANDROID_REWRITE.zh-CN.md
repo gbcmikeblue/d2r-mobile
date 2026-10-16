@@ -13,6 +13,9 @@
 > 与其冲突处，以 `docs/ANDROID_PLAN.zh-CN.md` 的「七、下一步」「八、进度记录」为准（那是逐轮更新的正本）。
 > **本页 §十一**是把 §四~§九 的规格钉成"分几步做、每步判据是什么"的那一层：里程碑 **N0~N6**（与 `M0~M4` 并列不重号），
 > 其中 **N4 顶替 M2 那条一直没过的验收**。
+> **位置**：本页在 **`docs/rewrite/`**（新路径文档文件夹，索引见同目录 `README.zh-CN.md`；工具清单见 `TOOLS.zh-CN.md`，
+> 新会话提示词见 `NEWSESSION.zh-CN.md`）。文中提到的 `ANDROID_PLAN` / `ANDROID_PROGRESS` / `CROSS_MACHINE` 等
+> **旧路径文档都在上一级目录** `docs/` 下。
 
 ---
 

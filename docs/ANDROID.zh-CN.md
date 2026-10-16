@@ -12,7 +12,7 @@ English: [ANDROID.md](ANDROID.md)
 > 宿主复用 ≈95% 是实测的（§一·探路 A）；但图形层的三条地基假设——「指针即缓冲」「CPU 写完 GPU 即可见」
 > 「Metal 的小提交节奏可以逐个 op 平移」——在 Vulkan 上**都没有对应物**，真机读数（M2 未验收的"目标全零"、
 > M3 每轮约 10 秒的 GPU/GMU 停摆、设备丢失、第二台撞"内存换轨"与 AHB 内核 panic）是**同一个地基在五个位置
-> 上的开裂**，不是五个待排的 bug。取代它的那一套见 **[ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md)**
+> 上的开裂**，不是五个待排的 bug。取代它的那一套见 **[rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)**
 > （安卓图形层改为 Vulkan 原生的显式实现：影子内存 + 分块后备资源 + 显式屏障 + 帧批提交）。
 > 本节以下原文保留，作为立项时的口径留档。
 
@@ -137,7 +137,7 @@ Switch 原版着色器包
    > 铺成 Vulkan 内存，**Mali-G610 连这条路都没有**（第二台启动即停在内存换轨）；AHB 这个替身在 Mali 上
    > **原子访问（`LDADDAL`）当场 SIGBUS、并把内核带 panic 重启三次**；4 GB 池带 `STORAGE_BUFFER` 还建不出来。
    > ⇒ 结论改为：**零拷贝不成立为地基，只能当快路**；正确性路径必须是"普通内存 + 显式搬运"。
-   > 详见 [ANDROID_REWRITE.zh-CN.md](ANDROID_REWRITE.zh-CN.md) 第二节。
+   > 详见 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md) 第二节。
 2. **TBDR / 渲染通道优化**。`nvn_mtl.m` 里有大量针对 Metal 的通道合并、附件读入写回优化。Vulkan 有 render pass / subpass，但 Mali（TBR）与 Adreno（TBDR）的架构差异要求重做这部分逻辑，且性能调优要重来一遍。
 3. **页大小与对齐**。Metal 侧按 16 KiB 页对齐内存池；安卓常见 4 KiB / 16 KiB 混用，需要调整并核对。
 4. **可执行内存与 W^X**。iOS 不允许运行时写可执行代码，所以现方案把改写产物作为内嵌汇编编进 App；安卓反而更宽松（可 `mmap PROT_EXEC`），但 Android 10+ 有 W^X 限制，需要按版本处理。
