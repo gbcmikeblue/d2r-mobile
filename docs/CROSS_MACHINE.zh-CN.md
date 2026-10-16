@@ -223,39 +223,60 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
 > **这一节会过期。** 记于 2026-10-15（M3-3c 的内容基线 `ed900fb`；前几轮「M3-3b」/「M3-3a」/「M3-2z」）；
-> **最新提交**：`b966494`（2026-10-16，**新路径的第二个里程碑 N1**：影子内存 + 分块后备资源 + 地址反查 ——
-> `dm/android/vk2/vk2_pool.c/.h` + 自证探针 `vk2_pool_probe.c`，第一台**四轮 29 个字段逐轮一致**，
-> **G3 成立**（4 GB 池按块建成 5 块、每块头尾真写并回读逐字节一致、`g_pool_small` 与 `g_pool_no_region` 都为 0）、
-> `DM_GFX2` 缺省关且可读自证；**只让新池模块可用，不接管回放层**；
-> 其前 `0af1312` / `f7d5f24` = **纯文档，口径变更**：**第二台设备不使用** ⇒ 只用第一台、
-> **N5 暂缓 / G5 留档待验**；再前 `945f7d7` = **新路径的第一个里程碑 N0**：常数标定 —— 新探针
-> `dm/android/vk2/vk2_probe.c`（只问不接管）+ 第一台四轮真机读数，§9.9 四个常数全部落地
-> （块大小 960 MB / 脏位图 4 KiB 起步 / `VK2_INFLIGHT` 3 起步 / 暂存环 16 MiB 起步）、
-> `4780b9a` = **新路径文档独立成 `docs/rewrite/`**（设计正本移入该文件夹，新增索引 `README.zh-CN.md`、
-> 工具与仪器清单 `TOOLS.zh-CN.md`、新会话提示词 `NEWSESSION.zh-CN.md`）、`3113763` = README 与
-> `ANDROID.zh-CN.md` 改口径、`9a74398` = 里程碑 **N0~N6**（`ANDROID_REWRITE` §十一））
+> **最新提交**：`04b4dbf`（2026-10-16，**新路径的第三个里程碑 N2**：脏记账 + 上传/回读窗口 + 显式屏障 ——
+> `dm/android/vk2/vk2_dirty.c/.h` + `vk2_xfer.c/.h` + 自证探针 `vk2_xfer_probe.c`，第一台**四轮**
+> （**判据字段逐轮完全一致**，时间字段报区间）：**G1 成立**（4/4 档往返闭环逐字节等于**独立重算**的期望）、
+> **G2 成立**（不等待读 = 旧值 / **等完栅栏仍不回读 = 还是旧值** / 回读之后 = 新值）、脏位图与朴素模型
+> **逐位一致**、`vkQueueWaitIdle` 计数 **0**；**仍只让新模块可用，不接管回放层**；
+> 其前 `b966494` = **N1**（影子 + 分块后备 + 地址反查：`vk2_pool.c/.h` + `vk2_pool_probe.c`，四轮 29 个字段
+> 一致，**G3 成立**、`DM_GFX2` 缺省关且可读自证）、
+> `0af1312` / `f7d5f24` = **纯文档，口径变更**：**第二台设备不使用** ⇒ 只用第一台、**N5 暂缓 / G5 留档待验**；
+> `945f7d7` = **新路径的第一个里程碑 N0**：常数标定 —— 新探针 `dm/android/vk2/vk2_probe.c`（只问不接管）
+> + 第一台四轮真机读数，§9.9 四个常数全部落地（块大小 960 MB / 脏位图 4 KiB 起步 / `VK2_INFLIGHT` 3 起步 /
+> 暂存环 16 MiB 起步）、`4780b9a` = **新路径文档独立成 `docs/rewrite/`**（设计正本移入该文件夹，新增索引
+> `README.zh-CN.md`、工具与仪器清单 `TOOLS.zh-CN.md`、新会话提示词 `NEWSESSION.zh-CN.md`）、
+> `3113763` = README 与 `ANDROID.zh-CN.md` 改口径、`9a74398` = 里程碑 **N0~N6**（`ANDROID_REWRITE` §十一））
 > —— 新机器从这之后接手，恢复步骤照第三节；
 > 进度细节与结论以 [ANDROID_PLAN.zh-CN.md](ANDROID_PLAN.zh-CN.md) 的「七、下一步」与「八、进度记录」为准。
 > **★ 新路径的入口（开新会话从这里进）**：先看 [rewrite/README.zh-CN.md](rewrite/README.zh-CN.md)（那个文件夹的索引），
 > 开新会话时把 [rewrite/NEWSESSION.zh-CN.md](rewrite/NEWSESSION.zh-CN.md) 里的提示词**整段复制**过去即可；
 > 开工前照 [rewrite/TOOLS.zh-CN.md](rewrite/TOOLS.zh-CN.md) 的清单一一点。
 > **★ 现在的方向**：按 [rewrite/ANDROID_REWRITE.zh-CN.md](rewrite/ANDROID_REWRITE.zh-CN.md)（「七、下一步」第 0 条，架构口径变更）
-> 的**里程碑 N0~N6** 走 —— **N0（常数标定，`945f7d7`）与 N1（影子 + 分块后备 + 地址反查，`b966494`）都已完成**
-> （都在 2026-10-16，都在第一台）：N0 把 §9.9 的四个待实测常数量成真机读数
-> （**块大小 960 MB / 脏位图粒度 4 KiB 起步 / `VK2_INFLIGHT` 3 起步 / 暂存环 16 MiB 起步**，只问不接管）；
-> N1 把 `vk2_pool.c/.h` 落地并让 **G3 成立**（4 GB 池按块建成 5 块、全功能后备、两个降级计数器为 0）
-> —— 读数 `.work/logs/probe-8b1f1e50-vk2_probe.txt` 与 `…-vk2_pool_probe.txt`；
-> 之后 N2 脏记账 + 上传/回读窗口 + 屏障（判据 G1/G2）→ N3 帧批提交 + 有界在飞（G4）→
+> 的**里程碑 N0~N6** 走 —— **N0（常数标定，`945f7d7`）、N1（影子 + 分块后备 + 地址反查，`b966494`）与
+> N2（脏记账 + 上传/回读窗口 + 显式屏障，`04b4dbf`）都已完成**（都在 2026-10-16，都在第一台）：
+> N0 把 §9.9 的四个待实测常数量成真机读数（**块大小 960 MB / 脏位图粒度 4 KiB 起步 / `VK2_INFLIGHT` 3 起步 /
+> 暂存环 16 MiB 起步**，只问不接管）；N1 让 **G3 成立**（4 GB 池按块建成 5 块、全功能后备、两个降级计数器为 0）；
+> N2 让 **G1/G2 成立**（往返闭环逐字节正确；**可见性是"回读"这一步显式建立起来的**：
+> 不等待读 = 旧值、等完栅栏仍不回读 = 还是旧值、回读之后 = 新值）——
+> 读数 `.work/logs/probe-8b1f1e50-vk2_probe.txt` / `…-vk2_pool_probe.txt` / `…-vk2_xfer_probe.txt`；
+> 之后 N3 帧批提交 + 有界在飞 + `vkQueueWaitIdle` 归零（判据 G4）→
 > **N4 接管回放层出画面（顶替 M2 的验收）** → N5 两台设备都过（**暂缓**）→ N6 旧路退场。
 > 每块判据是 **G1~G5**，每块照"自证探针 → 读数落盘 → 再接管"三件套；旧路全留（`DM_GFX2` 缺省关）。
-> **N0~N4 都在第一台上做**；**2026-10-16 口径变更：第二台不使用** ⇒ **N2~N6 全在第一台上做、N5 暂缓**
+> **N0~N4 都在第一台上做**；**2026-10-16 口径变更：第二台不使用** ⇒ **N3~N6 全在第一台上做、N5 暂缓**
 > （G5 暂不作为当前验收，替代口径见 `rewrite/ANDROID_REWRITE.zh-CN.md` §六）。
 > **⚠ 上机前先读**：CROSS_MACHINE 第五节「第二台」那几条（logs 目录属主坑 / **AHB 线已暂停且会让内核 panic** /
 > USB 掉线≠重启），以及 ANDROID_PLAN「M3-3e」第九节（暂停的现状与重开条件）与「M3-3f」（仪器坑）。
 
 ### 现在停在哪
 
-- **★ 最新一轮（「N1」，2026-10-16，提交 `b966494`）停在**：**新路径的第二个里程碑 N1 = 影子内存 + 分块后备资源 +
+- **★ 最新一轮（「N2」，2026-10-16，提交 `04b4dbf`）停在**：**新路径的第三个里程碑 N2 = 脏记账 + 上传/回读窗口 +
+  显式屏障，已完成 ⇒ 可见性第一次被真机读数建立起来**。新文件 `dm/android/vk2/vk2_dirty.c/.h`（区间级三态脏记账：
+  CPU/GPU 各一张 1 bit 位图、4 KiB 起步 ⇒ 4 GB 池 262144 字节；连续脏页并成 run；**半页竞态只报计数**）+
+  `vk2_xfer.c/.h`（上传窗口：逐 run 影子 → **暂存环 16 MiB** → `vkCmdCopyBuffer` → **每个 run 后一条屏障** →
+  置 CLEAN；回读窗口：**等定向栅栏** → 拷回 → memcpy，**一处 `vkQueueWaitIdle` 都没有**，而且它在这个编译单元
+  里被**宏成"计数 + 报红"**）+ 自证探针 `vk2_xfer_probe.c`。第一台**四轮**、**判据字段逐轮完全一致**：
+  **G1 成立**（4/4 档往返闭环逐字节等于**独立重算**的期望：64 KiB / 1 MiB / **16 MiB 正好填满暂存环** /
+  **跨块 959.5 MiB 起 1 MiB ⇒ 拆 2 条拷贝 + 2 条屏障**）；**G2 成立**（(a) 提交后**不等待**读影子 = 65536/65536
+  **仍是旧值**、(b) **等栅栏成功后仍不回读** = 还是旧值、(c) `vk2_readback` = **新值**；(d) 没指定要等谁 ⇒
+  拒绝回读、(e) 等永不 signal 的栅栏 ⇒ 5.0 秒超时**如实报失败**）；脏位图与朴素模型**逐位一致**
+  （1048576 页 × 20000 次随机记账）+ run 摊回页集合一致；扫描 空池 21~47 µs / 稀疏 1% 1051~1674 µs、
+  10313 条 run / 全脏 1593~1782 µs、**1 条 run**；机制读数：512 MB 真搬 = **32 个窗口 127~153 ms
+  （3.3~4.0 MB/ms）**、贴图单段 = 1 条 run、拆 64 处 = 64 条 run；`vkQueueWaitIdle` 计数 **0**。
+  **本块仍只是"让新模块可用"**（回放层三处一行未动、没写 `vk2_sub`、**没跑游戏轮**）；N1 的探针在 N2 代码上
+  重跑一轮（`…-n2regress.txt`）**全部键值不变**。读数 `.work/logs/probe-8b1f1e50-vk2_xfer_probe.txt`
+  （前三轮 `…-r1/-r2/-r3.txt` 留档），结论与"探针自己的两个 bug"见 `ANDROID_PLAN` §八·N2。
+  **下一步 = N3**（帧批提交 + 有界在飞 + `vkQueueWaitIdle` 归零，判据 **G4**）。
+- **上一轮（「N1」，2026-10-16，提交 `b966494`）停在**：**新路径的第二个里程碑 N1 = 影子内存 + 分块后备资源 +
   地址反查，已完成**。新文件 `dm/android/vk2/vk2_pool.c/.h`（**客体池永远是普通内存**、GPU 用**另一份**按块切分的
   `DEVICE_LOCAL` 后备资源；块大小 **960 MB** = N0 的读数写成代码常量，块数按池大小算，4 GB ⇒ 5 块）+
   自证探针 `dm/android/vk2/vk2_pool_probe.c`（六问一答，接进 `dm/android/CMakeLists.txt` 与 `.work/probes.py` 的
@@ -495,8 +516,8 @@ PC 侧的路径与工具见第二、三节；这里只说**跑一次并拿到读
 | `.work/ab_run.py` | 跑 N 轮并判类：推 conf → `am force-stop` → `am start` → 等 N 秒 → 拉 `latest.log` → 出"出图 / op 每帧 / >1 秒长等 / `-4` 条数"并判成**健康 / 停顿型 / 设备丢失型 / 崩溃轮 / 启动受阻**；读数追加 `.work/logs/ab-readings.tsv`，逐轮日志 `.work/logs/ab-<tag>-<运行编号>-r<N>.log` |
 | `.work/ab-clean.conf` | **最干净的臂**：`DM_WIN_SRC=0`（查看器**显式**关）+ 不写扫描 / HUD / 看门狗 + `DM_TG_SERIES=0`。两台共用同一份 |
 | `.work/mkapk.py` | 出包（经 `.work/build_u8.cmd` 打 `chcp 65001`）+ 装机（先试设备端 `pm install -r`，MIUI 那个坑） |
-| `.work/probes.py` | 编 / 推 / 跑能力探针（`build` / `push` / `run`，带 `--env` / `--tag` / `--serial`；`ALL` 里有 `vk_probe` / `vk_hostmem_probe` / `vk_fdmap_probe` / `vk_region_probe` / `vk_ahb_probe` / `vk_shader_probe` / `vk_pipe_probe` / `t_digest` / **`vk2_probe`** / **`vk2_pool_probe`**）。**2026-10-16（N1）在本机重建过**：`.work` 不进仓库，换机器就缺；读数落 `.work/logs/probe-<串号>-<探针名>[-tag].txt` |
-| `.work/vk2_pool_rounds.py` | **N1 起**：把 `vk2_pool_probe` 跑 N 轮（第 1~N−1 轮带 tag 留档、**最后一轮不带 tag = 正式读数**）并打一张"字段 × 轮次"的对照表 ⇒ 一眼看出哪个字段轮间不一致（N1 四轮 29 个字段全一致） |
+| `.work/probes.py` | 编 / 推 / 跑能力探针（`build` / `push` / `run`，带 `--env` / `--tag` / `--serial`；`ALL` 里有 `vk_probe` / `vk_hostmem_probe` / `vk_fdmap_probe` / `vk_region_probe` / `vk_ahb_probe` / `vk_shader_probe` / `vk_pipe_probe` / `t_digest` / **`vk2_probe`** / **`vk2_pool_probe`** / **`vk2_xfer_probe`**）。**2026-10-16（N1）在本机重建过**：`.work` 不进仓库，换机器就缺；读数落 `.work/logs/probe-<串号>-<探针名>[-tag].txt` |
+| `.work/vk2_pool_rounds.py` | **N1 起**：把某个探针跑 N 轮（第 1~N−1 轮带 tag 留档、**最后一轮不带 tag = 正式读数**）并打一张"字段 × 轮次"的对照表 ⇒ 一眼看出哪个字段轮间不一致（N1 四轮 29 个字段全一致；N2 判据字段全一致、只有六个时间字段抖动）。**N2 起带 `--probe` 参数**：`--probe vk2_xfer_probe` |
 | `.work/push_dev2.py` | 把设备侧数据推齐（逐文件 + 跳过已存在 + 重试；`spv` 走 tar） |
 | `.work/bg.py` | 把长任务放后台并把输出落盘（前台一条命令会堵住整个回合） |
 
