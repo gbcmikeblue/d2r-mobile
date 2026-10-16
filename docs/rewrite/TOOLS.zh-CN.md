@@ -73,7 +73,7 @@
 |---|---|---|
 | 主机 / 工具链 | NDK 30.0.16248370、CMake 3.31.6、`android-31` / `arm64-v8a`、JDK 21 | 不变 |
 | 第一台真机 | Redmi K90（`8b1f1e50`，Adreno 830，Vulkan 1.3.284） | 插好；`adb devices -l` 能看到；用 `.work/uptime.py` 确认没重启过 |
-| 第二台真机 | Redmi `pearl`（`VC9TGM45MNJB8TSG`，Mali-G610 MC6，Vulkan 1.1.177） | **保持暂停到 N5**；重开条件见 `ANDROID_PLAN`「M3-3e」第九节（人在设备旁 + 明确同意） |
+| 第二台真机 | Redmi `pearl`（`VC9TGM45MNJB8TSG`，Mali-G610 MC6，Vulkan 1.1.177） | **不使用**（2026-10-16 口径变更：新路径只用第一台 ⇒ **N1~N6 全在第一台上做、N5 暂缓**）；真要重开见 `ANDROID_PLAN`「M3-3e」第九节（人在设备旁 + 明确同意 + 从最小尺寸起步） |
 | `trace_processor`（读 `.work/trace/stall.pftrace`） | **仍缺**：工作区没有 `.work/trace/`，也没有能跑它的机器 | 不阻塞新路径；要用先确认机器 |
 | Vulkan Validation Layers（真机） | **仍缺**：NDK 里没有 `libVkLayer_khronos_validation.so`（arm64） | 新地基判据不依赖它；要做先说明（需联网取） |
 | 设备侧数据 | RomFS / SPIR-V / 改写产物已在两台 `/data/local/tmp/dm/` | 不变；新地基不动它们 |
