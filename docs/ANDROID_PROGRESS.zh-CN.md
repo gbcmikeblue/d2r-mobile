@@ -9,8 +9,8 @@
 > `docs/CROSS_MACHINE.zh-CN.md` §7（交接现状）、`.work/recon/handoff.md`（本机事实与取证数据）。
 > 凡本页与上述文档冲突处，已在 §13「口径提醒」中标出。
 >
-> **基线**：分支 `android`，HEAD `0da66c0`（2026-10-16，「M3-3e」：装机已验证 + AHB 支路两台成立并落地、
-> 支路默认关闸；其前 `d16de56` = M3-3d 收尾、`8c497b8` = M3-3d、`04ea8e8` = 规则 + 文档口径）。
+> **基线**：分支 `android`，HEAD `afd7500`（2026-10-16，「M3-3e」续：分级复量把触发点收窄到"客体在 AHB 堆上的
+> 原子操作"、第二台的 AHB 线暂停；其前 `0da66c0` = M3-3e、`e5468fc` = M3-3e 收尾、`d16de56` = M3-3d 收尾）。
 > **自本提交起，Windows 上一切命令走项目内的 `.venv` Python**（规则 `.codebuddy/rules/windows-python-only/RULE.mdc`，alwaysApply）。
 > 主线 `main` 是不含安卓的 iOS / macOS 版本。
 
@@ -457,17 +457,18 @@ iCloud→Drive/自建；mach `vm_*`→`/proc/self/maps`、`__builtin___clear_cac
 | 已知潜伏缺陷 | 安卓 `crash.c` 的 `is_write` 恒为 0，而脏页跟踪的缺页钩子先看这一位 ⇒ 被写保护的池页一旦被写会走崩溃路径（现场诊断已能读出出错指令编码，可正确判读） |
 | M1 欠账 | MD5/SHA1/SHA256 占位、mach-o 段查找恒"找不到"、SIGSEGV ESR 读写位缺失、构建暂时 `-w` |
 | 只验过一台设备 | 已在推进（M3-3d / M3-3e）：第二台 = MT6896 / **Mali-G610 MC6** / Android 15；但**卡点 B 的对照读数仍缺** —— 第二台目前被下一行那条挡着 |
-| **第二台的 AHB 支路会让内核 panic 重启** | M3-3e 实测**三次**（`persist.sys.boot.reason.history`：kernel_panic 启动于 10:45:49 / 10:46:38 / 10:47:49，对上"冒烟跑完"与紧随的两次 app 启动）。同一台上**只做 3968 MB 的 AHB 分配**那几轮一直没事 ⇒ 触发点在"把 ~4 GB 铺成客体堆之后"。内核日志拿不到（无 root、`dmesg` 被 `klogctl` 拒、`/sys/fs/pstore` 与 `/data/system/dropbox` 读不了）⇒ AHB 支路**默认关**（`DM_REGION_AHB=1` 才走，`DM_REGION_AHB_MAX=<MB>` 给单次上限），下一刀是**分级复量**（每一步都要人在场，可能再重启那台设备） |
+| **第二台的 AHB 支路会让内核 panic 重启** | M3-3e 实测**五次**（`persist.sys.boot.reason.history`：kernel_panic 启动于 10:45:49 / 10:46:38 / 10:47:49，下午分级复量又两次）。分级复量把触发点收窄到"**客体在这块内存上做的第一件事**"：分配 / 取 fd / mmap / 导入 / 撤销都安全（dryrun），宿主**逐页写 + `memset`（含 `DC ZVA`）+ 读回**也安全，"CPU 访问大内存"与 `SetHeapSize` 的 `mprotect` 两条假设都被否；而**原子/独占访问**（`LDADDAL`）当场把宿主进程打成 `SIGBUS` ⇒ 这块 **GPU-only 用法位**的 AHB 映射**没有原子语义**，**AHB 支路不能用来铺客体堆**（客体一拿到堆就要用互斥/引用计数）。内核日志拿不到（无 root、`dmesg` 被 `klogctl` 拒、pstore 与 dropbox 读不了）⇒ AHB 支路**默认关**（`DM_REGION_AHB=1` 才走），**第二台的 AHB 线已暂停**（2026-10-16 用户决定，主线回第一台） |
 
 ---
 
 ## 11. 下一步（按优先级，2026-10-15/16 口径）
 
-1. ★ **分级复量第二台"重启的尺寸门槛"**（2026-10-16「M3-3e」新加，**最高优先级**）——
-   用 `DM_REGION_AHB=1 DM_REGION_AHB_MAX=<MB>` 从 256 → 1024 → 2048 → 3968 MB 一档一档试，把
-   ①"重启的尺寸门槛"②"是**分配**、**mmap** 还是**客体开始用**这一步"分开。每一步之间用 `.work/uptime.py`
-   复核有没有重启；**每一步都要人在场**（可能再重启那台设备）。若确认是"客体一写就崩"，下一问就是
-   MTK 的 gralloc/ion 堆是不是**不可 CPU 访问**。
+1. ★ **主线回到第一台（Adreno）**（2026-10-16「M3-3e」第九节，**口径变更**）—— 第二台的 AHB 线**暂停**：
+   分级复量**已做完**（读数与结论见 ANDROID_PLAN「M3-3e」第八节）：分配 / mmap / 导入 / 撤销都安全、
+   宿主逐页写与 `memset`（含 `DC ZVA`）都安全、`SetHeapSize` 的 `mprotect` 被否掉，而**原子/独占访问**
+   （`LDADDAL`）当场把宿主进程打成 `SIGBUS` ⇒ **这块 GPU-only 的 AHB 内存没有原子语义，AHB 支路不能铺客体堆**。
+   每试一档可能让那台设备重启一次（累计 5 次），用户决定**停**；第二台放着不动是安全的（装的是关闸的包）。
+   ⇒ 下一步按下面第 2 / 3 / 4 条在第**一台**上推进（Validation Layers、`trace_processor`、两支 A/B 臂）。
 1b. ~~**换设备 / 换驱动**跑同一套 A/B 配方~~ —— **2026-10-16「M3-3d」做了，但读数没拿到**：第二台（**Mali**）先后被
    ① MIUI 的"通过 USB 安装"未开（人工）、② 零拷贝内存池那条路在 Mali 上不存在（设计）挡住。
    ⇒ **「M3-3e」把 ⓪ ①-a 都做完了**：**⓪ 装机已验证**（`pm install -r` → `Success`，sha 一致；其后两轮 APK 判定
