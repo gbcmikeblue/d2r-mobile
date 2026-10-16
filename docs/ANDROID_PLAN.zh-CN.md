@@ -678,6 +678,16 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
    —— 客体每帧的 `vkQueueSubmit` 也会先看见）；② **"不写 `DM_WIN_SRC` ≠ 关查看器（缺省 28）"**，干净臂必须显式 `DM_WIN_SRC=0`。
    第一台干净臂 12 轮：**健康 1 / 停顿型 7 / 设备丢失型 2 / 崩溃 2**（健康那一轮 1154 帧 / 70 秒、op/帧 1276.5、零长等；
    生病轮 op/帧 96~107、每轮 2~4 条 10.1~11.8 秒长等）。细节见「M3-3d」。
+   ⇒ **「M3-3e」把第 0 步（装机）与 AHB 候选路都做了**（2026-10-16）：装机 `pm install -r` → `Success`
+   （第二条遮挡解除，`ab-run` 判类器修好后两轮都是**启动受阻**）；`AHardwareBuffer` 支路在**两台**上都成立
+   （第一台也跑通当对照），第二台冒烟**第一次越过内存换轨**（堆 3968 + 别名区 512 MB）并跑到 `SetHeapSize 3728 MB`
+   —— **但随后第二台内核 panic 重启了三次**（10:45:49 / 10:46:38 / 10:47:49，`persist.sys.boot.reason.history`）。
+   触发点已收窄到"把 ~4 GB 的 AHB 铺成客体堆之后"（同一台上**只做 3968 MB 分配**那几轮一直没事）；
+   内核日志拿不到（无 root / `dmesg` 被拒 / pstore 与 dropbox 读不了）⇒ 只能分级复量。
+   ⇒ 支路**已默认关闸**（`DM_REGION_AHB=1` 才走，`DM_REGION_AHB_MAX=<MB>` 给单次上限），第二台已装带闸的包、
+   复核未再重启；**卡点 B 的第二台对照仍缺**（这次不是"够不到"，是"不敢跑"）。细节见「M3-3e」。
+   **★ 下一步先做这一件**：用 `DM_REGION_AHB_MAX` 分级复量（256 → 1024 → 2048 → 3968 MB），把"重启的尺寸门槛"
+   与"分配 / mmap / 客体使用"三者分开 —— **每一步都要人在场**（可能再重启那台设备）。
 3. ~~**「九」第 2 项 `HOST_CACHED`**~~ —— **已取证、已否掉（2026-10-15，「M3-2q」）**：类型 6 上导出 fd / `mmap`
    到指定地址 / 双向都**能**（256 MB、512 MB、3968 MB 都过了），但同机 A/B 里 **CPU 时间没有可测差异**（同峰配对
    <3%，轮间波动 ±100%），而用它要**越过缓冲声明的可用类型位**（外部缓冲 `0x13` 里没有类型 6，属规范外用法），
@@ -2438,6 +2448,137 @@ on-CPU 6.7 秒 / 10.4 秒），所以当**量级**读，不当精确数。
    - ④ 第一台上仍可做的两支：`DM_UP_NOSUB`（上传不提交、只解排布，破坏性取证）与"GPU 保活"（**只当 A/B 臂，不得当修复**）。
 4. 第二台的数据侧**已经备齐**（9.1 GB + 存档 + 4 个探针在设备上），一旦"通过 USB 安装"打开、且内存路线有了，
    它就能立刻用**同一份 `ab-clean.conf` + 同一个 `ab_run.py`** 跑出可比的读数 —— 这一轮把"尺子"本身搭好了。
+
+### M3-3e：AHB 支路**走通了第二台**，然后把它**搞重启了三次**（内核 panic）—— 支路已默认关闸（2026-10-16，第二台 + 第一台对照）
+
+一句话：**「M3-3d」的两条遮挡都拆了** —— 装机成功；同源的 `AHardwareBuffer` 支路在**两台**上都验证成立，第二台的
+`dmhost` 冒烟**第一次越过了内存换轨**（堆 3968 MB + 别名区 512 MB，跑到 `SetHeapSize 3728 MB`）。**但代价是**：
+在随后那两分钟里第二台**内核 panic 重启了三次**（`persist.sys.boot.reason.history` 连记三条 `kernel_panic`）
+⇒ AHB 支路**已改成显式开关、默认关**（`DM_REGION_AHB=1` 才走），第二台已装上带闸的包，风险解除。
+**卡点 B 的第二台对照读数仍然没有**（这次不是"够不到"，是"不敢跑"）。
+
+**一、第 0 步：把「装机」这条钉死（顺带修两处仪器）**
+
+- 装机：`pm install -r /data/local/tmp/dm.apk` → **`Success`**，装后 sha256 与本地一致
+  （`.work/logs/dev2-wait-install.txt`）。**「M3-3d」第二条遮挡（MIUI 拒绝装包）确认解除。**
+- **仪器坑 ①（会让判类静默变错）**：app 的日志目录 `logs` 是早先用 **shell** 推数据时建的
+  （属主 `shell`、组 `ext_data_rw`、0770），app（u0_a237）**打不开** `latest.log`（errno 13：
+  `开不了日志文件 .../logs/latest.log`）⇒ `ab_run.py` 拉到的路径是空的，**判成"崩溃轮"**（0 心跳、全零）。
+  处置：只把那个 `logs` 目录**改名**（`mv logs logs.shellown-20261016`，可逆，不是删除）让 app 自己 `mkdir`
+  ⇒ 属主变成 app，日志落到标准路径（`latest.log` 5466 字节）。`.work/push_dev2.py` 里那两条 `mkdir ... logs`
+  也去掉了（并在原处写了原因）。
+- **仪器坑 ②（判类优先级）**：`ab_run.py` 原来是 `if crash or hb <= 1: 崩溃轮`，**抢在 `overlay_fail` 前面** ——
+  第二台那种"`nnosInitialize` 之后 0.4 秒就死、只留 1 条心跳"的轮被它判成"崩溃轮"，把"内存换轨失败"这条
+  **有据可查的原因**盖掉了。已改成 `CRASH 签名 → 启动受阻（内存换轨【红】/越出 alias 区）→ 心跳太少`。
+- 修好后两轮读数（`.work/logs/ab-dev2-1016-*.log`，`ab-readings.tsv` 已追加）：**判定 启动受阻 ×2** ——
+  `建载体缓冲失败（256 MB）` → 堆/别名区各 0 MB → `SVC 0x2c 越出 alias 区` → `Break#1 reason=0 Result=0xd401`。
+  ⇒ **APK 这条路上也被同一处挡住**，与「M3-3d」的 `dmhost` 冒烟一致（这一步的目的达成）。
+- 顺带记三条设备侧事实（第二台）：app **能读** `/data/local/tmp/dm/{patched,spv,romfs}`；app 可写区**能写、能建目录**；
+  「所有文件访问」**未授予**（第一台是授予的，所以第一台能建 `/sdcard/d2rm`）；**存档与临时两台上都走内部目录**
+  （`/data/user/0/ai.d2rm.dm/files/save`）⇒ 推在外部队列里的那 10 个存档文件两台上都不被 app 读，不是第二台独有的差异。
+
+**二、AHB 探针（`dm/android/vk/vk_ahb_probe.c`，接进 `.work/probes.py`）—— 两台逐项读数**
+
+读数：`.work/logs/probe-<串号>-vk_ahb_probe*.txt`（默认、`-ahb-gpuonly`、`-ahb-cpuonly`、`-ladder512*`、`-ladder3968-gpuonly`）。
+入口新增两个开关（`.work/probes.py --env / --tag / --serial`），读数文件名带 tag、**不覆盖**旧读数。
+
+| 项 | 第一台 Adreno 830 | 第二台 Mali-G610 MC6 |
+|---|---|---|
+| AHB 扩展 / 句柄能力 | 有；`VkPhysicalDeviceExternalBufferInfo(AHB)` = **EXPORTABLE\|IMPORTABLE**，compatible `0x400` | 同左（**两台都报可导出可导入**） |
+| `AHardwareBuffer_isSupported` | `CPU\|CPU\|GPU_DATA_BUFFER`=1、`CPU\|CPU\|GPU_SAMPLED_IMAGE`=**0**、只 CPU=1 | 同左 |
+| AHB 尺寸阶梯（只分配+describe+释放） | 1/64/256 MB 成；**512 MB 失败（rc=-129），单独跑（新进程）也失败** ⇒ 上限在 256~512 MB 之间 | 1/64/256 MB 成；**3968 MB 成、4096 MB 失败（rc=-22）** |
+| 取 fd（`dlsym("AHardwareBuffer_getNativeHandle")`） | 可用；numFds=**2**，fd[0]=fd[1]=`/dmabuf:AHardwareBuffer` | 可用；numFds=**3**，**fd[0]=`anon_inode:gralloc_extra`（mmap 它 = EACCES）**、fd[1]=`/dmabuf:Gralloc`、fd[2]=ashmem |
+| `mmap(MAP_FIXED)` 到指定地址（64 MB） | **落在指定地址** | **落在指定地址**（用 fd[1]） |
+| `vkGetAndroidHardwareBufferPropertiesANDROID` | allocationSize 64 MB、memoryTypeBits **0x12**（类型 1、4） | 同尺寸、memoryTypeBits **0x2**（类型 1 = `DEVICE_LOCAL\|HOST_VISIBLE\|HOST_CACHED`） |
+| 导入 AHB 当 VkDeviceMemory | **不带** `VkMemoryDedicatedAllocateInfo` 就 `VK_SUCCESS` | 同左 |
+| 池子用法：同一份内存上按偏移绑多块缓冲 | 外部缓冲偏移 0 / 1 MB 都 `VK_SUCCESS`；**普通缓冲（池子的真实形态）偏移 2 MB 也 `VK_SUCCESS`** | 同左（普通缓冲可用类型位 `0x3`，含 AHB 那型） |
+| 双向（客体 ↔ GPU），裸映射 | 带/不带 CPU 位都**全通** | **带 CPU_\* 位（`0x1000033` 与 `0x33`，两次）两个方向都不通；只留 `GPU_DATA_BUFFER`（`0x1000000`）两个方向都通** |
+| 探针结论行 | `⇒ AHB 支路在本设备上成立` | `⇒ AHB 支路在本设备上成立` |
+
+**四条口径**（都进了 `vk_region.c` 的注释，因为每条改了就会坏）：
+
+1. **AHB 的用法位只给 `GPU_DATA_BUFFER`、不带任何 `CPU_*` 位**。带 CPU 位时 Mali 的 gralloc 给的是**缓存**内存，
+   客体经 dma-buf 裸映射的直接读写与 GPU 侧**不一致**（实测两个方向都不通）；只留 GPU 位时两个方向都通。
+   这一条是"AHB 支路能不能用"的分水岭 —— 而它恰好与"这块内存要由客体直接读写"的直觉相反。
+2. **fd 要从句柄里挑 dmabuf 那一条**，不能看 `fd[0]`：第二台的 `fd[0]` 是 `gralloc_extra`（映射被拒 EACCES）。
+3. **导入不需要 dedicated 分配**（两台都接受不带 `VkMemoryDedicatedAllocateInfo` 的导入）。
+4. **单次上限两台差一个量级**（第一台 256~512 MB、第二台 ~3968 MB）⇒ 与甲案同样的"顶到上限就退一档、
+   并把报给客体的上限下调"逻辑照用。
+
+**三、支路落地（`dm/android/vk/vk_region.c`）与影响面**
+
+- 选路：分配**之前**用 `vkGetPhysicalDeviceExternalBufferProperties(OPAQUE_FD)` 问"可导出吗" —— 可导出走**甲案**；
+  不可导出（且 AHB 扩展在、开关开）走 **AHB 支路**；甲案**问得到却当场失败**时也退 AHB 再试一次。
+- 设备层（`vk_device.c`）：`want[]` 里加了 `VK_ANDROID_external_memory_android_hardware_buffer`（有则开）；
+  缺 `VK_KHR_external_memory_fd` 时的日志口改成"两条路"的口径（不再一律报红）。
+- **影响面：布局没变，所以三处老口径全都不用动** —— 两条路都是"Vulkan/AHB 出内存 → `mmap(MAP_FIXED)` 压回客体地址"：
+  - 客体地址空间仍由我们铺 ⇒ `dm_gpu_region_use` 的接口（"返回换成的字节数、调用方据此下调报给客体的大小"）不变；
+  - `vk_region_find`（按地址反查所在分配 + 偏移）不变 ⇒ 回放层"把池子里的地址变成 VkBuffer"那条路不变；
+  - `QueryMemory` / `GetInfo` 上报的整数不变（它们只认 `vk_region_overlay` 的返回值）。
+  - 唯一的实体差别：AHB 支路要**把 AHB 对象保活**（VkDeviceMemory 从它导入、客体的 mmap 也指着它的 dma-buf），
+    所以区域表多一个字段；甲案那个"载体缓冲 owner"在 AHB 支路里是 `VK_NULL_HANDLE`。
+- 新增依赖：`nativewindow`（`AHardwareBuffer_*` 所在的 NDK 公开库）以 **PUBLIC** 挂在 `dmhost_android` 上，
+  这样 `dmhost` 与 APK 里的 `libdm.so` 都拿得到符号。
+
+**四、第二台第一次越过内存换轨（`.work/logs/dev2-smoke.log`，10:45）**
+
+```
+[vk] 内存换轨选路：这台设备的**不透明 fd 不可导出**（甲案不成立）⇒ 走 AHB 支路
+【黄】堆 内存换轨（AHB）：只换成 3968 MB（要 4096 MB）——顶到单次上限，报给客体的上限已相应下调
+【绿】别名区 内存换轨（AHB）：512 MB 已是 GPU 直接可见（0x7bd7a85000，内存类型 1，AHB 对象已保活）
+>>> nninitStartup
+SetHeapSize：首次设堆成功 3728 MB（应用内存池 3797 MB − 映像 68 MB；此前被拒 34 次）
+```
+
+对比「M3-3d」的 `建载体缓冲失败（256 MB）` + `SVC 越出 alias 区` + `Break#1`：**那一步真的过去了**
+（这也是本轮唯一"移植面"的正面读数）。
+
+**五、⚠ 然后第二台内核 panic 重启了三次**
+
+`persist.sys.boot.reason.history` 里记的是**启动**时刻，三条 `kernel_panic`：
+
+| 时刻 | 事件 | 证据 |
+|---|---|---|
+| 10:45:27 | 第二台冒烟跑完（AHB 支路：堆 3968 + 别名区 512 MB，到 `SetHeapSize 3728 MB`） | `.work/logs/dev2-smoke.log` 时间戳 |
+| **10:45:49** | **重启 #1（kernel_panic）** | `persist.sys.boot.reason.history` |
+| 10:46:11 / 10:46:15 | 装包（sha 一致）后 app 被系统重启（pid 8793） | `.work/logs/dev2-applog-*`、app 的 `prev.log` |
+| **10:46:38** | **重启 #2（kernel_panic）** | 同上 |
+| ~10:47 | app 再次启动 | app 的 `latest.log` |
+| **10:47:49** | **重启 #3（kernel_panic）** | 同上 |
+| 10:47:41 起至今 | **未再重启** | `cat /proc/uptime`（关闸后冒烟 + 装包都复核过） |
+
+- **第一台没有重启**：`/proc/uptime` = **64.8 天**、`ro.boot.bootreason = reboot,update,system-update`（8 月的系统更新，
+  history 里两条都是老账）。它本会话里两次从 `adb devices` 消失是**USB 掉线**（CROSS_MACHINE §六 记过），不是重启。
+  ⇒ 改动对第一台的行为**没有变化**（它本来就满足甲案的条件，走的还是甲案）。
+- **收窄到"哪一步"**：10:42–10:44 那几轮**只做 3968 MB 的 AHB 分配**（探针尺寸阶梯，多轮）时设备一直在线上、
+  `adb devices` 一直看得见 ⇒ **"分配大块 AHB"本身不是触发点**；三次 panic 都落在"**把 ~4 GB 的 AHB 铺成客体堆之后**"
+  （冒烟与紧随其后的两次 app 启动都走了 AHB 支路）。究竟与那次 3968 MB 的**全尺寸 mmap** 有关、还是与
+  "**客体开始用那块内存**"有关，**还没有分离**。
+- **内核侧日志拿不到**：该机无 root、`dmesg` 被 `klogctl: Permission denied` 拒、`/sys/fs/pstore` 与
+  `/data/system/dropbox` 读不了、`/data/tombstones` 里只有 10-14 的旧条目 ⇒ 机制只能靠**分级复量**逼近（第七节）。
+  ⇒ 这台机上"内核为什么重启"这类问题，**现有权限够不着**，别在这上面设计取证。
+- **处置（已做）**：AHB 支路**默认关**，`DM_REGION_AHB=1` 才走；`DM_REGION_AHB_MAX=<MB>` 给单次分配上限
+  （分级复量用，允许压到 `MIN_USEFUL` 以下）。关掉后第二台回到"启动受阻" + `Break#1`：10:51 那轮冒烟日志是
+  `甲案不成立、AHB 支路可用，但它**缺省关**… ⇒ 这次不走内存换轨` → 堆/别名区各 0 MB → `SVC 越出 alias 区`
+  → `Break#1`，**且没有重启**（开机时长 1.4 → 4.2 分钟连续增长）；第二台已装上带闸的包
+  （sha256 `be77824057939e97`，装后与本地一致）。探针的默认阶梯也缩到 1/64/256 MB 并在文档头写了告警。
+
+**六、怎么重跑（别踩）**
+
+- 第二台上**任何**会让 app / `dmhost` 走 AHB 支路的动作，**先问人**（可能把那台设备重启）；
+- 分级复量一律 `DM_REGION_AHB=1 DM_REGION_AHB_MAX=<MB>` 从**小**往上（256 → 1024 → 2048 → 3968），
+  每步之间用 `.work/uptime.py` 复核有没有重启；
+- 探针要往 1 GB 以上问尺寸，也先问人（"分配"当时没事，但那是**还没被证伪**的，不是"已证实安全"）。
+
+**七、下一步（按分辨力）**
+
+1. **分离"分配 / mmap / 客体使用"三者**：探针侧能只分配 + mmap、不写（`DM_AHB_SIZE`）；冒烟那条是"客体一用"。
+   若确认"**客体一写就崩**" ⇒ 查 MTK 的 gralloc/ion 堆是不是"**不可 CPU 访问**"（第一台上 AHB 只有 256 MB 上限
+   也是同一方向的线索：大块 AHB 很可能落到另一个堆）。
+2. 若确认是尺寸/堆的问题：试"AHB 带 CPU 位 + 在必要处做 cache 维护"（第一台证明带 CPU 位能用），
+   或退**乙案**（让驱动选址）—— 乙案的影响面清单见「M3-3d」第六节第 ② 条。
+3. **卡点 B 的第二台对照仍缺**：只有在"AHB 支路能把堆铺起来、且不重启"之后才能补
+   （`.work/ab-clean.conf` + `.work/ab_run.py` 已两台共用，尺子现成）。
 
 ---
 

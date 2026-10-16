@@ -179,6 +179,26 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 成功后再跑 1~2 轮（预期判定 `启动受阻`）确认"APK 这条路上也被内存换轨挡住"。
 **注意**：装机≠卡点 B 能在第二台上量 —— 那要等零拷贝内存路线（AHB 支路）落地。
 
+**再更正（2026-10-16 晚些，已实测验证）**：**装机这条已经验证通过** —— `pm install -r /data/local/tmp/dm.apk`
+→ `Success`，装后 sha256 与本地一致（读数 `.work/logs/dev2-wait-install.txt`）；其后两轮 APK 的判定是
+**启动受阻**（`建载体缓冲失败（256 MB）` → 堆/别名区各 0 MB → `SVC 0x2c 越出 alias 区` → `Break#1`）。
+另外两条在这台上踩到的：
+
+- **app 的日志目录别用 shell 建**：`/sdcard/Android/data/ai.d2rm.dm/files/logs` 若由 `adb shell mkdir` 建出来
+  （属主 `shell`、组 `ext_data_rw`、0770），app **打不开** `latest.log`（errno 13：
+  `开不了日志文件 …/logs/latest.log`）⇒ `ab_run.py` 拉到的路径是空的，判类**静默变成"崩溃轮"**。
+  让 **app 自己建**（把旧目录 `mv` 掉即可，可逆；`.work/push_dev2.py` 里那两条 `mkdir … logs` 已去掉）。
+- **⚠ 这台设备会被我们的 AHB 支路搞成内核 panic 重启**：`persist.sys.boot.reason.history` 连记三条
+  `kernel_panic`（2026-10-16 的 10:45:49 / 10:46:38 / 10:47:49），时间对上"**把 ~4 GB 的 `AHardwareBuffer`
+  铺成客体堆之后**"（同一台上只做 3968 MB 的 AHB 分配那几轮一直没事）。该机**内核日志拿不到**
+  （无 root、`dmesg` 被 `klogctl` 拒、`/sys/fs/pstore` 与 `/data/system/dropbox` 读不了）。
+  AHB 支路**已默认关**（`DM_REGION_AHB=1` 才走；`DM_REGION_AHB_MAX=<MB>` 给单次分配上限），
+  细节与"分级复量"配方见 ANDROID_PLAN「M3-3e」。**在这台上跑任何会走那条路的动作之前先问用户**（可能重启设备）；
+  复核有没有重启用 `.work/uptime.py`（只读：开机时长 + `ro.boot.bootreason`）。
+- **USB 掉线 ≠ 重启**：本会话里第二台掉过一次、第一台掉过两次，而第一台的开机时长是 64.8 天、
+  bootreason 是 8 月的系统更新 ⇒ 那是 CROSS_MACHINE §六 记的 USB 掉线。**判"有没有重启"一律看 `/proc/uptime`
+  与 `ro.boot.bootreason`，别拿 `adb devices` 变空当证据**（重启与掉线在 adb 上长得一样）。
+
 ## 六、容易踩的几点
 
 - **git 身份**：这台机器没有配 `user.name` / `user.email`（提交时用 `-c` 临时传与历史一致的身份：`gbcmikeblue <1061589622@qq.com>`）。新电脑先把身份配好，否则 `git commit` 直接以 `Author identity unknown` 失败。

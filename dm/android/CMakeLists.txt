@@ -77,7 +77,12 @@ add_library(dmhost_android STATIC
   ${LIBDEFLATE}
   ${DM}/ios/Sources/dm_touch_controls.c)
 
-target_link_libraries(dmhost_android PUBLIC vulkan)
+# nativewindow 是 AHardwareBuffer_* 所在的库（NDK 的公开库）：内存换轨的 AHB 支路要它，见 vk_region.c。
+# PUBLIC 是必须的 —— 符号要用在最终可执行文件（dmhost 与 APK 里的 libdm.so）里，静态库自己不链接。
+# nativewindow hosts AHardwareBuffer_* (a public NDK library): the memory overlay's AHB route needs it, see
+# vk_region.c. PUBLIC is required -- the symbols are needed by the final binaries (dmhost and the APK's libdm.so)
+# and a static library does not link on its own.
+target_link_libraries(dmhost_android PUBLIC vulkan nativewindow)
 
 target_include_directories(dmhost_android PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
@@ -175,6 +180,22 @@ add_executable(vk_region_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_region_probe.c)
 target_link_libraries(vk_region_probe PRIVATE vulkan)
 target_link_options(vk_region_probe PRIVATE -Wl,-z,max-page-size=16384)
 target_include_directories(vk_region_probe PRIVATE ${COMPAT})
+
+# M2 的第五个能力探针（「M3-3d」的延伸）：AHardwareBuffer 这条路在**非 Adreno**上能不能走。
+# 「M3-3d」量出第二台（MT6896 / Mali-G610 MC6）两种外部句柄都不可导出 ⇒ 甲案（分配可导出内存 → 取 fd →
+# mmap 压回客体地址）在它上面不存在；同源的另一条路是 AHB（两台都有该扩展），问的是**一问**：
+# 导入 AHB 之后能不能在**同一份内存上按偏移绑多块缓冲**（池子与 vk_region_find 的前提）。
+# AHB 的 API 在 NDK 的公开库 libnativewindow.so 里（AHardwareBuffer_*）。
+# M2's fifth capability probe (an extension of M3-3d): does the AHardwareBuffer route exist on a **non-Adreno**
+# device? M3-3d measured that neither external handle type is exportable on device 2 (MT6896 / Mali-G610 MC6), so
+# approach A (allocate exportable memory -> take the fd -> mmap it back at the guest address) does not exist there.
+# The sibling route is an AHB (the extension is present on both devices) and it asks **one** question: after
+# importing an AHB, can several buffers be bound at offsets of **the same memory** (the precondition of the pool
+# and of vk_region_find)? The AHB API lives in the NDK's public libnativewindow.so (AHardwareBuffer_*).
+add_executable(vk_ahb_probe ${CMAKE_CURRENT_SOURCE_DIR}/vk/vk_ahb_probe.c)
+target_link_libraries(vk_ahb_probe PRIVATE vulkan nativewindow android)
+target_link_options(vk_ahb_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_include_directories(vk_ahb_probe PRIVATE ${COMPAT})
 
 # M1 验收用的可执行文件：没有窗口、没有图形后端，直接在设备上跑。
 # 通过 adb push 到 /data/local/tmp 执行（那里对 shell 用户是可执行的），目标是日志里出现游戏的 UNIMPL 行；

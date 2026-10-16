@@ -434,13 +434,21 @@ void vk_device_init(void) {
     free(qf);
     if (g_qfi == UINT32_MAX) { LOG("【红】没有图形队列族"); return; }
 
-    const char *want[] = { "VK_KHR_external_memory_fd",        // 内存换轨（把 Vulkan 内存摆到客体地址上）要用 | needed by the memory overlay (placing Vulkan memory at guest addresses)
+    const char *want[] = { "VK_KHR_external_memory_fd",        // 甲案（导出内存取 fd）要用 | needed by route A (export the memory and take its fd)
+                           "VK_ANDROID_external_memory_android_hardware_buffer",   // AHB 支路要用（甲案不可用时。见 vk_region.c）| needed by the AHB route (used when route A is unavailable; see vk_region.c)
                            "VK_EXT_vertex_attribute_divisor" };   // 顶点流每实例步进 > 1（有则开，没有就退化，见第 9 步的已知缺口）| per-instance vertex stream step > 1 (enabled when present, degraded when not; see the known gaps in step 9)
     const char *en[8]; uint32_t nec = 0;
-    for (unsigned i = 0; i < sizeof want / sizeof want[0]; i++)
-        if (vk_have_ext(want[i])) en[nec++] = want[i];
-        else if (i == 0) LOG("【红】设备没有扩展 %s：内存换轨会走不通", want[i]);
-        else LOG("【黄】设备没有扩展 %s：顶点流的每实例步进 > 1 只能按 1 处理", want[i]);
+    for (unsigned i = 0; i < sizeof want / sizeof want[0]; i++) {
+        if (vk_have_ext(want[i])) { en[nec++] = want[i]; continue; }
+        if (i == 0 && !vk_have_ext("VK_ANDROID_external_memory_android_hardware_buffer"))
+            LOG("【红】设备没有扩展 %s：内存换轨的两条路都走不通", want[i]);
+        else if (i == 0)
+            LOG("【黄】设备没有扩展 %s：甲案（导出内存取 fd）走不通，改用 AHB 支路", want[i]);
+        else if (i == 1)
+            LOG("【黄】设备没有扩展 %s：甲案不可用时就没有内存换轨了", want[i]);
+        else
+            LOG("【黄】设备没有扩展 %s：顶点流的每实例步进 > 1 只能按 1 处理", want[i]);
+    }
 
     // 动态渲染（Vulkan 1.3 核心）：回放层开渲染通道用它——比 VkRenderPass/VkFramebuffer 少一整套对象，
     // 而 NVN 的命令流本来就是"设目标 + 清除 + 绘制"的自由序列，与它正好对得上。
