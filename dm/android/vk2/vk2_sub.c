@@ -34,7 +34,13 @@ static int           g_n;            // 在飞深度（槽数）| in-flight dept
 static vk2_slot     *g_slots;
 static vk2_slot     *g_rec;          // 正在录制的槽（begin 之后、commit/abort 之前）| slot being recorded
 static uint64_t      g_frame_seq;    // 客体提交序号（1 起）| guest submission sequence, from 1
+static uint64_t      g_last_frame;   // 最近一次成功提交的 frame | the frame of the most recent successful commit
 static vk2_sub_stats g_st;
+// N4-c：回放层挂上来的两个钩子（见 vk2_sub.h 的说明）| N4-c: the two hooks the replay layer installs
+static vk2_sub_reap_fn g_reap_fn;
+static void           *g_reap_ud;
+static void          (*g_qlock)(void);
+static void          (*g_qunlock)(void);
 
 // ---------------------------------------------------------------- G4 的硬判据（不许 vkQueueWaitIdle）
 // 与 N2 的 `vk2_xfer.c` 同一套纪律手法：把 `vkQueueWaitIdle` 这个名字在本编译单元里宏成「计数 + 报红」的包装，
@@ -87,6 +93,14 @@ static vk2_slot *oldest_in_flight(void) {
 // the ring is handed back only now (the window may not outlive the slot that recorded it).
 static void slot_reap(vk2_slot *s) {
     if (!s->in_flight) return;
+    // N4-c：**先把"这个槽做完了"这件事通知出去**，然后才让槽可重用。栅栏句柄会被下一个提交 `vkResetFences`
+    // 重用 ⇒ 回收之后再拿 frame 去问栅栏没有意义；所以回放层的三件事（副作用 / GPU→池回读 / 描述符池）
+    // 只能在这里做，而且必须在这一刻做。
+    // N4-c: announce "this slot finished" first, then let it be reused -- the fence handle is reset by the next
+    // submit, so the replay layer's work (post ops, round-trip readback, descriptor pool) can only happen here.
+    uint64_t frame = s->frame;
+    VkFence  fen = s->fence;
+    if (g_reap_fn) { g_st.reap_hook_calls++; g_reap_fn((int)(s - g_slots), frame, fen, g_reap_ud); }
     s->in_flight = 0;
     s->frame = 0;
     g_st.reclaims++;
@@ -187,6 +201,7 @@ int vk2_sub_init(const vk2_dev *d, int inflight) {
     }
     g_rec = NULL;
     g_frame_seq = 0;
+    g_last_frame = 0;
     vk2_sub_stats_reset();
     g_ready = 1;
     XLOG("提交槽就绪：**在飞深度 %d**（一槽一池一 cb 一栅栏）、超时 %u ms、长等门槛 %llu µs、"
@@ -279,7 +294,13 @@ int vk2_sub_commit(void) {
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &s->cb;
+    // N4-c：客体线程的提交与前端线程的上屏 / 回读共用同一条队列 ⇒ 提交这一步要串行化（与旧路同一把锁；
+    // 探针不设这两个钩子，本模块就还是独立可跑）。
+    // N4-c: the guest's submits share one queue with the front end's present/readbacks, so this step is serialised
+    // with the same lock the old road takes (probes install no hook, so the module stays standalone).
+    if (g_qlock) g_qlock();
     VkResult r = vkQueueSubmit(g_dev.q, 1, &si, s->fence);   // **一次客体提交 = 一次 vkQueueSubmit**
+    if (g_qunlock) g_qunlock();
     if (r != VK_SUCCESS) {
         g_st.submit_fail++;
         XLOG("【红】frame %llu：vkQueueSubmit 失败 VkResult %d（commits 与 submits 由此不等）",
@@ -289,6 +310,7 @@ int vk2_sub_commit(void) {
     }
     g_st.submits++;
     s->in_flight = 1;
+    g_last_frame = s->frame;
     g_rec = NULL;
     return 1;
 }
@@ -362,4 +384,57 @@ int vk2_sub_use_banks(void) {
 int vk2_sub_slot_bank(int i) {
     if (i < 0 || i >= g_n) return -1;
     return g_slots[i].bank;
+}
+
+// ---------------------------------------------------------------- N4-c：回放层挂上来的那三件
+void vk2_sub_set_reap_hook(vk2_sub_reap_fn fn, void *ud) { g_reap_fn = fn; g_reap_ud = ud; }
+void vk2_sub_set_queue_lock(void (*lock)(void), void (*unlock)(void)) { g_qlock = lock; g_qunlock = unlock; }
+uint64_t vk2_sub_last_frame(void) { return g_last_frame; }
+int vk2_sub_slot_id(const vk2_slot *s) {
+    if (!s || !g_slots || s < g_slots || s >= g_slots + g_n) return -1;
+    return (int)(s - g_slots);
+}
+
+// N4-c：**按调用方给的超时**等一个 frame 的定向栅栏。为什么不能直接用 `vk2_sub_wait()`（它用模块自己的
+// 5 秒上限）：客体的 `nvnSyncWait` 有自己的超时语义（"这类提交等多久是客体说了算"），拿模块的上限去截短它
+// 就是**改语义**（N4-c 第一轮真机读数抓到的现场：`mtl_wait` 等了 5005 毫秒 —— 正好是模块那个 5 秒 ——
+// 而客体要的是它自己给的那个超时）。超时照旧**如实报失败**，不重试、不放宽。
+// N4-c: wait with the caller's timeout (the module's fixed 5 s must not shorten the guest's own nvnSyncWait
+// timeout -- the first N4-c device round caught exactly that: 5005 ms, the module's cap).
+int vk2_sub_wait_timeout(uint64_t frame, uint64_t timeout_ns) {
+    if (!g_ready || !frame) return 0;
+    if (frame <= g_st.reaped_max) return 1;
+    vk2_slot *s = find_in_flight(frame);
+    if (!s) return 1;                       // 已经回收 ⇒ 完成（单队列按序）| already reaped means done
+    uint64_t t0 = now_us();
+    VkResult r = vkWaitForFences(g_dev.dev, 1, &s->fence, VK_TRUE, timeout_ns ? timeout_ns : 1000000ull);
+    uint64_t dt = now_us() - t0;
+    g_st.wait1_calls++;
+    if (r != VK_SUCCESS) {
+        g_st.wait1_timeouts++;
+        if (g_st.wait1_timeouts <= 8)
+            XLOG("【黄】按调用方超时等 frame %llu：等了 %llu µs 没等到（VkResult %d）⇒ 如实报失败",
+                 (unsigned long long)frame, (unsigned long long)dt, (int)r);
+        return 0;
+    }
+    g_st.wait1_waited++;
+    g_st.wait1_us += dt;
+    if (dt > g_st.wait1_max_us) g_st.wait1_max_us = dt;
+    if (g_st.reaped_max < frame) g_st.reaped_max = frame;
+    reap_done_up_to(frame);
+    return 1;
+}
+uint64_t vk2_sub_user_timeouts(void) { return g_st.wait1_timeouts; }
+
+// 非阻塞地问"这个 frame 完成了没"（`mtl_wait(fence, 0)` 要的就是它）。**这不是等待**；发现完成了就顺手回收
+// （回收会走钩子 —— 回放层的副作用与 GPU→池回读都在那里）。返回 1 = 已完成、0 = 还在飞、-1 = frame 不合法。
+int vk2_sub_poll(uint64_t frame) {
+    if (!g_ready || !frame) return -1;
+    if (frame <= g_st.reaped_max) return 1;      // 早就完成（单队列 ⇒ 顺序完成）| long done (one queue, in order)
+    vk2_slot *s = find_in_flight(frame);
+    if (!s) { g_st.poll_over_deep++; return 1; } // 不在飞 = 已经回收 ⇒ 当作完成 | not in flight means already reaped
+    if (vkGetFenceStatus(g_dev.dev, s->fence) != VK_SUCCESS) return 0;
+    if (g_st.reaped_max < frame) g_st.reaped_max = frame;
+    reap_done_up_to(frame);
+    return 1;
 }

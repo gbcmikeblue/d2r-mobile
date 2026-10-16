@@ -158,6 +158,21 @@ void vk2_dirty_clean(vk2_dirty *d, uint64_t off, uint64_t len) {
     d->st.clean++;
 }
 
+// N4-c：**只清 GPU 那一位**（往返型回读之后用）。为什么不能顺手把 CPU 位也清掉：那一页可能同时还有 CPU 脏
+// （客体刚写过、还没上传），清掉它就等于把那几个字节永远丢在影子里（而记账看不出来）。两条路分开：
+//   · 整段回读进影子且页上没有 CPU 脏 ⇒ `vk2_dirty_clean`（两位都清，影子与后备一致）；
+//   · 页上有 CPU 脏 ⇒ 只清 GPU 位（GPU 写过的字节已经回读进影子，CPU 那几个字节留给上传窗口）。
+// N4-c: clear only the GPU bit after a round-trip readback. The page may still carry a CPU-dirty mark (the guest wrote
+// there and the upload has not happened yet); clearing that would silently drop those bytes.
+void vk2_dirty_clean_gpu(vk2_dirty *d, uint64_t off, uint64_t len) {
+    if (!d || !d->pages) return;
+    uint64_t p0 = 0, p1 = 0; int cl = 0;
+    if (!clip_pages(d, off, len, &p0, &p1, &cl)) return;
+    if (cl) d->st.clamp++;
+    bits_clr(d->gpu, p0, p1);
+    d->st.clean_gpu++;
+}
+
 int vk2_dirty_any(const vk2_dirty *d, uint64_t off, uint64_t len, int state) {
     if (!d || !d->pages) return 0;
     uint64_t p0 = 0, p1 = 0; int cl = 0;

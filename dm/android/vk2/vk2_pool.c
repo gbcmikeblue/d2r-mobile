@@ -551,6 +551,26 @@ static int touch_at(uint64_t addr, uint64_t len, int gpu) {
 int vk2_touch_cpu(uint64_t addr, uint64_t len) { return touch_at(addr, len, 0); }
 int vk2_touch_gpu(uint64_t addr, uint64_t len) { return touch_at(addr, len, 1); }
 
+// N4-c：**只查不改** —— 这段客体地址里有没有"GPU 写过、还没被回读回去"的页？半页竞态对策的第一问
+// （有 ⇒ 调用方先回读整页并保留 CPU 刚写的那几个字节，然后再标 CPU 脏；见 vk2_xfer.h 的 vk2_hazard_merge）。
+// N4-c: read-only query -- are there GPU-dirty (not yet read back) pages in this guest address range? The first
+// question the half-page hazard handling asks before it marks a CPU write.
+int vk2_dirty_any_gpu(uint64_t addr, uint64_t len) {
+    if (!g_ready) return 0;
+    addr = vk2_ptr_mask((uintptr_t)addr);
+    if (!len) len = 1;
+    int any = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_npool; i++) {
+        vk2_pool *p = &g_pools[i];
+        if (addr < p->lo || addr + len > p->hi) continue;
+        any = vk2_dirty_any(&p->dirty, addr - p->lo, len, VK2_DIRTY_GPU);
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return any;
+}
+
 int vk2_pool_mark_all_cpu(int i) {
     if (!g_ready) return 0;
     pthread_mutex_lock(&g_mu);
@@ -646,6 +666,10 @@ int vk2_gfx2_enabled(void) {
 
 static int g_gpu_takenover;
 void vk2_pool_set_gpu_takenover(int on) { g_gpu_takenover = on ? 1 : 0; }
+// N4-c：回放层的贴图侧（`vk_tex.c` 那三处"一次性提交 + 等队列空闲"）要按同一条口径决定走不走它
+// ——"GPU 侧接管"是这一件事的**唯一判据**，所以给一个只读的问法（不读环境变量第二次，避免两处口径漂）。
+// N4-c: the texture side asks the same question -- "is the GPU side taken over" is the single criterion.
+int vk2_gpu_takenover(void) { return g_gpu_takenover; }
 
 const char *vk2_route_line(void) {
     static char line[360];
@@ -656,7 +680,8 @@ const char *vk2_route_line(void) {
                  "回放层的接管范围 = %s",
                  (unsigned long long)mb,
                  g_gpu_takenover
-                   ? "**GPU 侧已接管**（N4-b：`mtl_addr` 回后备资源 + 帧开头上传；提交与贴图仍走旧路）"
+                   ? "**GPU 侧已接管**（N4-b：`mtl_addr` 回后备资源 + 帧开头上传；N4-c：提交侧 = `vk2_sub_*`、"
+                     "GPU→池的回读、贴图侧不再等队列空闲）"
                    : "只登记池（N4-a：GPU 侧仍走旧路的零拷贝）");
     else
         snprintf(line, sizeof line,

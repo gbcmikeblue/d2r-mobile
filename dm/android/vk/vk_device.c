@@ -293,6 +293,21 @@ int vk_queue_lock_state(char *buf, size_t cap) {
     return h != 0;
 }
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void) { return &g_mem; }
+
+// N4-c：等队列空闲的计数入口（G4 的第三条判据，规格见 vk_device.h）。**只计数 + 真的等**，不做别的 ——
+// "谁想加一句 `vkQueueWaitIdle` 就静默加上"这件事在这里被挡成一条可读的读数。
+// N4-c: the counting entry for queue-idle waits (G4's third criterion, see vk_device.h). It only counts and waits.
+static _Atomic uint64_t g_idle_calls, g_idle_skipped;
+VkResult vk_idle_wait(const char *site) {
+    atomic_fetch_add(&g_idle_calls, 1);
+    if (g_idle_calls <= 4) LOG("[vk] 等队列空闲：在「%s」（累计 %llu 次；**新地基下这一格必须是 0**）",
+                               site ? site : "?", (unsigned long long)g_idle_calls);
+    return vkQueueWaitIdle(vk_queue());
+}
+uint64_t vk_idle_calls(void) { return atomic_load(&g_idle_calls); }
+// 被"定向栅栏 / 同一队列的提交序"替代掉、**没有**真的等空闲的地方（N4-c 的四处）：由 vk_tex.c 与 nvn_vk.c 计数。
+void vk_idle_avoided(void) { atomic_fetch_add(&g_idle_skipped, 1); }
+uint64_t vk_idle_calls_skipped(void) { return atomic_load(&g_idle_skipped); }
 uint32_t vk_zero_copy_type(void) { return g_zero_copy; }
 uint32_t vk_zero_copy_cached_type(void) { return g_zero_copy_cached; }
 

@@ -14,9 +14,10 @@
 // ⇒ 4 GB 池 = 2 × 131072 = **262144 字节**（N2 的探针复核这张表，并把扫描耗时重新量一遍）。
 //
 // **半页竞态（本文件要说清的语义边界）**：同一页既被 GPU 写过（gpu=1）又被 CPU **部分**写过时，
-// 整页上传影子会把 GPU 写在那一页里、CPU 没碰过的那几个字节盖掉。本轮的处理是**只报计数不猜**：
-// `hazard_halfpage` 记一笔、打一条【黄】，真正的处理（先回读该页再让 CPU 写）留给 N4 的绑定点决定
-// —— N2 的任务是**把这件事量出来**，不是替它做决定。
+// 整页上传影子会把 GPU 写在那一页里、CPU 没碰过的那几个字节盖掉。N2 只报计数（`hazard_halfpage`）；
+// **N4-c 给了对策**（两条，见 `vk2_xfer.h` 与 `vk2_xfer.c`）：① 槽回收时把那一次提交直写过的段**整页**回读
+// 进影子；② 帧开头上传**跳过**还带着 GPU 脏的页（`up_skip_gpu`），不拿旧影子盖掉在飞的 GPU 写。
+// "在绑定点先回读该页"在时序上做不到（那一刻这次 GPU 写还没发生），所以不是那条路。
 //
 // ---------------------------------------------------------------------------------------------------------------
 // N2 part one: interval-level dirty accounting (spec: section 9.4). "Write is immediately visible" (Metal's
@@ -40,6 +41,7 @@
 
 typedef struct {
     uint64_t mark_cpu, mark_gpu, clean;      // 记账调用次数 | accounting calls
+    uint64_t clean_gpu;                      // N4-c：只清 GPU 位（往返型回读之后，页上有 CPU 脏）| GPU-bit-only cleans
     uint64_t scans, runs_seen;               // 扫描次数 / 扫出来的 run 数 | scans / runs produced
     uint64_t scan_pages;                     // 累计扫过的页数（按池大小计）| pages walked, cumulative
     uint64_t scan_us, last_scan_us;          // 扫描累计 / 最近一次耗时（µs）| scan time, cumulative / last
@@ -73,6 +75,8 @@ void vk2_dirty_fini(vk2_dirty *d);
 void vk2_dirty_mark_cpu(vk2_dirty *d, uint64_t off, uint64_t len);
 void vk2_dirty_mark_gpu(vk2_dirty *d, uint64_t off, uint64_t len);
 void vk2_dirty_clean(vk2_dirty *d, uint64_t off, uint64_t len);
+// N4-c：只清 GPU 那一位（往返型回读之后用，理由见 vk2_dirty.c 里那段说明）| clear only the GPU bit (N4-c)
+void vk2_dirty_clean_gpu(vk2_dirty *d, uint64_t off, uint64_t len);
 
 // 查询：这段里有没有 cpu / gpu 脏页（1 = 有）；count 给页数。
 // Query: is there any cpu/gpu-dirty page in this range (1 = yes); the page counts are the two helpers.

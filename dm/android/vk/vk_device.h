@@ -63,6 +63,17 @@ void vk_queue_note(const char *phase);
 int vk_queue_lock_state(char *buf, size_t cap);   // 写一行"持有者 tid / 在做什么"；返回 1 = 有人持有 | Writes one line "holder tid / what for"; 1 = held
 const VkPhysicalDeviceMemoryProperties *vk_mem_props(void);
 
+// ---------- N4-c：**等队列空闲**的计数入口（G4 的第三条判据）----------
+// 新地基（`DM_GFX2=1` + 提交侧接管）的硬判据是"**游戏路径上的 `vkQueueWaitIdle` 计数 = 0**"。为了让它可读、
+// 也为了让"以后谁手滑加一句"不可能静默通过，核心回放层里那五处等空闲全部改成走这个包装：它**计数 + 打点名**
+// 再真的去等。心跳那一行（`vk_diag_line`）把计数报出来 ⇒ 截图与心跳里都能看到这一格。
+// The counter entry for queue-idle waits (G4's third criterion). Every queue-idle wait left in the replay layer goes
+// through this wrapper, which counts and names the site before waiting; the heartbeat reports the count.
+VkResult vk_idle_wait(const char *site);   // 计数 + 打点名 + 真的 `vkQueueWaitIdle`（返回值照传）| count, name, wait
+void     vk_idle_avoided(void);         // 这一处**没有**等空闲（被定向栅栏/提交序替代）⇒ 计一笔自证 | avoided
+uint64_t vk_idle_calls(void);
+uint64_t vk_idle_calls_skipped(void);   // 被定向栅栏/队列序替代掉、**没有**真的等空闲的次数 | avoided, not waited
+
 // ---------- 管线缓存（VkPipelineCache，图形与计算共用；说明见 vk_device.c 里那一整段）----------
 // 为什么在设备层：它的来历要与设备/驱动核对，落盘路径也要与"哪个进程在跑"有关（APK 只能写 app 内部目录）。
 // 用法就是一句话：把 vk_dev_pcache() 传给 vkCreate*Pipelines 的 cache 参数，**外面套一对 lock/unlock**

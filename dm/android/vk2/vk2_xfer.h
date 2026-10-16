@@ -69,6 +69,10 @@ typedef struct {
     uint64_t rb_no_fence;      // 没指定要等谁就调回读（报【黄】、返回 0）| readback with no producer fence
     uint64_t fence_timeouts;   // 等栅栏超时次数（如实报失败）| fence timeouts (reported as failure)
     uint64_t idle_calls;       // **必须恒为 0**：模块里调 vkQueueWaitIdle 的次数（G4 的前置自检）
+    uint64_t rb_addr_calls, rb_addr_bytes; // N4-c：按**客体地址**回读的调用次数与字节（往返型）| address-keyed readbacks
+    uint64_t gpu_settled, gpu_settled_bytes; // N4-c：清 GPU 位的次数与清到的页字节（往返型回读之后的收尾）| GPU bits settled
+    uint64_t up_skip_gpu;      // N4-c：帧开头上传**跳过**的"还带着 GPU 脏"的页数（半页竞态第二对策）| pages skipped
+    uint64_t up_skip_gpu_bytes;// N4-c：这些页的字节数（它们保持 CPU 脏，等回读之后再上传）| bytes of those pages
     uint64_t banks;            // N4：当前分了几段（1 = N2/N3 的单环）| N4: how many banks the ring is split into
     uint64_t initial_rounds;   // N4-b：初始同步用了几轮"录一批 → 提交 → 等栅栏"（末次）| initial-sync rounds, last call
     uint64_t initial_bytes;    // N4-b：初始同步累计搬了字节 | bytes moved by initial sync, cumulative
@@ -160,6 +164,30 @@ int  vk2_readback(VkBuffer src, uint64_t off, void *dst, size_t n);
 // 池感知版：自己按池内存地址反查出 (块, 块内偏移)，读回**影子**，并把这段置 CLEAN。
 // Pool-aware form: resolves the address to (chunk, offset), reads into the shadow, and marks the range CLEAN.
 int  vk2_readback_pool(void *pool_mem, uint64_t pool_off, size_t n);
+
+// ---- N4-c：往返型（GPU→池）的两条路 ---------------------------------------------------------------
+// ① **按客体地址回读一段**（回放层手里只有地址）：反查池 → 池内偏移 → 逐块回读进**影子**。
+//    **字节精确**（只读这段 —— GPU 到底写了哪些字节由调用方按提交记账），**不动脏位**：清位是下一句的事。
+//    调用方必须先 `vk2_readback_after(那个 frame 的栅栏)`（一般是"槽回收钩子"里拿到的、已经 signal 的那一个）。
+//    返回 1 = 成功、0 = 失败（地址不在池里 / 没有后备 / 没指定栅栏 ⇒ 与 vk2_readback 同一套纪律）。
+// N4-c: read a range back into the shadow by **guest address**, byte-exact and without touching the dirty bits.
+int  vk2_readback_addr(uint64_t addr, uint64_t len);
+// 收尾：把这段覆盖到的**页**的 GPU 脏位清掉（CPU 位不动）。调用时机 = 这一段的 GPU 写都回读完了、而且**没有别的
+// 在飞提交还会写同一页**（回放层的槽回收钩子按"其它在飞槽记下的区间"判断这件事）。
+// Settle: clear the GPU bits of the covering pages (the CPU bits stay). Only legal once every GPU write on those pages
+// has been read back and no other in-flight submission still writes them.
+uint64_t vk2_gpu_settle(uint64_t addr, uint64_t len);
+
+// ② **半页竞态的第一半对策（上传侧）**：帧开头的上传**跳过**还带着 GPU 脏的页（`up_skip_gpu` 计数）。理由：
+//    那一页的 GPU 写要么还没发生（在飞/同帧录制中），要么发生了但还没被 ① 回读进来 ⇒ 拿旧影子整页盖过去
+//    就是把它盖掉。这些页**保持 CPU 脏**（不清位），等 ① 把 GPU 的字节合回影子之后的下一次上传再走。
+// N4-c: the upload side of the half-page countermeasure -- a page that is still GPU-dirty is skipped (counted) and
+// left CPU-dirty, so stale shadow bytes never pile onto an in-flight GPU write.
+//
+// ③ 队列锁钩子：本模块自己也要往同一条队列上提交（回读拷贝）⇒ 回放层把它设进来，探针不设（保持独立可跑）。
+// The queue-lock hook: this module submits readback copies to the same queue; the replay layer installs the same lock
+// the guest's submits use. Probes leave it unset.
+void vk2_xfer_set_queue_lock(void (*lock)(void), void (*unlock)(void));
 
 void vk2_xfer_stats_get(vk2_xfer_stats *out);
 void vk2_xfer_stats_reset(void);

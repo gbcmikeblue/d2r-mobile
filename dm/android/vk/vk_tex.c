@@ -311,6 +311,13 @@ static ent_t *g_tab; static int g_cap, g_n;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static VkCommandPool g_pool; static VkCommandBuffer g_cb;
 static VkCommandBuffer g_cb_up;   // 上传专用的那条（见下面"两条，各管一段"）| the upload-only one (see "two of them, one per section" below)
+// N4-c：一次性提交（读回 / 对照清除 / 上传）的**定向栅栏**。"等队列空闲"在新地基下被它替代 —— 同一条队列上
+// 的提交是**按序完成**的，所以"等这一条拷贝自己的栅栏"就足以保证"这一条之前那些提交都做完了"（这正是原来
+// `vkQueueWaitIdle` 想表达的意思），而且它**不等前端线程的上屏提交**。旧路（DM_GFX2 关）仍然等队列空闲。
+// N4-c: the one-off submission's targeted fence, which replaces the queue-idle wait under the new foundation: submits
+// on one queue complete in order, so waiting on this copy's own fence already implies "everything before it is done"
+// -- what vkQueueWaitIdle meant -- while not waiting on the front end's presents. The old road keeps the idle wait.
+static VkFence g_one_fence;
 
 // 读回（以及对照清除）**必须串行**：读回会被**两个线程**同时发起 —— 出图/扫描在客体线程、查看器在前端线程 ——
 // 而它们共用同一块常驻中转缓冲（`stg_get`，会销毁重建）与同一块命令缓冲（`g_cb`）。早先只锁了"队列提交"那一段，
@@ -484,6 +491,12 @@ static int one_begin_on(VkCommandBuffer *slot) {
         VkResult ar = vkAllocateCommandBuffers(vk_dev(), &ai, slot);
         if (ar != VK_SUCCESS) { *slot = VK_NULL_HANDLE; step_fail("vkAllocateCommandBuffers 返回 %d", (int)ar); return 0; }
     }
+    // N4-c：新地基下一次性提交要带自己的栅栏（创建时不带 SIGNALED：第一次等之前会 vkResetFences）
+    if (vk2_gpu_takenover() && !g_one_fence) {
+        VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkResult fr2 = vkCreateFence(vk_dev(), &fi, NULL, &g_one_fence);
+        if (fr2 != VK_SUCCESS) { step_fail("vkCreateFence 返回 %d", (int)fr2); return 0; }
+    }
     { VkResult rr = vkResetCommandBuffer(*slot, 0);
       if (rr != VK_SUCCESS) { step_fail("vkResetCommandBuffer 返回 %d", (int)rr); return 0; } }
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -514,14 +527,19 @@ static const char *const ONE_IDLE_UP   = "一次性提交等空闲（上传，�
 static int one_end_on(VkCommandBuffer cb, int up) {
     { VkResult er = vkEndCommandBuffer(cb);
       if (er != VK_SUCCESS) { step_fail("vkEndCommandBuffer 返回 %d", (int)er); return 0; } }
+    // N4-c：新地基下这条一次性提交**带自己的栅栏**，等它自己的栅栏（**不再等队列空闲**；同队列按序完成，
+    // 所以它 signal 就意味着"它之前那些提交都做完了"，而前端线程的上屏提交不在这条链上）。
+    int use_fence = vk2_gpu_takenover() && g_one_fence != VK_NULL_HANDLE;
+    VkFence fe = use_fence ? g_one_fence : VK_NULL_HANDLE;
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
-    // 提交与"等队列空闲"是一件事（一次性命令缓冲的语义），整段拿队列锁（见 vk_device.h）
-    // The submit and the queue-idle wait are one thing for a one-off command buffer, so the whole span takes the
+    // 提交与"等它做完"是一件事（一次性命令缓冲的语义），整段拿队列锁（见 vk_device.h）
+    // The submit and "wait for it to finish" are one thing for a one-off command buffer, so the whole span takes the
     // queue lock (see vk_device.h)
     vk_queue_note(up ? ONE_NOTE_UP : ONE_NOTE_RB);
     vk_queue_lock();
+    if (use_fence) vkResetFences(vk_dev(), 1, &fe);
     dm_waitled_enter(up ? ONE_SUBMIT_UP : ONE_SUBMIT_RB);
-    VkResult sr = vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE);
+    VkResult sr = vkQueueSubmit(vk_queue(), 1, &si, fe);
     dm_waitled_leave();
     if (sr != VK_SUCCESS) {
         step_fail("vkQueueSubmit 返回 %d", (int)sr);
@@ -530,20 +548,27 @@ static int one_end_on(VkCommandBuffer cb, int up) {
     }
     vk_op_note(up ? "一次性提交（上传）" : "一次性提交（读回/对照）");
 
-    // M3-2w：读回 / 对照走的就是这条"一次性提交 + 等空闲"，而它**可能跑在客体线程上**
+    // M3-2w：读回 / 对照走的就是这条"一次性提交 + 等它做完"，而它**可能跑在客体线程上**
     // （「M3-2u」的采样 PC：`vk_tex_view ← mtl_exec ← dm_gfx_suspend`）—— 所以它是"轮询式等待"的头号嫌疑之一，记账。
-    // M3-2w: readback / control clear go through this "one-off submit + wait idle", and it **can run on a guest thread**
+    // M3-2w: readback / control clear go through this "one-off submit + wait", and it **can run on a guest thread**
     // ("M3-2u" sample PC: `vk_tex_view <- mtl_exec <- dm_gfx_suspend`), which makes it a prime suspect for the "polling
     // wait" -- so it is recorded.
     // M3-3a：**上传**也走这里（`ent_upload` 的 `g_cb_up`），同一条路上客体线程一样会久等 —— 所以站点名分两路。
     // M3-3a: **uploads** come through here too (`ent_upload`'s `g_cb_up`) and the guest thread waits just as long, so the
     // site name splits per path.
     dm_waitled_enter(up ? ONE_IDLE_UP : ONE_IDLE_RB);
-    VkResult r = vkQueueWaitIdle(vk_queue());
+    VkResult r;
+    if (use_fence) {
+        vk_idle_avoided();      // 这一处**没有**等队列空闲（自证：G4 的第三条判据要把"替代掉"也报出来）
+        r = vkWaitForFences(vk_dev(), 1, &fe, VK_TRUE, 5000000000ull);
+        if (r != VK_SUCCESS) { vk_queue_unlock(); step_fail("vkWaitForFences 返回 %d", (int)r); LOG("【红】一次性提交等待失败 VkResult %d（等定向栅栏，超时如实报失败）", (int)r); return 0; }
+    } else {
+        r = vk_idle_wait(up ? ONE_IDLE_UP : ONE_IDLE_RB);   // 旧路：等队列空闲（计数在 vk_device.c 那一个入口里）
+    }
     dm_waitled_leave();
     vk_queue_unlock();
-    if (r != VK_SUCCESS) { step_fail("vkQueueWaitIdle 返回 %d", (int)r); LOG("【红】一次性提交等待失败 VkResult %d", (int)r); vk_op_result("vkQueueWaitIdle（一次性提交等空闲）", r); return 0; }
-    vk_op_note(up ? "一次性提交等空闲（上传）" : "一次性提交等空闲（读回/对照）");
+    if (r != VK_SUCCESS) { step_fail("等队列空闲 返回 %d", (int)r); LOG("【红】一次性提交等待失败 VkResult %d", (int)r); vk_op_result("vkQueueWaitIdle（一次性提交等空闲）", r); return 0; }
+    vk_op_note(up ? "一次性提交等完成（上传）" : "一次性提交等完成（读回/对照）");
     return 1;
 }
 static int one_begin(void) { return one_begin_on(&g_cb); }        // 读回 / 对照清除 | readback / control clear
@@ -1162,14 +1187,22 @@ static int grab_ser_locked(uint64_t serial, unsigned level, uint8_t *dst, size_t
     if (!stg_get((VkDeviceSize)w * h * bpp, &buf, &mem)) { LOG("【红】读回：建中转缓冲失败（%llu 字节）", (unsigned long long)((VkDeviceSize)w * h * bpp)); return 0; }
 
     // 拷之前先把队列排空：要读的是 GPU 已经写完的画面（与苹果侧截图前那次 mtl_finish_gpu 同一个意思）
-    // Drain the queue before copying: the point is to read a picture the GPU has finished (the same meaning as the
-    // mtl_finish_gpu before Apple's screenshot)
-    vk_queue_note("读回：等队列空闲");
-    vk_queue_lock();
-    dm_waitled_enter("读回：等队列空闲（等驱动做完在飞提交）");
-    vkQueueWaitIdle(vk_queue());
-    dm_waitled_leave();
-    vk_queue_unlock();
+    // **N4-c：新地基下这一步整个不需要** —— 下面这条拷贝提交到**同一条队列**，而队列上的提交是按序完成的
+    // ⇒ 它执行时前面的绘制/拷贝已经做完；屏障与拷贝自己那条栅栏（`one_end_on` 里等的）就是可见性凭据。
+    // 旧路照旧等队列空闲（缺省关时一行都不变）。
+    // Drain the queue before copying: the point is to read a picture the GPU has finished. N4-c: under the new
+    // foundation this step is not needed at all -- the copy below goes to the same in-order queue, and the barrier plus
+    // the copy's own fence (waited in one_end_on) are the visibility argument. The old road keeps the idle wait.
+    if (vk2_gpu_takenover()) {
+        vk_idle_avoided();
+    } else {
+        vk_queue_note("读回：等队列空闲");
+        vk_queue_lock();
+        dm_waitled_enter("读回：等队列空闲（等驱动做完在飞提交）");
+        vk_idle_wait("读回：等队列空闲（等驱动做完在飞提交）");
+        dm_waitled_leave();
+        vk_queue_unlock();
+    }
     int ok = 0;
     if (one_begin()) {
         VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1318,14 +1351,20 @@ int vk_tex_probe_clear(uint64_t serial, float r, float g, float b, float a) {
         if (!said++) LOG("【黄】对照实验：序号 %llu 是深度/模板贴图，vkCmdClearColorImage 用不得，跳过", (unsigned long long)serial);
         return 0;
     }
-    vk_queue_note("对照实验：等队列空闲");
-    vk_queue_lock();
-    dm_waitled_enter("对照实验：等队列空闲（等驱动）");
-    vkQueueWaitIdle(vk_queue());
-    dm_waitled_leave();
-    vk_queue_unlock();
+    // N4-c：与读回那条同一理由 —— 新地基下这条清除的**屏障 + 它自己的栅栏**（`one_end_on` 里等）就够，
+    // 队列上的顺序保证它在前面那些提交之后执行。等队列空闲在旧路保留。
+    if (vk2_gpu_takenover()) {
+        vk_idle_avoided();
+    } else {
+        vk_queue_note("对照实验：等队列空闲");
+        vk_queue_lock();
+        dm_waitled_enter("对照实验：等队列空闲（等驱动）");
+        vk_idle_wait("对照实验：等队列空闲（等驱动）");
+        dm_waitled_leave();
+        vk_queue_unlock();
+    }
     int ok = 0;
-    one_lock("对照清除（等队列空闲 + 转布局）");   // 与读回 / 上传串行（见 g_one_mu）| serialised against readback / upload (see g_one_mu)
+    one_lock("对照清除（转布局提交 + 等自己的栅栏）");   // 与读回 / 上传串行（见 g_one_mu）| serialised against readback / upload (see g_one_mu)
     if (one_begin()) {
         VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .oldLayout = lay, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

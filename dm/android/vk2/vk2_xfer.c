@@ -56,6 +56,9 @@ static VkCommandBuffer g_scb;
 static VkFence         g_scf;
 static VkFence  g_producer;           // 回读要等谁 | whose fence the readback must wait for
 static vk2_xfer_stats g_st;
+// N4-c：队列锁钩子（与客体提交共用同一条队列；见 vk2_xfer.h）| N4-c: the queue-lock hook (one queue shared with submits)
+static void (*g_qlock)(void);
+static void (*g_qunlock)(void);
 
 // ---------------------------------------------------------------- G4 的前置自检（不许 vkQueueWaitIdle）
 // 本文件里**只准等定向栅栏**（纪律，§9.5 / §9.6）。为了让它成为编译期就挡得住的东西，这里把
@@ -115,7 +118,11 @@ static int submit_wait(VkCommandBuffer cb, VkFence fe, const char *what) {
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    // N4-c：这条提交也在**客体那条队列**上（前端线程与客体线程都会走到这里）⇒ 与旧路一样在队列锁里提交。
+    // The copy is submitted to the same queue the guest uses, from either thread, so it takes the same lock.
+    if (g_qlock) g_qlock();
     VkResult r = vkQueueSubmit(g_dev.q, 1, &si, fe);
+    if (g_qunlock) g_qunlock();
     if (r != VK_SUCCESS) { XLOG("【红】%s 提交失败：VkResult %d", what, (int)r); return 0; }
     r = vkWaitForFences(g_dev.dev, 1, &fe, VK_TRUE, (uint64_t)VK2_XFER_TIMEOUT_MS * 1000000ull);
     if (r != VK_SUCCESS) {
@@ -295,7 +302,29 @@ static int upload_run(uint64_t pool_off, uint64_t len, void *ud) {
     uint64_t chunk_bytes = vk2_pool_chunk_bytes();
     uint8_t *shadow = (uint8_t *)(uintptr_t)c->pool->lo;
     uint64_t ncopy = 0;                                          // 这一条 run 拆成了几条拷贝
+    uint64_t gran = vk2_dirty_gran_default();
     while (len) {
+        // N4-c：**半页竞态的第二对策（上传侧）** —— 这一段里只要有一页还带着 GPU 脏，就不能整段搬上去
+        // （那一页的 GPU 写要么还没发生、要么已经写进后备但还没被回读进影子；拿旧影子盖过去就是把它盖掉）。
+        // 先把切片缩到"第一张 GPU 脏页"之前；若第一页就是 GPU 脏页，就**跳过这一页**（它保持 CPU 脏，
+        // 等"回收时整页回读"把 GPU 的字节合回影子之后的下一次上传再走），不吃暂存环的空间。
+        // N4-c: the upload side of the half-page countermeasure -- shrink this slice to just before the first
+        // GPU-dirty page, or step over that page entirely (leaving it CPU-dirty for a later frame), never pushing
+        // stale shadow bytes over an in-flight GPU write.
+        // run 的两端都是**页对齐**的（脏位图扫描按页并 run）⇒ 这里可以整页地看。
+        if (vk2_dirty_any(&c->pool->dirty, pool_off, len, VK2_DIRTY_GPU)) {
+            uint64_t page_len = gran; if (page_len > len) page_len = len;
+            if (vk2_dirty_any(&c->pool->dirty, pool_off, page_len, VK2_DIRTY_GPU)) {
+                g_st.up_skip_gpu++; g_st.up_skip_gpu_bytes += page_len;   // 第一页就是 ⇒ 跳过它（保持 CPU 脏）
+                pool_off += page_len; len -= page_len;
+                continue;
+            }
+            uint64_t at = 0;                                          // 只搬到第一张 GPU 脏页之前
+            while (at + gran <= len && !vk2_dirty_any(&c->pool->dirty, pool_off + at, gran, VK2_DIRTY_GPU))
+                at += gran;
+            len = at;
+            if (!len) continue;
+        }
         uint64_t k = pool_off / chunk_bytes;
         if (k >= (uint64_t)c->pool->nchunk) break;                // 没有后备（块数被上限截过）
         const vk2_chunk *ch = &c->pool->chunk[k];
@@ -563,6 +592,93 @@ uint64_t vk2_xfer_initial_sync(int bank) {
     g_st.initial_rounds = (uint64_t)rounds;
     g_st.initial_bytes += total;
     return total;
+}
+
+// ---------------------------------------------------------------- N4-c：往返型（GPU→池）的两条路
+// 规格与纪律见 vk2_xfer.h。这里的两个入口都属于"**GPU 写过、CPU 要读**"这一类：
+//   ① `vk2_readback_addr`：按**客体地址**回读一段（回放层的槽回收钩子里用：那次提交 GPU 直写过的段，
+//      等它自己的栅栏 signal 之后原样搬回影子 ⇒ 客体再读它自己的内存就是 GPU 的结果，与旧路语义一致）；
+//   ② `vk2_hazard_merge`：半页竞态 —— GPU 写过的整页被 CPU 部分写，整页上传会盖掉 GPU 的字节；这里把整页
+//      回读进暂存、只把 CPU 碰过的字节留在影子里（"后写的赢"），**只清 GPU 位**（CPU 位留给上传窗口）。
+// N4-c: the two round-trip entries (spec in vk2_xfer.h): address-keyed readback of GPU-written ranges, and the
+// half-page hazard merge that keeps the CPU's bytes while bringing the rest of the page back.
+void vk2_xfer_set_queue_lock(void (*lock)(void), void (*unlock)(void)) { g_qlock = lock; g_qunlock = unlock; }
+
+// 按客体地址找池（掩掉最高那个字节：这台机的 malloc 返回带 TBI 标记的指针，见 vk2_pool.c）。
+// Find the pool covering a guest address (masking the top byte: this device's malloc returns tagged pointers).
+static vk2_pool *pool_at_addr(uint64_t addr, uint64_t len) {
+    uintptr_t a = vk2_ptr_mask((uintptr_t)addr);
+    for (int i = 0; i < vk2_pool_count(); i++) {
+        vk2_pool *p = (vk2_pool *)(uintptr_t)vk2_pool_at(i);
+        if (p && a >= p->lo && a + len <= p->hi) return p;
+    }
+    return NULL;
+}
+
+// 逐块回读 [pool_off, pool_off+n) 到 dst（caller 已指定过生产者栅栏）| per-chunk readback into dst
+static int rb_range(vk2_pool *pool, uint64_t pool_off, void *dst, uint64_t n) {
+    uint64_t chunk_bytes = vk2_pool_chunk_bytes();
+    uint8_t *d = (uint8_t *)dst;
+    uint64_t left = n, at = pool_off;
+    while (left) {
+        uint64_t k = at / chunk_bytes;
+        if (k >= (uint64_t)pool->nchunk) { XLOG("【红】回读：池内 %llu 没有后备块", (unsigned long long)at); return 0; }
+        const vk2_chunk *ch = &pool->chunk[k];
+        uint64_t rel = at - ch->off;
+        uint64_t take = ch->size - rel;
+        if (take > left) take = left;
+        if (!vk2_readback(ch->buf, rel, d, (size_t)take)) return 0;
+        at += take; left -= take; d += take;
+    }
+    return 1;
+}
+
+int vk2_readback_addr(uint64_t addr, uint64_t len) {
+    if (!g_ready || !len) return 0;
+    if (!g_producer) {                     // 与 vk2_readback 同一条纪律：没指定等谁就不回读
+        g_st.rb_no_fence++;
+        XLOG("【黄】按地址回读没指定要等谁的栅栏 ⇒ 拒绝（回放层要先 vk2_readback_after(那个 frame 的栅栏)）");
+        return 0;
+    }
+    vk2_pool *pool = pool_at_addr(addr, len);
+    if (!pool) { XLOG("【黄】按地址回读：%#llx+%llu 不落在任何一个已登记的池里（只报计数）",
+                      (unsigned long long)addr, (unsigned long long)len); return 0; }
+    uintptr_t a = vk2_ptr_mask((uintptr_t)addr);
+    uint64_t off = a - pool->lo;
+    // **字节精确**：只读 [off, off+len) 这一段 —— 这是"GPU 到底写了哪些字节"的唯一真值（回放层按提交记账）。
+    // 为什么不整页读：同页上可能还有**客体的 CPU 写**（半页竞态），整页读会把那几个字节用后备的内容盖掉；
+    // 为什么不清位：清位要按页、还要看同页有没有 CPU 脏 —— 那件事交给 `vk2_gpu_settle()`（调用方在
+    // "所有在飞的重叠写都收完之后"调它）。
+    // Byte-exact: only the range the GPU actually wrote is read back. Page-wide reads would clobber a CPU write on
+    // the same page, and the dirty bits are settled separately by vk2_gpu_settle().
+    uint64_t t0 = now_us();
+    if (!rb_range(pool, off, (uint8_t *)a, len)) return 0;
+    g_st.rb_addr_calls++; g_st.rb_addr_bytes += len; g_st.rb_calls++; g_st.rb_bytes += len;
+    g_st.rb_wait_us += now_us() - t0;      // 与 rb_wait_us 同账（这一栏就是"回读花了多久"）
+    return 1;
+}
+
+// N4-c：把 [addr, addr+len) 覆盖到的**页**的 GPU 脏位清掉（只看 GPU 位：同页若有 CPU 脏，那是客体的字节，
+// 留给上传窗口）。调用方必须在"这一段的所有 GPU 写都已经回读、而且没有别的在飞提交还会写同一个页"时调它
+// （回放层的槽回收钩子做这个判断）—— 清早了会把后一个提交的写记成 CLEAN，那个写就再也回读不回来了。
+// N4-c: clear the GPU bit of the pages covering the range (the CPU bit is left alone). The caller must have read back
+// every GPU write on those pages and checked that no other in-flight submission writes them.
+uint64_t vk2_gpu_settle(uint64_t addr, uint64_t len) {
+    if (!g_ready || !len) return 0;
+    vk2_pool *pool = pool_at_addr(addr, len);
+    if (!pool) return 0;
+    uintptr_t a = vk2_ptr_mask((uintptr_t)addr);
+    uint64_t off = a - pool->lo;
+    uint64_t gran = vk2_dirty_gran_default();
+    uint64_t pool_bytes = pool->hi - pool->lo;
+    uint64_t lo = off / gran * gran;
+    uint64_t hi = (off + len + gran - 1) / gran * gran;
+    if (hi > pool_bytes) hi = pool_bytes;
+    if (hi <= lo) return 0;
+    vk2_dirty_clean_gpu(&pool->dirty, lo, hi - lo);
+    g_st.gpu_settled_bytes += hi - lo;
+    g_st.gpu_settled++;
+    return hi - lo;
 }
 
 void vk2_xfer_stats_get(vk2_xfer_stats *out) { if (out) *out = g_st; }

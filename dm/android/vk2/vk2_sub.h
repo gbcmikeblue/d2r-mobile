@@ -90,6 +90,7 @@ typedef struct {
     uint64_t no_slot_fail;        // 槽满且等待失败 ⇒ 取不到槽的次数 | no slot could be acquired
     uint64_t wait1_calls;         // vk2_sub_wait(frame) 调用次数 | targeted single-frame waits
     uint64_t wait1_waited;        // 其中真等了栅栏的次数 | how many of them actually waited
+    uint64_t wait1_timeouts;      // N4-c：**按调用方超时**等、真的超时了的次数 | user-timeout waits that expired
     uint64_t wait1_us, wait1_max_us;   // 它们等到的时长（累计 / 最长）| their wait time
     uint64_t wait_all_calls;      // vk2_sub_wait_all 调用次数 | vk2_sub_wait_all calls
     uint64_t wait_all_waited;     // 它等到的在飞槽数（**不是等队列空闲**）| in-flight slots it waited on
@@ -100,6 +101,8 @@ typedef struct {
     uint64_t use_banks_calls;     // vk2_sub_use_banks 调用次数 | use_banks calls
     uint64_t idle_calls;          // **必须恒为 0**：本文件里出现 vkQueueWaitIdle 的次数（G4 的硬判据）
     uint64_t reaped_max;          // 已确认完成的最大 frame（**单队列 ⇒ 栅栏按提交序 signal**）
+    uint64_t reap_hook_calls;     // N4-c：回收钩子被调用的次数（每个被观察到完成的槽一次）
+    uint64_t poll_over_deep;      // N4-c：`vk2_sub_poll` 里"这个 frame 已经不在飞了"的次数（= 早就回收）| polled past the window
 } vk2_sub_stats;
 
 // ---------------------------------------------------------------- 生命周期
@@ -150,6 +153,36 @@ void vk2_sub_note_upload(void);
 // a single ring serialised uploads against the in-flight depth). Not calling it keeps every slot on bank 0.
 int  vk2_sub_use_banks(void);
 int  vk2_sub_slot_bank(int i);     // 第 i 个槽用哪一段（只读，诊断用）| which bank slot i uses
+
+// ---------------------------------------------------------------- N4-c：回放层怎么挂上来
+// ① **槽回收钩子**：本模块**观察到**某个槽的栅栏已经 signal（取槽前的轮询 / `vk2_sub_wait` / `wait_all` / 收尾）
+//    时，先调一次钩子，**然后**才让那个槽可以被重用。回放层需要它做三件事，顺序都不能错：
+//      · 把"GPU 完成后才生效"的副作用做掉（事件写值 / 计数器 / 未对齐拷贝的 CPU memcpy）；
+//      · **把这次提交 GPU 直写过后备的那几段回读到影子**（N4-c 的往返型：旧路 GPU 写的就是池内存本身、
+//        CPU 后读得到；新地基下写落在后备资源上 ⇒ 不回读就是永远读到旧值）；
+//      · 重置这个槽的描述符池、读回它的时间戳。
+//    **为什么必须是钩子而不是自己轮询**：栅栏句柄会被下一个提交 `vkResetFences` 重用 ⇒ "事后拿 frame 去问
+//    栅栏"在槽已被回收之后没有意义（栅栏说的已经是新提交的事）。所以"谁看到栅栏 signal"这件事必须由本模块
+//    在**回收那一刻**通知出去。钩子里**不许**再调本模块的接口（会重入），只许录自己的命令缓冲 / 提交别的东西。
+// ② **队列锁钩子**：客体线程的提交与前端线程的上屏 / 回读共用同一条队列（见 vk_device.h 的 vk_queue_lock），
+//    回放层把它设进来 ⇒ 本模块的 `vkQueueSubmit` 与旧路一样在锁里（探针不设，保持独立可跑）。
+// ③ `vk2_sub_poll(frame)`：非阻塞地问"这个 frame 完成了没"（`mtl_wait(fence, 0)` 要的就是它）。
+// N4-c: how the replay layer hangs itself on. A reclaim hook (called the moment this module observes a slot's fence,
+// before the slot may be reused -- a fence handle is reset by the next submit, so asking after the fact is meaningless,
+// and the hook is where the round-trip readback of GPU-written ranges happens); a queue-lock hook (the guest's submits
+// share the queue with the front end, so this module takes the same lock the old road did); and a non-blocking poll.
+typedef void (*vk2_sub_reap_fn)(int slot, uint64_t frame, VkFence fence, void *ud);
+void vk2_sub_set_reap_hook(vk2_sub_reap_fn fn, void *ud);
+void vk2_sub_set_queue_lock(void (*lock)(void), void (*unlock)(void));
+uint64_t vk2_sub_last_frame(void);            // 最近一次**成功**提交的 frame 号（回放层的 g_fence 用它）| last committed frame
+int  vk2_sub_poll(uint64_t frame);            // 1 = 已完成（顺手回收）；0 = 还在飞；-1 = frame 不合法
+// **按调用方给的超时**等指定 frame 的栅栏（N4-c：客体自己的 `nvnSyncWait` 有它自己的超时语义 ——
+// 客体说等多久就等多久，**不许被模块的 5 秒上限截短**；超时照旧如实报失败）。1 = 完成、0 = 超时/失败。
+// Wait on one frame's fence with **the caller's timeout** (the guest's own nvnSyncWait timeout must not be
+// shortened by this module's 5 s cap); a timeout is reported as failure.
+int  vk2_sub_wait_timeout(uint64_t frame, uint64_t timeout_ns);
+uint64_t vk2_sub_user_timeouts(void);         // 按调用方超时等、且真的超时了的次数 | user-timeout waits that expired
+int  vk2_sub_slot_id(const vk2_slot *s);      // 这个槽在表里的下标（回放层按槽索引自己的 per-slot 状态）
 
 // ---------------------------------------------------------------- 读数与日志
 void vk2_sub_stats_get(vk2_sub_stats *out);

@@ -17,7 +17,13 @@
 //        标脏之后同一帧才读得到新值
 //   问 5 **"脏 → 上传 → 清位 → 再触碰 → 再上传"**这条不变量（"下一帧重传"就是接管路径的命根子）
 //   问 6 **GPU_DIRTY 不被上传覆盖**（旧路 `UPDATE_UB` / `COPY_B2B` 直写后备之后影子就过期了这条语义）
-//   问 7 结论键值（`--- VK2_TAKEOVER_SUMMARY ---`）+ `vkQueueWaitIdle` 计数（两个模块都必须是 0）
+//   问 8 **N4-c：提交侧接上** —— 槽回收钩子在「栅栏已经被观察到」的那一刻被调到（每次提交一次）；`vk2_sub_poll`
+//        的三种返回（已回收 = 1 / 还在飞 = 0 / 不认识 = -1），"还在飞"那一半用一次 **128 MB 的 GPU 拷贝**做前提
+//   问 9 **N4-c：往返型（GPU→池回读）** —— GPU 直写后备之后：① 不等就读 = 旧值；② 等栅栏（不回读）还是旧值；
+//        ③ 回收钩子按那次提交的栅栏回读之后 = 新值（逐字节独立重算）
+//   问 10 **N4-c：半页竞态的两条对策** —— ① 帧开头上传跳过还带 GPU 脏的页（页保持 CPU 脏）；
+//        ② 回收时字节精确回读 + 只清 GPU 位 ⇒ 影子里 GPU 的字节与 CPU 的字节各归各位
+//   问 11 结论键值（`--- VK2_TAKEOVER_SUMMARY ---`）+ `vkQueueWaitIdle` 计数（两个模块都必须是 0）
 //
 // 跑法（一律走项目内 `.venv` Python）：
 //   & "<仓库>/.venv/Scripts/python.exe" -X utf8 .work/probes.py run vk2_takeover_probe --serial 8b1f1e50 [--tag r1]
@@ -210,6 +216,35 @@ static int run_frame(frame_out *out) {
     return out->waited;
 }
 
+// ---------------------------------------------------------------- N4-c：回放层那三件事的探针版
+// 问 8~10 需要三样东西，探针自己照回放层的形状做出来（**不依赖回放层**，这样它才是自证）：
+//   ① **回收钩子**：本模块在"观察到某个槽的栅栏已经 signal"时调它（然后才让槽可重用）。探针的钩子做两件事 ——
+//      记"钩子被调到了、那一刻栅栏确实已经 signal"；按 `g_hook_mode` 决定要不要把"本槽 GPU 直写过的段"
+//      回读进影子（这正是回放层在回收时做的事）。
+//   ② **GPU 直写区间的记账**：回放层按提交记（`COPY_B2B` / `UPDATE_UB` 的目标）；探针在录那段拷贝时自己记。
+//   ③ **poll**：非阻塞地问"这个 frame 完成了没"（`mtl_wait(fence, 0)` 要的就是它）。
+// N4-c: the probe's own version of the three things the replay layer does (reclaim hook, per-submission GPU-written
+// ranges, and the non-blocking poll), so questions 8-10 stay self-proving and do not depend on the replay layer.
+#define PROBE_NOTE_MAX 16
+typedef struct { uint64_t addr, len; } prange;
+static prange   g_note[PROBE_NOTE_MAX];
+static int      g_nnote;
+static int      g_hook_mode;          // 0 = 只记不读（问 9 的 (b) 半）；1 = 回读 + 清位（回放层的形状）
+static VkDevice g_hook_dev;
+static uint64_t g_hook_calls, g_hook_signalled, g_hook_rb_bytes, g_hook_settled;
+static void probe_reap(int slot, uint64_t frame, VkFence fence, void *ud) {
+    (void)slot; (void)ud;
+    g_hook_calls++;
+    if (g_hook_dev && vkGetFenceStatus(g_hook_dev, fence) == VK_SUCCESS) g_hook_signalled++;
+    if (g_hook_mode != 1) return;
+    vk2_readback_after(fence);            // 生产者 = 这次提交自己（此刻已经 signal）
+    for (int k = 0; k < g_nnote; k++) {
+        if (vk2_readback_addr(g_note[k].addr, g_note[k].len)) g_hook_rb_bytes += g_note[k].len;
+        g_hook_settled += vk2_gpu_settle(g_note[k].addr, g_note[k].len);
+    }
+    g_nnote = 0;
+}
+
 int main(void) {
     const uint64_t seed = env_u64("DM_VK2_SEED", 20261016ull);
     const uint64_t pool_mb = env_u64("DM_VK2_POOL_MB", 8);
@@ -239,6 +274,12 @@ int main(void) {
     if (!vk2_xfer_init(&d, ring_mb * MB, 0)) { printf("【红】vk2_xfer_init 失败\n"); return 1; }
     if (!vk2_sub_init(&d, inflight)) { printf("【红】vk2_sub_init 失败\n"); return 1; }
     vk2_pool_set_log(plog); vk2_xfer_set_log(xlog); vk2_sub_set_log(slog);
+    // N4-c：把"回收钩子"挂上（回放层的形状；问 8~10 用它）。**注意：挂钩子之后 N3 的问 3/4 那些读数不受影响**
+    // ——钩子只记账、并在 g_hook_mode=1 时回读"本槽自己记下的区间"（没有记区间时它什么都不做）。
+    // N4-c: install the reclaim hook (the replay layer's shape; questions 8-10 use it). It only accounts, and with
+    // g_hook_mode=1 it reads back the ranges this slot noted -- with none noted it does nothing.
+    g_hook_dev = vd.dev;
+    vk2_sub_set_reap_hook(probe_reap, NULL);
 
     // 池 = 普通匿名内存（新地基的唯一前提）| the pool is plain anonymous memory (the new foundation's precondition)
     const uint64_t pool_bytes = pool_mb * MB;
@@ -522,7 +563,297 @@ int main(void) {
         }
     }
 
-    // ------------------------------------------------------------------ 问 8：结论键值
+    // ------------------------------------------------------------------ 问 8：提交侧（回收钩子 + poll）
+    Q("**提交侧接上**：槽回收钩子在「栅栏已经被观察到」的那一刻被调到吗（回放层的副作用与 GPU→池回读挂在这里）？"
+      "`vk2_sub_poll` 的三种返回对不对？");
+    int q8_hook_ok = 0, q8_poll_ok = 0, q8_poll_running = -1;
+    {
+        uint64_t c0 = g_hook_calls;
+        vk2_sub_stats ss0, ss1;
+        vk2_sub_stats_get(&ss0);
+        const uint64_t off = 5 * MB, len = 32 * KB;
+        vk2_dirty *dd = vk2_pool_dirty(0);
+        frame_out fo;
+        pat_fill(mem + off, len, seed + 11);
+        vk2_dirty_mark_cpu(dd, off, len);
+        g_hook_mode = 0;                       // 只记账，不回读（这一问只问"钩子到没到"）
+        int ran = run_frame(&fo);
+        vk2_sub_stats_get(&ss1);
+        A("跑了 1 帧（frame %llu、搬 %llu 字节）：钩子调用 +%llu（这一帧 1 次；累计 %llu）、其中"
+          "「调用时栅栏已经 signal」= %llu 次；`vk2_sub` 的回收数 %llu → %llu、提交 %llu → %llu",
+          (unsigned long long)fo.frame, (unsigned long long)fo.moved,
+          (unsigned long long)(g_hook_calls - c0), (unsigned long long)g_hook_calls,
+          (unsigned long long)g_hook_signalled,
+          (unsigned long long)ss0.reclaims, (unsigned long long)ss1.reclaims,
+          (unsigned long long)ss0.submits, (unsigned long long)ss1.submits);
+        q8_hook_ok = (ran && g_hook_calls - c0 == 1 && g_hook_signalled == g_hook_calls &&
+                      ss1.submits == ss0.submits + 1) ? 1 : 0;
+        A("⇒ 钩子 = 每次提交 1 次、且**只在那一次提交的栅栏已经 signal 之后**被调到 = %d（回收时刻就是"
+          "「GPU 写完了」的时刻，回放层的三件事挂在这里才对）", q8_hook_ok);
+
+        // poll 的两半：① 早已回收的 frame ⇒ 1；② 刚提交、GPU 还在忙 ⇒ 0
+        uint64_t last = vk2_sub_last_frame();
+        int p_old = vk2_sub_poll(fo.frame);
+        A("`vk2_sub_poll(已经回收的 frame %llu)` = %d（应 1，**不阻塞**；这就是 `mtl_wait(fence, 0)` 的"
+          "「看一眼」）", (unsigned long long)fo.frame, p_old);
+        // 让这一次提交**真有 GPU 活**（128 MB 的拷贝，N3 量过 ≈4 ms）⇒ 提交后立刻 poll 必为"还在飞"。
+        // 这是问"同时在飞"那条纪律的同一手（探针第一版栽在"GPU 快得来不及"上，见 TOOLS B⁶）。
+        VkBuffer ba = VK_NULL_HANDLE, bb = VK_NULL_HANDLE;
+        VkDeviceMemory ma = VK_NULL_HANDLE, mb = VK_NULL_HANDLE;
+        const uint64_t big = 128ull * MB;
+        int made = 0;
+        {
+            VkBufferCreateInfo bci;
+            memset(&bci, 0, sizeof bci);
+            bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bci.size = big;
+            bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VkMemoryAllocateInfo mai;
+            memset(&mai, 0, sizeof mai);
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            made = 1;
+            if (vkCreateBuffer(vd.dev, &bci, NULL, &ba) != VK_SUCCESS) made = 0;
+            if (made) { VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vd.dev, ba, &mr);
+                mai.allocationSize = mr.size;
+                uint32_t pick = UINT32_MAX;
+                for (uint32_t i = 0; i < vd.mp.memoryTypeCount; i++)
+                    if ((mr.memoryTypeBits & (1u << i)) &&
+                        (vd.mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { pick = i; break; }
+                if (pick == UINT32_MAX || vkAllocateMemory(vd.dev, &mai, NULL, &ma) != VK_SUCCESS) made = 0;
+                else if (vkBindBufferMemory(vd.dev, ba, ma, 0) != VK_SUCCESS) made = 0; }
+            if (made && vkCreateBuffer(vd.dev, &bci, NULL, &bb) != VK_SUCCESS) made = 0;
+            if (made) { VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vd.dev, bb, &mr);
+                mai.allocationSize = mr.size;
+                uint32_t pick = UINT32_MAX;
+                for (uint32_t i = 0; i < vd.mp.memoryTypeCount; i++)
+                    if ((mr.memoryTypeBits & (1u << i)) &&
+                        (vd.mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { pick = i; break; }
+                if (pick == UINT32_MAX || vkAllocateMemory(vd.dev, &mai, NULL, &mb) != VK_SUCCESS) made = 0;
+                else if (vkBindBufferMemory(vd.dev, bb, mb, 0) != VK_SUCCESS) made = 0; }
+        }
+        if (made) {
+            uint64_t pf = 0;
+            vk2_slot *s = vk2_sub_begin();
+            if (s) {
+                pf = s->frame;
+                VkBufferCopy cp = { .srcOffset = 0, .dstOffset = 0, .size = big };
+                vkCmdCopyBuffer(s->cb, ba, bb, 1, &cp);
+                if (vk2_sub_commit()) {
+                    q8_poll_running = vk2_sub_poll(pf);       // 提交完**立刻**问：应 0（还在飞）
+                    // N4-c 的修（真机读数抓到的）：**客体按自己的超时等围栏**，不许被模块的 5 秒上限截短。
+                    // 这里用 1 ms 超时去等一条 128 MB 的拷贝 ⇒ 必然超时（如实报失败、计数 +1），
+                    // 然后正常等一次 ⇒ 完成（超时之后可恢复）；再按超时等一次已完成的 frame ⇒ 立刻 1。
+                    uint64_t to0 = vk2_sub_user_timeouts();
+                    int w_to = vk2_sub_wait_timeout(pf, 1000000ull);
+                    uint64_t to1 = vk2_sub_user_timeouts();
+                    int w = vk2_sub_wait(pf);
+                    int p_done = vk2_sub_poll(pf);            // 等完之后：应 1
+                    int w_done = vk2_sub_wait_timeout(pf, 1000000ull);
+                    A("一次 128 MB 的 GPU 拷贝提交（frame %llu）后**立刻** poll = %d（应 0 = 还在飞）；"
+                      "按**客体给的 1 ms 超时**等 = %d（应 0 = 超时，计数 %llu → %llu）；"
+                      "正常等自己的栅栏（%d）之后再 poll = %d（应 1）；再按超时等已完成的 frame = %d（应 1，立刻）",
+                      (unsigned long long)pf, q8_poll_running, w_to, (unsigned long long)to0,
+                      (unsigned long long)to1, w, p_done, w_done);
+                    q8_poll_ok = (p_old == 1 && q8_poll_running == 0 && w_to == 0 && to1 == to0 + 1 &&
+                                  w && p_done == 1 && w_done == 1) ? 1 : 0;
+                } else { vk2_sub_abort(); A("【红】那次大拷贝提交失败"); }
+            }
+        } else A("【黄】128 MB 的缓冲没建出来 ⇒ 这一半（「提交后立刻 poll = 还在飞」）没量到");
+        if (ba) vkDestroyBuffer(vd.dev, ba, NULL);
+        if (bb) vkDestroyBuffer(vd.dev, bb, NULL);
+        if (ma) vkFreeMemory(vd.dev, ma, NULL);
+        if (mb) vkFreeMemory(vd.dev, mb, NULL);
+    }
+
+    // ------------------------------------------------------------------ 问 9：往返型（GPU→池回读）闭环
+    Q("**往返型（GPU→池回读）**：GPU 直写过后备之后 —— ① **不等**就读影子 = 旧值；② 等栅栏（钩子不回读）还是旧值；"
+      "③ 回收钩子按那次提交的栅栏回读之后 = 新值（逐字节独立重算）");
+    int q9_naive = 0, q9_afterwait = 0, q9_afterrb = 0, q9_ok = 0;
+    {
+        const uint64_t src_off = 5 * MB + 128 * KB, dst_off = 4 * MB, len = 64 * KB;
+        vk2_dirty *dd = vk2_pool_dirty(0);
+        frame_out fo;
+        // 先把两段图案都搬上去（源 = B、目标 = A）：这样"GPU 拷贝"的源在后备里是确定的
+        pat_fill(mem + src_off, len, seed + 21);
+        pat_fill(mem + dst_off, len, seed + 22);
+        vk2_dirty_mark_cpu(dd, src_off, len);
+        vk2_dirty_mark_cpu(dd, dst_off, len);
+        run_frame(&fo);
+
+        // 半 (a)：录一次 GPU 直写（= COPY_B2B / UPDATE_UB 的目标），**提交但不等待** ⇒ 影子仍是 A
+        g_hook_mode = 0;
+        g_nnote = 0;
+        vk2_slot *s = vk2_sub_begin();
+        uint64_t frame_x = 0;
+        if (s) {
+            frame_x = s->frame;
+            VkBuffer cbk = VK_NULL_HANDLE; uint64_t choff = 0, srcoff = 0, dstoff = 0;
+            uint64_t cbytes = vk2_pool_chunk_bytes();
+            // 反查两块：都用池内偏移 → 块缓冲 + 块内偏移
+            vk2_addr((uint64_t)(uintptr_t)(mem + src_off), len, &cbk, &srcoff);
+            vk2_addr((uint64_t)(uintptr_t)(mem + dst_off), len, &cbk, &dstoff);
+            (void)cbytes;
+            VkBufferCopy cp = { .srcOffset = srcoff, .dstOffset = dstoff, .size = len };
+            vkCmdCopyBuffer(s->cb, cbk, cbk, 1, &cp);
+            vk2_dirty_mark_gpu(dd, dst_off, len);                 // 回放层在这一刻标的
+            g_note[g_nnote].addr = (uint64_t)(uintptr_t)(mem + dst_off);
+            g_note[g_nnote].len = len; g_nnote++;
+            vk2_sub_commit();
+        }
+        q9_naive = pat_check(mem + dst_off, len, seed + 22);       // 不等待就读：应仍是 A
+        A("(a) GPU 直写提交（frame %llu）之后**不等待**读影子：仍是 A = %d（应 1 —— 新地基下 GPU 写的是后备，"
+          "影子不会自己变）", (unsigned long long)frame_x, q9_naive);
+
+        // 半 (b)：等它的栅栏（钩子 mode 0 = **不回读**）⇒ 影子仍是 A（"等栅栏 ≠ 可见"）
+        int w = vk2_sub_wait(frame_x);
+        q9_afterwait = w && pat_check(mem + dst_off, len, seed + 22);
+        A("(b) 等这一 frame 的定向栅栏（%d）之后、**没有回读**：仍是 A = %d（应 1 —— G2 的第二半：等栅栏不等于可见）",
+          w, q9_afterwait);
+
+        // 半 (c)：再来一次，**钩子按那次提交的栅栏回读** ⇒ 影子 = B
+        pat_fill(mem + src_off, len, seed + 23);
+        vk2_dirty_mark_cpu(dd, src_off, len);
+        run_frame(&fo);                                            // 把新的源搬上去
+        g_hook_mode = 1;
+        g_nnote = 0;
+        s = vk2_sub_begin();
+        uint64_t frame_y = 0;
+        if (s) {
+            frame_y = s->frame;
+            VkBuffer cbk = VK_NULL_HANDLE; uint64_t srcoff = 0, dstoff = 0;
+            vk2_addr((uint64_t)(uintptr_t)(mem + src_off), len, &cbk, &srcoff);
+            vk2_addr((uint64_t)(uintptr_t)(mem + dst_off), len, &cbk, &dstoff);
+            VkBufferCopy cp = { .srcOffset = srcoff, .dstOffset = dstoff, .size = len };
+            vkCmdCopyBuffer(s->cb, cbk, cbk, 1, &cp);
+            vk2_dirty_mark_gpu(dd, dst_off, len);
+            g_note[g_nnote].addr = (uint64_t)(uintptr_t)(mem + dst_off);
+            g_note[g_nnote].len = len; g_nnote++;
+            vk2_sub_commit();
+        }
+        int w2 = vk2_sub_wait(frame_y);                            // 回收钩子在这里回读 + 清位
+        q9_afterrb = w2 && pat_check(mem + dst_off, len, seed + 23);
+        A("(c) 同样一次 GPU 直写（frame %llu），**回收钩子按它自己的栅栏回读**（回读 %llu 字节、清位 %llu 字节）："
+          "影子 = B = %d（应 1，逐字节等于独立重算的期望）", (unsigned long long)frame_y,
+          (unsigned long long)g_hook_rb_bytes, (unsigned long long)g_hook_settled, q9_afterrb);
+        q9_ok = (q9_naive && q9_afterwait && q9_afterrb) ? 1 : 0;
+        A("三半合起来 = %d ⇒ **「GPU 写后备、CPU 读影子」必须显式回读**，而回读挂在「槽回收 + 那次提交自己的"
+          "栅栏」这个时刻上（这也是 N4-c 给回放层补的那一条）", q9_ok);
+    }
+
+    // ------------------------------------------------------------------ 问 10：半页竞态的两条对策
+    Q("**半页竞态的对策**（N2 量出：GPU 写过的页被 CPU 部分写）：① 帧开头上传**跳过**还带 GPU 脏的页；"
+      "② 回收时**字节精确**回读那一段 + 只清 GPU 位 ⇒ 同一页上「GPU 写过的区间以 GPU 为准、区间之外的"
+      "CPU 字节保住」（这就是 N2 说「要页内字节级记账」的那一半）");
+    int q10_skip = 0, q10_merge = 0, q10_ok = 0;
+    {
+        const uint64_t pg = 4096;                        // 一页（= 脏位图粒度）
+        const uint64_t off = 6 * MB, src_off = 7 * MB;   // 目标页 / 源页（都已上传过图案）
+        vk2_dirty *dd = vk2_pool_dirty(0);
+        frame_out fo;
+        vk2_xfer_stats xs0, xs1;
+        // 先把源页写成图案 D2、目标页写成图案 D（都搬上去）
+        pat_fill(mem + src_off, pg, seed + 31);
+        pat_fill(mem + off, pg, seed + 32);
+        vk2_dirty_mark_cpu(dd, src_off, pg);
+        vk2_dirty_mark_cpu(dd, off, pg);
+        g_hook_mode = 0;
+        run_frame(&fo);
+
+        // ① 帧 X：GPU 直写目标页的**前半**（真拷贝），提交但**不等** ⇒ 整页带着"GPU 脏"
+        const uint64_t gpu_half = pg / 2;
+        g_nnote = 0;
+        vk2_slot *s = vk2_sub_begin();
+        uint64_t frame_x = 0;
+        if (s) {
+            frame_x = s->frame;
+            VkBuffer cbk = VK_NULL_HANDLE; uint64_t so = 0, dof2 = 0;
+            vk2_addr((uint64_t)(uintptr_t)(mem + src_off), gpu_half, &cbk, &so);
+            vk2_addr((uint64_t)(uintptr_t)(mem + off), gpu_half, &cbk, &dof2);
+            VkBufferCopy cp = { .srcOffset = so, .dstOffset = dof2, .size = gpu_half };
+            vkCmdCopyBuffer(s->cb, cbk, cbk, 1, &cp);
+            vk2_dirty_mark_gpu(dd, off, gpu_half);          // 页粒度 ⇒ 整页都算"GPU 脏"
+            g_note[g_nnote].addr = (uint64_t)(uintptr_t)(mem + off);
+            g_note[g_nnote].len = gpu_half; g_nnote++;      // 回放层记的是**实际写过的区间**（字节精确）
+            vk2_sub_commit();
+        }
+        A("帧 X（frame %llu）：GPU 把源页的**前半** 2 KiB 拷进目标页前半（= 一次 `COPY_B2B`/`UPDATE_UB` 的目标"
+          "直写），提交但**不等** ⇒ 目标**页**带着 GPU 脏（脏位是页粒度的，回放层记的区间是字节精确的）",
+          (unsigned long long)frame_x);
+
+        // ② CPU 只写这一页的**后半** 2 KiB = 图案 E，并标 CPU 脏（这就是"半页竞态"的现场）
+        const uint64_t half = pg / 2, cpu_pat = seed + 33;
+        pat_fill(mem + off + half, half, cpu_pat);
+        int noticed = vk2_dirty_any_gpu((uint64_t)(uintptr_t)(mem + off), pg);   // 回放层的"撞上了吗"那一问
+        vk2_dirty_mark_cpu(dd, off + half, half);
+        A("CPU 只写后半 2 KiB（图案 E）并标 CPU 脏；`vk2_dirty_any_gpu(整页)` = %d（应 1 —— 绑定点会看到"
+          "「这次触碰撞上了 GPU 写过的页」）", noticed);
+
+        // ③ 跑一帧（帧 Y）：上传必须**跳过**这一页（不拿旧影子盖掉在飞的 GPU 写），页保持 CPU 脏
+        vk2_xfer_stats_get(&xs0);
+        run_frame(&fo);
+        vk2_xfer_stats_get(&xs1);
+        uint64_t cpu_still = vk2_dirty_any(dd, off, pg, VK2_DIRTY_CPU);
+        q10_skip = (xs1.up_skip_gpu > xs0.up_skip_gpu && cpu_still == 1) ? 1 : 0;
+        A("帧 Y 上传：跳过 GPU 脏页 %llu → %llu（应 +≥1，跳过 %llu 字节）、这一页的 CPU 脏仍在 = %llu（应 1）"
+          "⇒ 对策① %s", (unsigned long long)xs0.up_skip_gpu, (unsigned long long)xs1.up_skip_gpu,
+          (unsigned long long)(xs1.up_skip_gpu_bytes - xs0.up_skip_gpu_bytes), (unsigned long long)cpu_still,
+          q10_skip ? "成立" : "**不成立**");
+
+        // ④ 等帧 X 的栅栏（若还没等）→ **字节精确**回读那一段 + 清 GPU 位（= 回收钩子做的事）
+        // 栅栏的取法：先确保帧 X 做完（单队列 ⇒ 之后提交的栅栏 signal 就意味着 X 也做完了），再用**一次空帧**
+        // 自己的栅栏（在等它之前把句柄取出来）当"生产者已完成"的凭据 —— 这正是回放层在回收钩子里拿到的那个。
+        // N4-c: make sure frame X is done, then use a fresh empty frame's own fence (captured before waiting) as the
+        // "producers are done" token -- exactly what the replay layer's reclaim hook is handed.
+        if (vk2_sub_poll(frame_x) != 1) vk2_sub_wait(frame_x);
+        uint64_t rb = 0, st = 0;
+        {
+            vk2_slot *s3 = vk2_sub_begin();
+            if (s3) {
+                uint64_t f3 = s3->frame;
+                if (vk2_sub_commit()) {
+                    VkFence fen3 = vk2_sub_fence(f3);      // **等之前**取出来（回收之后就拿不到句柄了）
+                    if (fen3 && vk2_sub_wait(f3)) {
+                        vk2_readback_after(fen3);          // 此刻它已经 signal
+                        rb = vk2_readback_addr((uint64_t)(uintptr_t)(mem + off), gpu_half) ? gpu_half : 0;
+                        st = vk2_gpu_settle((uint64_t)(uintptr_t)(mem + off), gpu_half);
+                    }
+                } else vk2_sub_abort();
+            }
+        }
+        uint64_t gpu_left = vk2_dirty_any(dd, off, pg, VK2_DIRTY_GPU);
+        uint64_t cpu_left = vk2_dirty_any(dd, off, pg, VK2_DIRTY_CPU);
+        // 期望按**独立重算**核（`pat_fill` 是从 0 开始填的 ⇒ 两半都用 pat_check，不是 pat_check_at）
+        int front_ok = pat_check(mem + off, half, seed + 31);           // 前半 = GPU 拷贝进来的源页内容
+        int back_ok = pat_check(mem + off + half, half, cpu_pat);       // 后半 = CPU 刚写的图案 E（**保住了**）
+        q10_merge = (rb == gpu_half && !gpu_left && cpu_left == 1 && front_ok && back_ok) ? 1 : 0;
+        A("回收时刻那两下（对**那段 2 KiB**）：回读 %llu 字节（应 %llu）、清 GPU 位 %llu 字节；之后影子 = "
+          "前半（GPU 的源页图案）%d / 后半（CPU 的图案 E）%d、GPU 脏 = %llu（应 0）、CPU 脏 = %llu（应 1，"
+          "还要上传）⇒ 对策② %s", (unsigned long long)rb, (unsigned long long)gpu_half, (unsigned long long)st,
+          front_ok, back_ok, (unsigned long long)gpu_left, (unsigned long long)cpu_left,
+          q10_merge ? "成立" : "**不成立**");
+
+        // ⑤ 再跑一帧：这一页（现在只有 CPU 脏）被整页上传 ⇒ 后备 = 前半 GPU 的 + 后半 CPU 的（回读验证）
+        vk2_xfer_stats_get(&xs0);
+        run_frame(&fo);
+        vk2_xfer_stats_get(&xs1);
+        int up_now = (xs1.upload_bytes > xs0.upload_bytes);
+        uint64_t saved_front = 0, saved_back = 0;
+        // 回读（这一次是"整页从后备读回影子"）之后按独立期望核
+        memset(mem + off, 0, (size_t)pg);
+        int rbv = vk2_readback_pool(mem, off, (size_t)pg);
+        saved_front = (uint64_t)pat_check(mem + off, half, seed + 31);
+        saved_back = (uint64_t)pat_check(mem + off + half, half, cpu_pat);
+        A("帧 Z 再上传（搬了 %llu 字节、上传字节 %llu → %llu）：回读整页核 —— 前半 = GPU 写的 %llu、"
+          "后半 = CPU 写的 %llu ⇒ 两个写者都保住了 = %d",
+          (unsigned long long)fo.moved, (unsigned long long)(xs0.upload_bytes >> 10),
+          (unsigned long long)(xs1.upload_bytes >> 10), (unsigned long long)saved_front,
+          (unsigned long long)saved_back, (rbv && up_now && saved_front && saved_back) ? 1 : 0);
+        q10_ok = (q10_skip && q10_merge && rbv && up_now && saved_front && saved_back) ? 1 : 0;
+        g_hook_mode = 0;
+    }
+
+    // ------------------------------------------------------------------ 问 11：结论键值
     Q("结论键值 + `vkQueueWaitIdle` 计数（新地基里必须恒为 0）");
     vk2_xfer_stats xs;
     vk2_sub_stats  ss;
@@ -559,6 +890,19 @@ int main(void) {
     printf("REDIRTY_INVARIANT=%d\n", q5_ok);
     printf("GPU_DIRTY_SURVIVES=%d\n", q6_ok);
     printf("INIT_SYNC_OK=%d\n", q7_ok);
+    // N4-c 的三问
+    printf("REAP_HOOK_OK=%d\n", q8_hook_ok);
+    printf("REAP_HOOK_CALLS=%llu\n", (unsigned long long)g_hook_calls);
+    printf("REAP_HOOK_SIGNALLED=%llu\n", (unsigned long long)g_hook_signalled);
+    printf("SUB_POLL_OK=%d\n", q8_poll_ok);
+    printf("SUB_POLL_RUNNING=%d\n", q8_poll_running);      // 提交后立刻 poll 的读数（应 0）
+    printf("ROUNDTRIP_POOL_OK=%d\n", q9_ok);
+    printf("ROUNDTRIP_NAIVE_STALE=%d\n", q9_naive);       // 不等就读 = 旧值
+    printf("ROUNDTRIP_AFTERWAIT_STALE=%d\n", q9_afterwait); // 等栅栏仍不给可见性
+    printf("ROUNDTRIP_AFTER_RB=%d\n", q9_afterrb);        // 回收钩子回读之后 = 新值
+    printf("HALFPAGE_OK=%d\n", q10_ok);
+    printf("HALFPAGE_SKIP=%d\n", q10_skip);
+    printf("HALFPAGE_MERGE=%d\n", q10_merge);
     printf("INIT_SYNC_BYTES=%llu\n", (unsigned long long)g_init_bytes);
     printf("INIT_SYNC_ROUNDS=%llu\n", (unsigned long long)g_init_rounds);
     printf("INIT_SYNC_MS=%llu\n", (unsigned long long)g_init_us);   // 时间字段（抖动，按区间报）
@@ -568,6 +912,12 @@ int main(void) {
     printf("XFER_BARRIERS=%llu\n", (unsigned long long)xs.barriers);
     printf("XFER_RING_FULL=%llu\n", (unsigned long long)xs.ring_full);
     printf("XFER_IDLE_CALLS=%llu\n", (unsigned long long)xs.idle_calls);
+    // N4-c 的搬运侧读数
+    printf("XFER_RB_ADDR_CALLS=%llu\n", (unsigned long long)xs.rb_addr_calls);
+    printf("XFER_RB_ADDR_BYTES=%llu\n", (unsigned long long)xs.rb_addr_bytes);
+    printf("XFER_GPU_SETTLED=%llu\n", (unsigned long long)xs.gpu_settled);
+    printf("XFER_UP_SKIP_GPU_PAGES=%llu\n", (unsigned long long)xs.up_skip_gpu);
+    printf("XFER_UP_SKIP_GPU_BYTES=%llu\n", (unsigned long long)xs.up_skip_gpu_bytes);
     printf("SUB_COMMITS=%llu\n", (unsigned long long)ss.commits);
     printf("SUB_SUBMITS=%llu\n", (unsigned long long)ss.submits);
     printf("SUB_SUBMIT_FAIL=%llu\n", (unsigned long long)ss.submit_fail);

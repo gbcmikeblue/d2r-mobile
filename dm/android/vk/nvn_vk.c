@@ -31,10 +31,13 @@
 #include "vk_ops.h"
 #include "vk2_pool.h"      // N4：新地基（Vulkan 原生显式实现）的池模块 —— 选路点与真机池账 | N4: the new pool module
 #include "vk2_xfer.h"      // N4-b：上传窗口 —— 帧开头把 CPU 脏页搬进后备资源（GPU 侧从此读的是后备）| the upload window
+#include "vk2_sub.h"       // N4-c：提交侧（帧批提交 + 有界在飞 + 定向栅栏）—— 回放层不再用旧路的 8 槽与队列空闲等待
 
 // N4-b：暂存环按**提交槽**分段（一段一个槽 ⇒ 在飞几个槽就能同时各载一个上传窗口，N3 量出来的待办）。
-// 段数与槽数必须一致：下面 `MAX_INFLIGHT` 那里有一条 `_Static_assert` 把这条纪律做成编译期检查。
-// N4-b: the staging ring is split per submission slot; the counts must agree, checked at compile time below.
+// N4-c：**槽=新地基的 `vk2_sub` 槽**（在飞深度 `VK2_INFLIGHT_DEFAULT` = 3，N3 的读数定下来的）⇒ 段数取 8 是
+// 一个上界（VK2_BANKS_MAX = 16 够），真正生效的段数是 `vk2_sub_use_banks()` 按槽数分的那个。
+// N4-c: the slots are now vk2_sub's slots (in-flight depth 3, settled by N3's readings), so 8 is only an upper bound
+// for the bank count -- what takes effect is what vk2_sub_use_banks() splits for the actual slot count.
 #define VK2_UPLOAD_BANKS 8
 #include "dm.h"
 #include <pthread.h>
@@ -107,6 +110,8 @@ static VkBuffer make_pool_buffer(uint64_t size, int *fell_back) {
 // bytes and "how much is needed" has to be measured before "whether to give it".
 static int      g_vk2_up;              // 新地基池模块起来了吗 | the new pool module is up
 static int      g_vk2_gpu;             // **N4-b：GPU 侧接管了吗**（`mtl_addr` 回后备资源 + 帧开头上传）| GPU side taken over
+static int      g_vk2_sub_ok;          // **N4-c：提交侧接管了吗**（`vk2_sub` 起来了、钩子挂上了）| submission side taken over
+static uint64_t g_vk2_banks;           // 实际分了几个环段（= 提交槽数）| banks the ring was actually split into
 static uint64_t g_vk2_adds;            // 经新地基登记过的池数（含旧路会拒的那些）| pools registered via the new module
 static uint64_t g_vk2_bytes;           // 它们的总字节 | their total bytes
 static uint64_t g_vk2_route_logged;    // 选路行只打一次 | log the route line once
@@ -120,6 +125,25 @@ static uint64_t g_vk2_touch_hit;       // 触碰命中池的次数（标脏成�
 static uint64_t g_vk2_touch_miss;      // 触碰没落在池里的次数（正常情形，只计数）| touches outside every pool (normal)
 static uint64_t g_vk2_gpu_writes;      // GPU 直写后备（UPDATE_UB / COPY_B2B 的目标）的标脏次数 | GPU-direct writes marked
 static uint64_t g_vk2_synced_pools;    // 上次初始同步时已登记几个池（多出来的池要再同步一次）| pools covered so far
+// N4-c 的读数：往返型（GPU→池）回读、半页竞态、提交侧接管（G4 的第三条与 11.3 缺的三个字段都从这里读）
+// N4-c readings: round-trip readbacks, half-page hazards, and the submission side (G4's third criterion).
+static uint64_t g_vk2_rb_calls;        // 槽回收时回读的次数 | readbacks in the reclaim hook
+static uint64_t g_vk2_rb_bytes;        // 回读的字节 | bytes read back
+static uint64_t g_vk2_rb_us;           // 回读花的累计时间 | cumulative readback time
+static uint64_t g_vk2_rb_max_us;       // 单次最长（µs）| longest single readback
+static uint64_t g_vk2_rb_hook;         // 槽回收钩子被调用的次数 | reclaim-hook calls
+static uint64_t g_vk2_rb_deferred;     // 清 GPU 位被延后的段数（别的在飞提交还写同一页）| settle deferred to a later slot
+static uint64_t g_vk2_rb_ranges;       // 一次提交里记下的 GPU 直写区间数（累计）| GPU-written intervals recorded
+static uint64_t g_vk2_hazard;          // 半页竞态**化解**次数（绑定点上先回读整页）| half-page hazards resolved
+static uint64_t g_vk2_hazard_bytes;    // 为化解而回读的字节 | bytes read back to resolve them
+static uint64_t g_vk2_begin_fail;      // 取不到提交槽的次数（超时如实报失败）| times no submission slot could be taken
+static uint64_t g_vk2_idle_skipped;    // **N4-c：本该等队列空闲、但被定向栅栏/顺序替代掉的次数** | queue-idle waits avoided
+// "一帧"的三个新基线字段（11.3）：每帧脏 run 数（上传侧由 vk2_xfer 记账）、每帧提交次数、槽等待率。
+// The three new baseline fields (11.3): dirty runs per frame, submissions per frame, and the slot wait rate.
+static uint64_t g_vk2_subs;
+
+// N4-c：槽回收钩子（定义在提交那一节：它要用 g_inf[] 的 per-slot 状态）| N4-c: the reclaim hook (defined with submission)
+static void vk2_reap_hook(int slot, uint64_t frame, VkFence fence, void *ud);
 
 static void vk2_boot(void) {
     if (g_vk2_up) return;
@@ -167,6 +191,25 @@ static void vk2_boot(void) {
     if (banks != VK2_UPLOAD_BANKS)
         LOG("【黄】N4：暂存环只分到 %d 段（要 %d 段）⇒ 多出来的槽会共用第 0 段",
             banks, (int)VK2_UPLOAD_BANKS);
+    // ---- N4-c：提交侧（§9.6 的 `vk2_sub_*` 顶替旧路的 8 槽 + 队列锁 + 全部 `vkQueueWaitIdle`）----
+    // 三件事必须一起挂上，缺一个就退回旧路（宁可整块退回，也不要"一半新一半旧"的提交）；
+    // 起不来时 g_vk2_sub_ok 保持 0 ⇒ 提交走旧路（GPU 侧的内存接管仍然有效）。
+    // N4-c: the submission side. All three pieces are installed together, or the submission stays on the old road
+    // (a half-taken-over submission path is worse than either road); the GPU-side memory takeover stays either way.
+    if (vk2_sub_init(&d, VK2_INFLIGHT_DEFAULT)) {
+        vk2_sub_set_reap_hook(vk2_reap_hook, NULL);               // 槽回收：副作用 + GPU→池回读 + 描述符池
+        vk2_sub_set_queue_lock(vk_queue_lock, vk_queue_unlock);   // 与前端上屏/回读共用同一条队列
+        vk2_xfer_set_queue_lock(vk_queue_lock, vk_queue_unlock);  // 回读拷贝也在同一条队列上
+        int nb = vk2_sub_use_banks();
+        if (nb > 0) {
+            g_vk2_banks = (uint64_t)nb;
+            g_vk2_sub_ok = 1;
+        } else {
+            LOG("【红】N4-c：环按槽分失败 ⇒ **提交侧仍走旧路**（在飞深度与环段数不匹配会把上传串行化）");
+        }
+    } else {
+        LOG("【红】N4-c：提交模块起不来 ⇒ **提交侧仍走旧路**（GPU 侧的内存接管不受影响）");
+    }
     g_vk2_up = 1;
     g_vk2_gpu = 1;
     vk2_pool_set_gpu_takenover(1);   // 只影响路由行的自证措辞（"只登记" vs "GPU 侧已接管"）
@@ -177,18 +220,55 @@ static void vk2_boot(void) {
     LOG("N4-b **GPU 侧接管**：暂存环 %llu MB / %d 段（按提交槽分）；`mtl_addr` 起回**后备资源**"
         "（块缓冲 + 块内偏移）；帧开头把 CPU 脏页搬上去",
         (unsigned long long)rmb, banks);
+    if (g_vk2_sub_ok)
+        LOG("N4-c **提交侧接管**：%d 个提交槽（`vk2_sub_*`，一环一段）、**槽满了只等最老那个槽的定向栅栏**、"
+            "`mtl_drain/finish` → 等全部在飞槽的栅栏；槽回收时把这次提交 **GPU 直写的段回读进影子**（往返型）",
+            vk2_sub_inflight());
+    else
+        LOG("【黄】N4-c：提交侧**没接上**（回放层继续用旧路 8 槽 + `vkQueueWaitIdle`）");
 }
+
+// N4-c：一次提交里记多少个"GPU 直写过后备"的区间（`COPY_B2B` / `UPDATE_UB` 的目标）。超了就把它们并成
+// **一个上界**（从最小到最大），回读时多读一点但语义不变 —— 与"节流而不是丢"同一条纪律。
+// N4-c: how many GPU-written ranges one submission records; on overflow they are merged into a single bounding
+// range (reading a bit more is fine, silently dropping one is not).
+#define VK2_GPUWR_MAX 64
+// 定义在提交那一节（要用 inflight_t / g_inf / g_cur_slot）：这里先声明，两个触碰包装就都能用它。
+// Defined in the submission section (it needs inflight_t / g_inf / g_cur_slot); declared here for the wrappers.
+static inline void vk2_gpuwrite_note(uint64_t a, uint64_t n);
 
 // N4-b：标脏的两个小包装（回放层的绑定点与拷贝点用）。关着时一次都不动；命中/未命中都记账
 // —— 未命中是**正常情形**（绑定的地址常常落在池外），所以只计数、不报红。
 // N4-b: the two marking wrappers the replay layer's binding and copy sites use. Misses are normal, so they count.
+//
+// N4-c：半页竞态的**对策**（N2 量出的那条：GPU 写过的页被 CPU 部分写，整页上传会把 GPU 写在那页里、
+// CPU 没碰过的字节盖掉）。顺序上"在绑定点先回读该页"做不到 —— 那一刻这次要发生的 GPU 写**还没发生**
+// （标记是录制期写的，提交还没发），回读只会把还没被写过的后备读进影子。真正在时序上成立的只有两条：
+//   ① **槽回收时**（那次提交的栅栏已经 signal）把它直写过的段**整页**回读进影子 —— 这是最早可行的"先回读该页"；
+//   ② **帧开头上传时跳过还带着 GPU 脏的页**（`vk2_xfer.c` 的 `up_skip_gpu`）—— 不拿旧影子盖掉在飞的 GPU 写，
+//      那几页保持 CPU 脏，等 ① 把 GPU 的字节合回影子之后再上传。
+// 本包装只把"这次触碰撞上了 GPU 脏页"记一笔（`g_vk2_hazard`）—— 它不再是"只报计数"，而是上面两条机制的
+// 计数入口；真出现"撞上了、而两条机制都没覆盖到"的情形，读数里的 hazard 与 up_skip_gpu 会一起说明。
+// N4-c: the half-page countermeasure. Reading the page back *at the binding point* cannot be correct -- the GPU
+// write being announced has not happened yet (the mark is recorded, the submission is not), so a readback there would
+// bring an unwritten backing store into the shadow. The two orderings that do hold are (1) at slot reap, with the fence
+// already signalled, read the submission's GPU-written ranges back page by page, and (2) at the frame head, skip pages
+// that are still GPU-dirty instead of pushing stale shadow bytes over an in-flight GPU write.
 static inline void vk2_touch_cpu_(uint64_t a, uint64_t n) {
     if (!g_vk2_gpu) return;
+    if (vk2_dirty_any_gpu(a, n)) {
+        g_vk2_hazard++;
+        if (g_vk2_hazard <= 8)
+            LOG("【地基】半页竞态：这次触碰（%#llx+%llu）撞上 GPU 写过的页 ⇒ 靠「回收时整页回读」+"
+                "「上传跳过 GPU 脏页」两条对策（累计 %llu 次）", (unsigned long long)a, (unsigned long long)n,
+                (unsigned long long)g_vk2_hazard);
+    }
     if (vk2_touch_cpu(a, n)) g_vk2_touch_hit++; else g_vk2_touch_miss++;
 }
 static inline void vk2_touch_gpu_(uint64_t a, uint64_t n) {
     if (!g_vk2_gpu) return;
     if (vk2_touch_gpu(a, n)) g_vk2_gpu_writes++;
+    vk2_gpuwrite_note(a, n);   // 记进本槽 —— 槽回收时按它把这一段回读进影子（N4-c 的往返型）
 }
 
 // 池账一行（自证：池地址、大小、新地基收没收、以及"要多少/给了多少"）
@@ -327,8 +407,40 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
 // M3-2w: these two go through the ledger as well -- they are "a guest thread waiting for the driver to finish the queue",
 // and the driver polls inside with a 1 ms sleep (exactly the shape of the host chain `nanosleep <- usleep <- ...` that
 // "M3-2v" caught). The site names split drain / finish so a dump is not ambiguous.
-void mtl_drain(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（drain）"); vk_queue_lock(); dm_waitled_enter("mtl_drain：等队列空闲（客体线程上等驱动）"); vkQueueWaitIdle(vk_queue()); dm_waitled_leave(); vk_queue_unlock(); } }
-void mtl_finish(void) { if (vk_dev()) { vk_queue_note("客体：等队列空闲（finish）"); vk_queue_lock(); dm_waitled_enter("mtl_finish：等队列空闲（客体线程上等驱动）"); vkQueueWaitIdle(vk_queue()); dm_waitled_leave(); vk_queue_unlock(); } }
+// N4-c：新地基下这两条不再等队列空闲，而是**等所有在飞槽自己的定向栅栏**（`vk2_sub_wait_all()`，带超时、
+// 超时如实报失败）。语义上等价（都在等"我这边的活全做完"），但**不等别人**：前端线程的上屏提交与它无关，
+// G4 要的 `vkQueueWaitIdle` 计数 0 也正是靠这一行。旧路照旧（缺省关时一行都不变）。
+// N4-c: with the new foundation these wait on every in-flight slot's own fence instead of queue idle -- the same
+// meaning ("my work is done") without waiting on the front end's presents, and it is what keeps the queue-idle count
+// at zero. The old road is untouched while DM_GFX2 is off.
+void mtl_drain(void) {
+    if (!vk_dev()) return;
+    if (g_vk2_sub_ok) {
+        vk_queue_note("客体：等所有在飞槽的栅栏（drain）");
+        dm_waitled_enter("mtl_drain：等全部在飞槽的定向栅栏（N4-c，不 vkQueueWaitIdle）");
+        if (!vk2_sub_wait_all()) LOG("【红】mtl_drain：等在飞槽超时（如实报失败，不重试）");
+        dm_waitled_leave();
+        return;
+    }
+    vk_queue_note("客体：等队列空闲（drain）"); vk_queue_lock();
+    dm_waitled_enter("mtl_drain：等队列空闲（客体线程上等驱动）");
+    vk_idle_wait("mtl_drain：等队列空闲（客体线程上等驱动）");
+    dm_waitled_leave(); vk_queue_unlock();
+}
+void mtl_finish(void) {
+    if (!vk_dev()) return;
+    if (g_vk2_sub_ok) {
+        vk_queue_note("客体：等所有在飞槽的栅栏（finish）");
+        dm_waitled_enter("mtl_finish：等全部在飞槽的定向栅栏（N4-c，不 vkQueueWaitIdle）");
+        if (!vk2_sub_wait_all()) LOG("【红】mtl_finish：等在飞槽超时（如实报失败，不重试）");
+        dm_waitled_leave();
+        return;
+    }
+    vk_queue_note("客体：等队列空闲（finish）"); vk_queue_lock();
+    dm_waitled_enter("mtl_finish：等队列空闲（客体线程上等驱动）");
+    vk_idle_wait("mtl_finish：等队列空闲（客体线程上等驱动）");
+    dm_waitled_leave(); vk_queue_unlock();
+}
 
 // 统计出参：waits 类的计数还没做（提交落地后才有），池子数是现成的事实。
 // Statistics out-parameters: the waits counters do not exist yet (they arrive with submission), the pool
@@ -374,7 +486,11 @@ enum { POST_EVENT, POST_COUNTER, POST_MEMCPY };
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; void *src, *dst; size_t n; } post_op;
 
 #define MAX_INFLIGHT 8
-_Static_assert(VK2_UPLOAD_BANKS == MAX_INFLIGHT, "暂存环段数必须等于提交槽数（N4-b）");
+// N4-c：新地基的槽数（`vk2_sub` 的在飞深度）≤ 我们请求的环段数 ≤ 环能分的上限。旧路的 8 槽只在新地基关着时用。
+// N4-c: the new foundation's slot count (vk2_sub's in-flight depth) must fit in the banks we ask for, and those in
+// the ring's maximum; the old road's 8 slots are only used while the new foundation is off.
+_Static_assert(VK2_INFLIGHT_DEFAULT <= VK2_UPLOAD_BANKS && VK2_UPLOAD_BANKS <= VK2_BANKS_MAX,
+               "暂存环段数要 ≥ 新地基的槽数、≤ 环能分的上限（N4-c）");
 #define MAX_POST 512
 #define STAGE_SIZE (4u << 20)
 typedef struct {
@@ -387,10 +503,51 @@ typedef struct {
     // N4-b: did this slot record an upload window? The ring bank is handed back when the slot is reaped.
     int vk2_up;
     post_op post[MAX_POST]; int npost;
+    // N4-c：**这次提交 GPU 直写过后备的区间**（`COPY_B2B` / `UPDATE_UB` 的目标），槽回收时按这些区间把后备
+    // 回读进影子 —— 旧路里 GPU 写的就是池内存本身、CPU 后读得到；新地基下写落在后备资源上，不回读就是永远
+    // 读到旧值。**按槽记账**（不是"扫全池的 GPU 脏页"）：同时有别的槽在飞、又标了同一页时，扫全池会把还没被
+    // GPU 写到的页提前回读 + 置 CLEAN ⇒ 那次写就丢了（N4-c 设计时正是为了绕开这条）。
+    // N4-c: the ranges this submission *directly* let the GPU write, read back into the shadow when its slot is
+    // reaped. Tracked per slot on purpose: scanning the whole pool would also pick up pages a still-in-flight slot
+    // has marked but not written yet, and cleaning those would lose that write.
+    struct { uint64_t addr, len; } gpu_wr[VK2_GPUWR_MAX];
+    int ngpu_wr, gpu_wr_over;   // gpu_wr_over：区间表满之后合并进来的次数（合并 = 读一个上界，正确但多读）
 } inflight_t;
 static inflight_t g_inf[MAX_INFLIGHT];
 static uint64_t g_fence;
 static int g_cur_slot = -1;   // 正在录制的槽（-1 = 没在录）| the slot being recorded (-1 = not recording)
+
+// N4-c：记一笔"这次提交让 GPU 直写后备的区间"（槽回收时按它回读）。表满 ⇒ 并成一个上界（正确、多读一点）。
+// N4-c: record a range this submission lets the GPU write directly (the reclaim hook reads it back). On overflow the
+// ranges are merged into one bounding range.
+static inline void vk2_gpuwrite_note(uint64_t a, uint64_t n) {
+    if (!g_vk2_gpu || g_cur_slot < 0 || !g_vk2_sub_ok) return;
+    inflight_t *in = &g_inf[g_cur_slot];
+    g_vk2_rb_ranges++;
+    for (int k = 0; k < in->ngpu_wr; k++) {   // 与已有区间相邻/重叠 ⇒ 合并（同一个目标反复写是常态）
+        uint64_t lo = in->gpu_wr[k].addr, hi = lo + in->gpu_wr[k].len;
+        if (a + n >= lo && a <= hi) {
+            uint64_t nlo = a < lo ? a : lo, nhi = (a + n) > hi ? a + n : hi;
+            in->gpu_wr[k].addr = nlo; in->gpu_wr[k].len = nhi - nlo;
+            return;
+        }
+    }
+    if (in->ngpu_wr < VK2_GPUWR_MAX) { in->gpu_wr[in->ngpu_wr].addr = a; in->gpu_wr[in->ngpu_wr].len = n; in->ngpu_wr++; return; }
+    uint64_t lo = in->gpu_wr[0].addr, hi = lo + in->gpu_wr[0].len;
+    for (int k = 1; k < in->ngpu_wr; k++) {
+        uint64_t l2 = in->gpu_wr[k].addr, h2 = l2 + in->gpu_wr[k].len;
+        if (l2 < lo) lo = l2;
+        if (h2 > hi) hi = h2;
+    }
+    if (a < lo) lo = a;
+    if (a + n > hi) hi = a + n;
+    in->gpu_wr[0].addr = lo; in->gpu_wr[0].len = hi - lo;
+    in->ngpu_wr = 1;
+    in->gpu_wr_over++;
+    if (in->gpu_wr_over <= 4)
+        LOG("【黄】这次提交的 GPU 直写区间超过 %d 条 ⇒ 并成一个上界（回读会多读 %llu 字节，语义不变）",
+            VK2_GPUWR_MAX, (unsigned long long)(hi - lo));
+}
 
 // 渲染状态影子与通道机械的**前置声明**：结构定义放这儿（提交侧的 begin/commit 也要用），函数体在命令流那一节。
 // Forward declarations of the render-state shadow and the pass machinery: the struct is defined here because the
@@ -932,12 +1089,22 @@ int vk_diag_line(char *buf, size_t cap) {
     vk_pipe_stats(&nlay, &nl2, &ncpso, &gpso, &nfail);
     uint64_t tot = 0;
     for (int t = 0; t < g_rt_n; t++) tot += g_rt_use[t].n;
-    return snprintf(buf, cap,
+    int n = snprintf(buf, cap,
                     "出图 %llu；绘制 有目标 %llu / 无目标 %llu；T2T %llu；渲染目标 %d 张（前几名累计 %llu）；图形管线 %llu（失败 %llu）；未执行 op %llu",
                     (unsigned long long)atomic_load(&g_present_n),
                     (unsigned long long)atomic_load(&g_draw_ncN), (unsigned long long)atomic_load(&g_draw_nc0),
                     (unsigned long long)vk_tex_t2t_count(), g_rt_n, (unsigned long long)tot,
                     (unsigned long long)gpso, (unsigned long long)nfail, (unsigned long long)atomic_load(&g_op_unhandled));
+    // N4-c：**G4 的第三条判据就挂在这一行上**（每秒一次，截图里也看得见）——
+    // 「等队列空闲」那一格在新地基下必须是 0；另一半是"被定向栅栏/提交序替代掉"的次数（自证不是没跑到）。
+    // N4-c: G4's third criterion rides on this line (once a second, and it shows in screenshots): the queue-idle
+    // count must be zero under the new foundation, and the "avoided" count proves the sites really ran.
+    if (g_vk2_gpu && n > 0 && (size_t)n < cap)
+        snprintf(buf + n, cap - (size_t)n,
+                 "；**等队列空闲 %llu**（新地基下必须 0）/ 被定向栅栏替代 %llu；提交侧 %s",
+                 (unsigned long long)vk_idle_calls(), (unsigned long long)vk_idle_calls_skipped(),
+                 g_vk2_sub_ok ? "新地基（vk2_sub）" : "旧路 8 槽");
+    return n;
 }
 
 // 按请求截图（DM_NVN_SHOT_UI / DM_TICK_HOLD=E:SHOT 用）：在当前出图帧之后第 k 帧截图。与苹果侧同签名。
@@ -961,20 +1128,93 @@ void mtl_xv_window_tex(uint64_t serial) {
     LOG("[vk] 登记窗口贴图：序号 %llu", (unsigned long long)serial);   // 与出图时报的序号对着看 | compare against the serial reported at present
 }
 
+// GPU 已完成某一个槽：先把"GPU 完成后才生效"的副作用做掉（旧路与新路的**同一段代码**，N4-c 把提出来共用）。
+// The "only after completion" effects of one finished slot (the same code on both roads; N4-c factored it out).
+static void slot_post_run(int i) {
+    for (int k = 0; k < g_inf[i].npost; k++) {
+        const post_op *o = &g_inf[i].post[k];
+        if (o->kind == POST_EVENT) { if (o->mode == 0) *o->val = o->v; else *o->val += o->v; }
+        else if (o->kind == POST_COUNTER) { if (o->addr) *(volatile uint32_t *)(uintptr_t)o->addr = (uint32_t)o->type; }
+        else if (o->kind == POST_MEMCPY) memcpy(o->dst, o->src, o->n);
+    }
+    g_inf[i].npost = 0;
+    g_inf[i].pending = 0;
+}
+
+// N4-c：**槽回收钩子**（`vk2_sub` 在"观察到某个槽的栅栏已经 signal"时调它，然后才让那个槽可重用）。
+// 三件事，顺序就是它们必须发生的顺序：
+//   ① 副作用（事件写值 / 计数器 / 未对齐拷贝的 CPU memcpy）—— 与旧路同一段代码；
+//   ② **往返型的回读**：这次提交让 GPU 直写过后备的那几段（`COPY_B2B` / `UPDATE_UB` 的目标），按**这次提交
+//      自己的栅栏（已经 signal）**整页回读进影子 —— 旧路里 GPU 写的就是池内存本身、CPU 后读得到；新地基下
+//      写落在后备资源上 ⇒ 不回读就永远读到旧值（"出图停住"的第一嫌疑，见 ANDROID_PLAN §八·N4-b）；
+//   ③ 描述符池整池重置 + 时间戳读回（与旧路回收时同一件事）。
+// **环的交还由 `vk2_sub` 自己做**（`vk2_sub_note_upload` 记着这一槽载着窗口）—— 这里不碰环。
+// N4-c: the reclaim hook. Three things in this order: the post-completion effects, the round-trip readback of the
+// ranges this submission let the GPU write directly (on its own signalled fence), and the descriptor-pool reset plus
+// timestamp readback. Handing the ring bank back is vk2_sub's own job (vk2_sub_note_upload), not ours.
+static void vk2_reap_hook(int slot, uint64_t frame, VkFence fence, void *ud) {
+    (void)ud;
+    if (slot < 0 || slot >= MAX_INFLIGHT) return;
+    g_vk2_rb_hook++;
+    inflight_t *in = &g_inf[slot];
+    slot_post_run(slot);
+    in->value = frame;
+    if (in->ngpu_wr) {
+        uint64_t t0 = now_ns(), bytes = 0;
+        int ok = 1, deferred = 0;
+        vk2_readback_after(fence);              // 生产者 = 这次提交自己（此刻已经 signal）
+        for (int k = 0; k < in->ngpu_wr; k++) {
+            bytes += in->gpu_wr[k].len;
+            if (!vk2_readback_addr(in->gpu_wr[k].addr, in->gpu_wr[k].len)) ok = 0;
+        }
+        // 语义（照旧路的读法定的）：**GPU 直写那一段里的字节以 GPU 为准**，其余字节保持影子的（= CPU 的）。
+        // 理由：客体是"先把数据写好、再录这条拷贝/更新、最后提交"，而拷贝在提交之后才执行 ⇒ 同一份内存里
+        // 也是"拷贝后写、它赢"（旧路的池内存就是 GPU 内存，就是这个次序）。同页上**落在 GPU 写过的区间之外**
+        // 的 CPU 字节不受影响 —— 这就是"页内字节级"的那一半（N2 只报计数的半页竞态在这里被拆开了）。
+        // Semantics (read off the old road): inside the range the GPU wrote, the GPU's bytes win -- the guest writes
+        // its data first, records the copy, and the copy executes after submission, so on a single copy of memory the
+        // GPU write is the later one. CPU bytes elsewhere on the page are untouched.
+        // 清 GPU 位**只能在没有别的在飞提交还写同一段覆盖到的页时做**：清早了会把那一次写记成 CLEAN，
+        // 而它还没被回读 ⇒ 那个写就再也回不来了（下一个回收钩子也不会再碰它）。有人还在写 ⇒ 留给它收尾。
+        for (int k = 0; k < in->ngpu_wr; k++) {
+            uint64_t lo = in->gpu_wr[k].addr, hi = lo + in->gpu_wr[k].len;
+            uint64_t gran = vk2_dirty_gran_default();              // 与脏位图粒度同档（N0 的读数：4 KiB）
+            uint64_t p0 = lo / gran * gran, p1 = (hi + gran - 1) / gran * gran;
+            int busy = 0;
+            for (int j = 0; j < MAX_INFLIGHT && !busy; j++) {
+                if (j == slot || !g_inf[j].pending) continue;
+                for (int m = 0; m < g_inf[j].ngpu_wr; m++) {
+                    uint64_t q0 = g_inf[j].gpu_wr[m].addr, q1 = q0 + g_inf[j].gpu_wr[m].len;
+                    if (q1 > p0 && q0 < p1) { busy = 1; break; }
+                }
+            }
+            if (busy) { deferred++; continue; }
+            vk2_gpu_settle(lo, hi > lo ? hi - lo : 1);
+        }
+        uint64_t dt = (now_ns() - t0) / 1000ull;   // µs
+        g_vk2_rb_calls++; g_vk2_rb_bytes += bytes; g_vk2_rb_us += dt;
+        if (deferred) g_vk2_rb_deferred += (uint64_t)deferred;
+        if (dt > g_vk2_rb_max_us) g_vk2_rb_max_us = dt;
+        if (!ok && g_vk2_rb_calls <= 8)
+            LOG("【黄】槽 %d（frame %llu）：这次提交的 GPU 直写段有 %d 段没回读成（影子可能还是旧值）",
+                slot, (unsigned long long)frame, in->ngpu_wr);
+        if (g_vk2_rb_calls <= 6 || (g_vk2_rb_calls % 300) == 0)
+            LOG("【地基】往返型回读：第 %llu 次（槽 %d / frame %llu）：%d 段 / %llu 字节，耗时 %llu µs"
+                "（GPU 写后备→影子；清位延后 %d 段）",
+                (unsigned long long)g_vk2_rb_calls, slot, (unsigned long long)frame, in->ngpu_wr,
+                (unsigned long long)bytes, (unsigned long long)dt, deferred);
+    }
+    in->ngpu_wr = 0; in->gpu_wr_over = 0;
+    desc_slot_reset(slot);
+    gpu_slot_readback(slot);
+}
+
 static void inflight_reap(void) {
+    if (g_vk2_sub_ok) return;   // N4-c：新地基下槽的回收由 `vk2_sub` 在回收时刻调钩子（栅栏句柄会被重用）
     for (int i = 0; i < MAX_INFLIGHT; i++) {
         if (!g_inf[i].pending) continue;
         if (vkGetFenceStatus(vk_dev(), g_inf[i].fence) != VK_SUCCESS) continue;
-        // GPU 已完成：先把"GPU 完成后才生效"的副作用做掉，再放掉这个槽
-        // The GPU has completed: run the "only after completion" effects first, then release the slot
-        for (int k = 0; k < g_inf[i].npost; k++) {
-            const post_op *o = &g_inf[i].post[k];
-            if (o->kind == POST_EVENT) { if (o->mode == 0) *o->val = o->v; else *o->val += o->v; }
-            else if (o->kind == POST_COUNTER) { if (o->addr) *(volatile uint32_t *)(uintptr_t)o->addr = (uint32_t)o->type; }
-            else if (o->kind == POST_MEMCPY) memcpy(o->dst, o->src, o->n);
-        }
-        g_inf[i].npost = 0;
-        g_inf[i].pending = 0;
+        slot_post_run(i);
         // N4-b：这一槽载着上传窗口 ⇒ **这一段暂存环现在才能交还**（环的存活期 ≤ 槽的存活期：
         // 环里的字节是那次拷贝的源，GPU 没做完之前不能被下一帧的 memcpy 盖掉）。
         // N4-b: this slot carried an upload window, so its ring bank is handed back only now.
@@ -1108,15 +1348,19 @@ static int vk_sub_ready(void) {
 // N4-b: the head of a frame -- push the bytes the shadow already has (and the GPU does not) into the backing store,
 // recorded before anything else in the command buffer. The replay runs at submission time, so the shadow already
 // holds every CPU write of this frame; which ranges to move is what the previous frame's touches marked.
-static void vk2_frame_upload(int slot) {
+static void vk2_frame_upload(int slot, int bank) {
     if (!g_vk2_gpu || !vk2_xfer_ready() || slot < 0 || slot >= MAX_INFLIGHT) return;
     // N4-b：**初始同步**（含"运行中新开的池"）—— 池刚登记时整池是脏的，而"一帧一段环"的节奏要几百帧才搬完，
     // 那几百帧里游戏读到的是没搬上去的部分。所以第一次提交之前先把脏页整批搬完（一次，~0.4 s 量级）。
+    // N4-c：用**最后一段**环（这一刻它不可能是某个在飞槽的段：初始同步发生在第一帧的开头），
+    // 新地基下段数是 3（不是旧路的 8）⇒ 段号要按实际分出来的段数取，写死 7 会越界。
     // N4-b: initial sync (including pools opened later): a fresh pool is entirely dirty and one ring's worth per
     // frame would take hundreds of frames, so the whole dirty set is pushed once before the first submission.
+    // N4-c: it uses the last bank, which cannot be held at this point (this runs at the very first frame head).
     if (g_vk2_adds && g_vk2_adds != g_vk2_synced_pools) {
         uint64_t t0 = now_ns();
-        uint64_t total = vk2_xfer_initial_sync(MAX_INFLIGHT - 1);
+        int sb = (int)(g_vk2_banks ? g_vk2_banks - 1 : (uint64_t)(MAX_INFLIGHT - 1));
+        uint64_t total = vk2_xfer_initial_sync(sb);
         g_vk2_synced_pools = g_vk2_adds;
         vk2_xfer_stats xs;
         vk2_xfer_stats_get(&xs);
@@ -1125,26 +1369,55 @@ static void vk2_frame_upload(int slot) {
             (unsigned long long)xs.initial_rounds, (unsigned long long)((now_ns() - t0) / 1000000));
     }
     g_vk2_frames++;
-    uint64_t moved = vk2_upload_all_into(slot, g_inf[slot].cb, g_fence + 1);
+    uint64_t moved = vk2_upload_all_into(bank, g_inf[slot].cb, g_fence + 1);
     if (!moved) return;
-    g_inf[slot].vk2_up = 1;                       // 回收这个槽时才能把这**一段**环交还
+    // N4-b：回收这个槽时才能把这**一段**环交还；N4-c：交还由 `vk2_sub` 在回收时刻自己做（它记着"这一槽载着窗口"），
+    // 旧路仍然由 `inflight_reap` 交还。
+    // N4-b: the bank is handed back when the slot is reaped; N4-c leaves that to vk2_sub (which knows the slot carries
+    // a window) and the old road keeps doing it in inflight_reap.
+    if (g_vk2_sub_ok) vk2_sub_note_upload();
+    else g_inf[slot].vk2_up = 1;
     g_vk2_up_frames++; g_vk2_up_windows++; g_vk2_up_bytes += moved;
     if (moved > g_vk2_up_max) g_vk2_up_max = moved;
     if (g_vk2_up_frames <= 6 || (g_vk2_frames % 30) == 0)
         LOG("【地基】帧开头上传：第 %llu 帧（槽 %d / 段 %d）搬 %llu KB；累计 %llu 帧里 %llu 帧搬过、"
             "共 %llu MB（最多一帧 %llu KB）",
-            (unsigned long long)g_vk2_frames, slot, slot, (unsigned long long)(moved >> 10),
+            (unsigned long long)g_vk2_frames, slot, bank, (unsigned long long)(moved >> 10),
             (unsigned long long)g_vk2_frames, (unsigned long long)g_vk2_up_frames,
             (unsigned long long)(g_vk2_up_bytes >> 20), (unsigned long long)(g_vk2_up_max >> 10));
 }
 
 void mtl_sub_begin(void) {
     if (!vk_sub_ready()) return;
-    int i = inflight_take();
-    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    if (vkBeginCommandBuffer(g_inf[i].cb, &bi) != VK_SUCCESS) { LOG("【红】开始命令缓冲失败"); return; }
+    int i = -1;
+    int bank = 0;
+    if (g_vk2_sub_ok) {
+        // N4-c：**提交侧走新地基** —— 取槽 = `vk2_sub_begin()`（先轮询 `vkGetFenceStatus`、满了只等最老那个槽的
+        // 定向栅栏、带超时；**绝不等队列空闲**）。命令缓冲是**它**的（"一个客体提交 = 一次 `vkQueueSubmit`"），
+        // 我们只是把它接到 `g_inf[i].cb` 上 —— 下游几十处录命令的地方一行都不用改。
+        // 槽回收（副作用 / GPU→池回读 / 描述符池）由它的回收钩子在**它自己看到栅栏 signal 的那一刻**做。
+        vk2_slot *s = vk2_sub_begin();
+        if (!s) {
+            g_vk2_begin_fail++;
+            if (g_vk2_begin_fail <= 4)
+                LOG("【红】N4-c：取不到提交槽（%d 个槽都在飞且等栅栏超时）⇒ 这次提交被丢（如实报，不重试）",
+                    vk2_sub_inflight());
+            return;                                  // g_cur_slot 保持 -1：下游录命令的地方都会自己跳过
+        }
+        i = vk2_sub_slot_id(s);
+        if (i < 0 || i >= MAX_INFLIGHT) { LOG("【红】N4-c：槽号 %d 越界（最多 %d）", i, MAX_INFLIGHT); vk2_sub_abort(); return; }
+        g_inf[i].cb = s->cb;                          // 把新地基的 cb 接进来（下游只认 g_inf[..].cb）
+        bank = vk2_sub_slot_bank(i);
+        if (bank < 0) bank = 0;
+    } else {
+        i = inflight_take();
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        if (vkBeginCommandBuffer(g_inf[i].cb, &bi) != VK_SUCCESS) { LOG("【红】开始命令缓冲失败"); return; }
+        bank = i;
+    }
     g_inf[i].cur = 1; g_inf[i].npost = 0; g_inf[i].stage_off = 0;
+    g_inf[i].ngpu_wr = 0; g_inf[i].gpu_wr_over = 0;
     gpu_slot_reset(i, g_inf[i].cb);   // 这一槽的查询区间复位（时间戳必须在同一命令缓冲里先复位再写） | reset this slot's query range (timestamps must be reset before being written, in the same command buffer)
     // 一次提交 = 一段连续的命令流：目标与清除按提交清零，视口/裁剪/绑定这些跨命令缓冲保留
     // （游戏在一个提交里给多个命令缓冲，状态在它们之间是接着用的）
@@ -1156,7 +1429,7 @@ void mtl_sub_begin(void) {
     g_rs.open = 0;
     g_cur_slot = i;
     // N4-b：帧开头把 CPU 脏页搬上去（`DM_GFX2=1` 且 GPU 侧已接管时才动；关着时一行都不执行）
-    vk2_frame_upload(i);
+    vk2_frame_upload(i, bank);
 }
 
 static void post_add(const post_op *o) {
@@ -1204,11 +1477,66 @@ void mtl_sub_counter(uint64_t addr, uint32_t type) {
     post_add(&o);
 }
 
+// N4-c 的读数（**11.3 里最后缺的三个字段的真帧落点**）：每帧提交次数 / 槽等待率 / 每帧脏 run 数，
+// 外加往返型回读与半页竞态的账。节流 = 每 60 次提交（+ 第一次）—— 游戏一轮约 100~200 次提交，
+// 挂在"每 300 次"上会一行都打不出来（口径：节流要按这一轮实际发生的量级定）。
+// N4-c's readings: the three baseline fields 11.3 was still missing, plus the round-trip and half-page accounts.
+static void vk2_n4c_report(int slot) {
+    vk2_sub_stats ss;
+    vk2_sub_stats_get(&ss);
+    vk2_xfer_stats xs;
+    vk2_xfer_stats_get(&xs);
+    uint64_t fr = g_vk2_frames ? g_vk2_frames : 1;
+    LOG("【地基】N4-c 提交侧：第 %llu 次提交（帧号 %llu、槽 %d、在飞 %d、每帧提交 %.2f）；槽等待率 %llu‰"
+        "（%llu/%llu，轮询回收 %llu）、提交失败 %llu、取不到槽 %llu；**等队列空闲 %llu**（新地基下必须 0）/ 被替代 %llu；"
+        "客体按自己的超时等围栏 %llu 次（其中超时 %llu 次）",
+        (unsigned long long)g_sub_total, (unsigned long long)g_fence, slot, vk2_sub_pending(),
+        (double)g_vk2_subs / (double)fr,
+        (unsigned long long)(ss.begins ? 1000ull * ss.waits / ss.begins : 0),
+        (unsigned long long)ss.waits, (unsigned long long)ss.begins, (unsigned long long)ss.poll_reaps,
+        (unsigned long long)ss.submit_fail, (unsigned long long)g_vk2_begin_fail,
+        (unsigned long long)vk_idle_calls(), (unsigned long long)vk_idle_calls_skipped(),
+        (unsigned long long)ss.wait1_calls, (unsigned long long)ss.wait1_timeouts);
+    LOG("【地基】N4-c 往返型：回读 %llu 次 / %llu KB（单次最长 %llu µs、累计 %llu ms；回收钩子 %llu 次、记下"
+        "GPU 直写区间 %llu 段、清位延后 %llu 段）；半页竞态撞上 %llu 次、上传跳过 GPU 脏页 %llu 页 / %llu KB；"
+        "每帧脏 run %.2f",
+        (unsigned long long)g_vk2_rb_calls, (unsigned long long)(g_vk2_rb_bytes >> 10),
+        (unsigned long long)g_vk2_rb_max_us, (unsigned long long)(g_vk2_rb_us / 1000),
+        (unsigned long long)g_vk2_rb_hook, (unsigned long long)g_vk2_rb_ranges,
+        (unsigned long long)g_vk2_rb_deferred, (unsigned long long)g_vk2_hazard,
+        (unsigned long long)xs.up_skip_gpu, (unsigned long long)(xs.up_skip_gpu_bytes >> 10),
+        (double)xs.runs / (double)fr);
+}
+
 uint64_t mtl_sub_commit(void) {
     if (!vk_sub_ready() || g_cur_slot < 0) { g_cur_slot = -1; return g_fence; }
     pass_end();   // 收尾时通道必须已关（VkCommandBuffer 不允许带着未关的动态渲染通道结束）| the pass must be closed before finishing (a VkCommandBuffer may not end inside an open dynamic render pass)
     inflight_t *in = &g_inf[g_cur_slot];
     int i = g_cur_slot; g_cur_slot = -1;
+    if (g_vk2_sub_ok) {
+        // N4-c：**一次客体提交 = 一次 `vkQueueSubmit`**（`vk2_sub_commit` 自己收尾 cb、`vkResetFences`、提交并
+        // 带上那个槽的定向栅栏；队列锁由它内部用同一把锁拿）。帧号也用它那一套 —— `g_fence` 跟着它走，
+        // 客体按 NVN 语义来等的那条路（`mtl_wait`）因此问的是**新地基的 frame**。
+        // N4-c: one guest submission is exactly one vkQueueSubmit, done inside vk2_sub_commit (it ends the cb, resets
+        // the fence and submits with that slot's own fence, taking the same queue lock). The frame numbering becomes
+        // vk2_sub's, so the guest's own fence waits (mtl_wait) ask about a new-foundation frame.
+        vk_queue_note("客体：提交命令缓冲");
+        dm_waitled_enter("vk：提交命令缓冲");
+        int ok = vk2_sub_commit();
+        dm_waitled_leave();
+        if (!ok) { LOG("【红】N4-c：vk2_sub_commit 没成（收尾 cb / 重置栅栏 / 提交 三者之一失败，细节见上一行）"); return g_fence; }
+        vk_op_note("客体：提交命令缓冲");
+        g_fence = vk2_sub_last_frame();
+        in->pending = 1;
+        in->value = g_fence;
+        g_vk2_subs++;
+        gpu_note_frame(i, atomic_load(&g_cur_frame));
+        g_sub_total++;
+        // N4-c 的读数**单独一行、按 60 次提交节流**（原来挂在"每 300 次"那个块里 —— 游戏一轮只有 ~200 次提交，
+        // 于是那三行一次都没打出来：读数的节流口径要按**这一轮实际会发生的量级**定，见 TOOLS B⁷）。
+        if (g_sub_total % 60 == 0 || g_sub_total == 1) vk2_n4c_report(i);
+        goto report_ops;
+    }
     if (vkEndCommandBuffer(in->cb) != VK_SUCCESS) { LOG("【红】结束命令缓冲失败"); return g_fence; }
     VkResult r = vkResetFences(vk_dev(), 1, &in->fence);
     if (r != VK_SUCCESS) { LOG("【红】重置栅栏失败 VkResult %d", (int)r); return g_fence; }
@@ -1231,6 +1559,7 @@ uint64_t mtl_sub_commit(void) {
     in->value = ++g_fence;
     gpu_note_frame(i, atomic_load(&g_cur_frame));   // 这次提交属于哪一帧（完成是滞后的，回查靠帧号） | which frame this submission belongs to (completion is late; the lookup goes by frame number)
     g_sub_total++;
+report_ops:
     // 每 300 次提交报一次 op 分布：这就是"接下来该实现哪些 op"的实测依据。
     // 只报次数最多的 5 个：宿主的 LOG 有长度上限，一行塞 12 个 op 会被截断（实测截在 119 字符，
     // 而渲染 op 恰恰在截掉的那半截里；前 5 名已足够定实现次序）。
@@ -1337,6 +1666,35 @@ uint64_t mtl_last_fence(void) { return g_fence; }
 // NVN's own fence semantics, and a wait that never returns means "that submission never completes".
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (!vk_dev() || !fence || fence > g_fence) return 0;
+    if (g_vk2_sub_ok) {
+        // N4-c：客体按 NVN 的 fence 语义来等 —— 新地基下问的是 `vk2_sub` 的 frame：
+        // ① `timeout_ns == 0` 是"看一眼"（`nvnSyncWait` 第一次调用就是这个）⇒ `vk2_sub_poll` **不阻塞**；
+        // ② 带超时就等**那个 frame 自己的定向栅栏**（`vk2_sub_wait`，超时如实报失败）。
+        // 注意：这里**不再**"滑出在飞窗口就直接当完成" —— 那张表由 `vk2_sub` 的 frame 序号与 `poll` 负责。
+        // N4-c: the guest's own NVN fence wait now asks a vk2_sub frame: timeout 0 is a peek (vk2_sub_poll does not
+        // block) and a real timeout waits on that frame's own fence (a timeout is reported as failure).
+        uint64_t t0 = now_ns();
+        int done = vk2_sub_poll(fence);
+        if (done == 1) {
+            if (timeout_ns && now_ns() - t0 > 300000000ull)
+                LOG("[vk] 客体等栅栏：frame %llu 已经完成（等了 %llu 毫秒；新地基的定向栅栏）",
+                    (unsigned long long)fence, (unsigned long long)((now_ns() - t0) / 1000000));
+            return 1;
+        }
+        if (!timeout_ns) return 0;
+        atomic_store(&g_led_fence_wait, 1); g_led_fence_slot = -1; g_led_fence_since = t0;
+        dm_waitled_enter("mtl_wait：客体等围栏（N4-c：frame 自己的定向栅栏，**用客体给的超时**）");
+        // **客体给多久就等多久**（不许拿模块的 5 秒上限去截短客体的语义 —— 第一轮真机读数抓到的就是这个：
+        // 日志里 5005 毫秒正好等于模块那个上限，而 `nvnSyncWait` 要的是它自己的超时）。
+        int ok = vk2_sub_wait_timeout(fence, timeout_ns);
+        dm_waitled_leave();
+        atomic_store(&g_led_fence_wait, 0);
+        if (now_ns() - t0 > 300000000ull)
+            LOG("[vk] 客体等栅栏：frame %llu 等了 %llu 毫秒（新地基的定向栅栏；客体给的超时 %llu 毫秒、返回 %d）",
+                (unsigned long long)fence, (unsigned long long)((now_ns() - t0) / 1000000),
+                (unsigned long long)(timeout_ns / 1000000), ok);
+        return ok;
+    }
     if (fence <= g_fence - MAX_INFLIGHT) { inflight_reap(); return 1; }   // 早已滑出在飞窗口 | long past the in-flight window
     for (int i = 0; i < MAX_INFLIGHT; i++)
         if (g_inf[i].pending && g_inf[i].value == fence) {

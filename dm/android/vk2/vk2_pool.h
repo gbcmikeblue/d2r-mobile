@@ -190,6 +190,8 @@ int  vk2_addr(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off);
 // not an error -- pool-relative addresses are the common case but not the only one.
 int vk2_touch_cpu(uint64_t addr, uint64_t len);
 int vk2_touch_gpu(uint64_t addr, uint64_t len);
+// N4-c：只查不改 —— 这段地址里有没有 GPU 写过（还没回读回去）的页；半页竞态对策的第一问 | read-only GPU-dirty query
+int vk2_dirty_any_gpu(uint64_t addr, uint64_t len);
 // 把一个池**整段**标 CPU_DIRTY（池刚登记时 / 接管初始化时用）：新地基的后备资源在第一次上传之前是未定义的，
 // 所以"登记时全脏"是"第一帧就把整池搬上去"的机制。返回 1 = 成功。
 // Mark one whole pool CPU_DIRTY (on registration / takeover start): the backing store is undefined before its first
@@ -243,6 +245,8 @@ int         vk2_gfx2_enabled(void);
 // 它只影响 `vk2_route_line()` 的自证措辞 —— 让读数一眼看出"这次是只登记，还是真的接管了"。
 // N4-b: called once the replay layer really took the GPU side over; it only changes what vk2_route_line says.
 void        vk2_pool_set_gpu_takenover(int on);
+// N4-c：只读的问法（贴图侧那三处"一次性提交 + 等队列空闲"按同一条口径决定走不走）| N4-c: the read-only form
+int         vk2_gpu_takenover(void);
 const char *vk2_route_line(void);
 
 #endif // DM_VK2_POOL_H
