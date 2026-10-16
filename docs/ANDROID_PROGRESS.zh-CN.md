@@ -21,7 +21,7 @@
 | 维度 | 现状 |
 |---|---|
 | 支线目标 | 把已存在的 iOS/macOS 兼容层（宿主 + Metal 图形层 + iOS 前端）搬到 Android |
-| 阶段 | **M1 完成、M2 未验收、M3 进行中**（M0 完成，M4 未开始）；**新地基 N0 / N1 / N2 / N3 / N4-a / N4-b / N4-c 已完成，N4-d 的两部分、N4-e 的第一刀与 N4-f 的前半（顶点数据 / 常量缓冲都是正常的）也都已完成**（2026-10-16，路径见 `rewrite/`；下一块 = "**顶点着色器输出**"：位置经变换后出裁剪体 / 输出 NaN —— N4-g 先问 `VK_EXT_transform_feedback` 能力） |
+| 阶段 | **M1 完成、M2 未验收、M3 进行中**（M0 完成，M4 未开始）；**新地基 N0 / N1 / N2 / N3 / N4-a / N4-b / N4-c 已完成，N4-d 的两部分、N4-e 的第一刀、N4-f 的前半（顶点数据 / 常量缓冲都是正常的）与台账里那条 A1（真机装 Vulkan 校验层）也都已完成**（2026-10-16，路径见 `rewrite/`；**校验层照出 16 种 VUID、其中一条真误用（`shaderDrawParameters`）已修并复验**，但**没有一条是"draw 层面的用法错误"** ⇒ 下一块 = "**顶点着色器输出**"：位置经变换后出裁剪体 / 输出 NaN —— N4-g 先问 `VK_EXT_transform_feedback` 能力） |
 | 工作窗口 | 2026-10-13 ～ 2026-10-15，**97 个提交**（10-13：1 / 10-14：73 / 10-15：23） |
 | 安卓侧代码量 | `dm/android/` 50 个源文件、约 **10,700 行**（C/H）；兼容层 15 个头/源 |
 | 产物 | `dm.apk` **6.10 MB**（内含 `libdm.so` 6.09 MB，宿主 + 回放层全静态链入） |
@@ -136,6 +136,7 @@ flowchart LR
 | **新地基 N4-d（第二部分）** | **已完成（2026-10-16）**：① **一条更正（本轮最要紧）**：N4-a ~ N4-d（第一部分）两臂 conf 全是 `DM_WIN_SRC=0`（查看器显式关）⇒ 屏幕上那张是 `paint()` 的**测试图**（带 1156×650 = 16:9、白条 133×180 @ y=270 与 `main_apk.c:592` 逐位吻合）⇒ **那三轮"画面没变 / M2 未过"的截图证据作废**（原文已留 + 批注）；② **把查看器打开重跑 6 轮**（A′=DM_GFX2=1 / B′=旧路 × 第 0/1 级）⇒ **两臂两级亮度读数全是 `均值 0.0 / 最小 0 / 最大 0`**、读成功的三张截图 99.611% 纯黑（`vb-s45` 读回失败回落测试图又长出红带）；③ **水位线口径定案**（`Z == X+1`、`K == X − Y + δ`；真机 95 个采样全自洽）；④ **atrace 三份**（stop 推迟 10 s）+ **线程命名**（`dm-*` / `dm-g<handle>`）⇒ 停顿期间 **`dm-guest` 4.6 kHz 睡→醒、阻塞 caller 0 条**、**前端被 `kgsl-events` 叫醒**（2394 次/10 s）、我方 `vkQueueSubmit` 卡 11.7 s、**三份 + 六轮无一自愈** | 6 个查看器轮（`.work/logs/n4-shot-va{,0}-s20.log` / `va-s45` / `vb{,0}-s20` / `vb-s45`，含逐 2 秒的 `查看器：… 亮度` 行）、水位线短轮 `.work/logs/n4-n4d-va1.log`、atrace 三份 `.work/trace/at_stall-n4d-at2-{1,2,3}.txt`（33.3 / 32.2 s，我方 26 万条事件；抬升 ×6.2 维持 13.0 / 14.5 s）+ 命名后第四份 `at_stall-n4d-at3-1.txt`、截图 `.work/logs/n4b-{va-s20,va-s45,vb-s20,vb-s45}.png`、`tid` 映射 `.work/trace/tids-n4d-at*-*.txt`；新红行 `【红】回读拷贝 等定向栅栏超时（5000 ms）：VkResult 2`（`fence_timeouts`）按"见证不是原因"记档 | `ANDROID_PLAN` §八·N4-d（第二部分） |
 | **N4-e（第一刀）** | **已完成（2026-10-16）**：不再靠肉眼看屏幕，改成"**用我们自己的写入当刻度**"一层层收 —— ① **扫描器**（`DM_NVN_SHOT_SCAN`，一次扫全部已知贴图逐张逐级）：**A′/B′ 两臂 @出图 40 逐项相同**（139 张、≥256×256 的 26 张、读 33 次、成功 20 / 失败 13），20 次成功里**只有序号 27 的第 1/2 级是整片 255（纯白）**、其余全 0/0/0；@60 一轮 192 张 / 167 次 / **成功 13 / 失败 154（`读回不支持格式 138`）**。② **两个对照**证明读回链通：`DM_GFX_PROBE=7` ⇒ 序号 7 = **136.0**（与预算值逐位命中）、`=28` ⇒ 28 三级 = **152.0**。③ **通道探针**（新开关 `DM_PASS_PROBE`）：`:end` ⇒ 152 ⇒ **附件/视图/布局/存储那一层成立**；不带 `:end` ⇒ **仍是整片 152** ⇒ **游戏 3.9 万次绘制一个像素都没落下**。④ **光栅化侧逐条排除**：`DM_NO_DEPTH_TEST=1`、`DM_PASS_AREA=2`、**`DM_RASTER_BRUTE=1`（剔/混/写掩码/视口裁剪全放开）** 三种全放开的组合下**序号 28 仍是整片 152** ⇒ **片元在光栅化之前就没了**。⑤ **顶点/几何侧新仪表**（绑上/没绑上（按流）/顶点数 0/索引数 0）⇒ 两轮：**没绑上的 2682~2762 次全部是第 4 条流**、**顶点数 0 的 0 次**、索引数 0 的 19~23 次 ⇒ "顶点流没绑 / 几何为空"都不成立 | 读数 `.work/logs/n4-shot-n4e-{scan-a40,scan-b40,probe28-a40,probe7-a40}.log` + `n4-n4e-{passprobe28,passprobe28open,nodepth,passarea2,brute,vtx,vtx2,vtx3}.log`（每轮都带**开关自证行**，逐轮核对 `.work/n4e_chk_sw.py`）；抽表 `.work/n4e_scan_report.py`；**M2 的验收仍未过**（且"画面"这一问已被收窄到"顶点数据与着色器输出"） | `ANDROID_PLAN` §八·N4-e |
 | **N4-f（前半：顶点数据 / 常量缓冲）** | **已完成（2026-10-16）**：新开关 `DM_VTX_PROBE=1`（**缺省关、只读**：不改状态 / 不标脏 / 不提交）挂在**既有判据行**（前 8 次绘制 + 每 2048 次）那一点上，读**影子里的**顶点数据与常量缓冲 —— 位置属性（Location 0，缺则取着色器声明里第一条真的绑了的）的 NVN 格式 / 步长 / 偏移 / 流 / 影子地址 + 按格式解码前 4 个顶点；顶点阶段**所有**有地址的常量槽各读前 64 字节。**A 臂 5 轮 + B 臂 2 轮**：**位置数据 NaN 0 / Inf 0 / 整片全零 0**（形状两种：UI `3×Float 步长20`、主场景 `4×ShortSNORM 步长28/24/20`，顶点数 3~14550）；**常量缓冲 NaN 0 / Inf 0**、逐槽 \|max\| **两臂逐项相同**（槽0 1~1067、槽2 ≈1、**槽3 = 1600 = 屏幕宽**、槽10 410~1070）；**分量类型与 SPIR-V 声明对上**（`f88d27f131d71049` 的 Location 0/1 都是 float×4，NVN 给 `3×Float` 第 4 分量补 1，两侧一致）。⚠ 仪器自己出过一次错并当场更正：第一版只查"第一个非零常量槽"（`常量[0][0]` 的前 4 个 `-0.00125,0,0,0` **不像**变换矩阵）⇒ 改成**扫全部槽**。⇒ **"顶点数据本身坏掉"这一支被排除**；**画面仍是全零**（截图轮 `DM_WIN_SRC=28` 781 次读成功、亮度全 0，`n4b-n4f-shot-a.png`）。 | `ANDROID_PLAN` §八·N4-f |
+| **A1（台账 §14）真机装 Vulkan 校验层** | **已完成（2026-10-16）**：层的 `libVkLayer_khronos_validation.so`（**27,684,688 字节**，Khronos `android-binaries-1.4.363.0.zip`）进 APK 的 `lib/arm64-v8a/`（`build_apk.cmd` 新增**缺省关**的 `DM_VKLAYER=1` 可选段），用 `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用 —— **不用 root、不改一行代码**（清单里 `android:debuggable="true"` 本来就有）。自证：logcat `added global layer … from library '/data/app/…/lib/arm64/libVkLayer_khronos_validation.so'` + `Loaded layer`。**一轮 60 秒照出 218 条 Error / 16 种 VUID**；**当场点出一条真误用并已修 + 复验**：`SPIR-V Capability DrawParameters` 归 `VkPhysicalDeviceVulkan11Features::shaderDrawParameters` 管，而 `vk_device.c` 从没挂过这个结构，**游戏的顶点着色器 1839 份都在用 `gl_BaseInstance`**（离线 `.work/spv` 的 `BuiltIn 4425`）⇒ 修后层**不再报它**（按 capability 逐项对比：`DrawParameters` 2 → 0）。**对卡点 A 最要紧的是一条负结果**：**16 种 VUID 里没有一条是"draw 层面的用法错误"**（顶点缓冲绑定 / 管线与通道兼容性 / 描述符 / 顶点属性都不报）⇒ **我们的 draw 在 API 层面合法** ⇒ 与 N4-e/N4-f 的"几何是自己算没了"一致。剩 15 种真误用（SPIR-V 自身不合法、内存类型、aspectMask、信号量、clip/cull 超上限…）已逐条列档。 | `ANDROID_PLAN` §八·A1 / §七·第 6 条；`TOOLS` §G |
 | **新地基 N4-e 之后的 N5 ~ N6** | **未开工**（N5 仍暂缓：第二台不使用；下一步 = **N4-g**：只剩"**顶点着色器输出**" —— 位置经变换后全在裁剪体之外、或输出 NaN/Inf ⇒ 一个片元都不产生；**先问设备能力 `VK_EXT_transform_feedback`**，有就抓 `gl_Position` 直接回答"在不在裁剪体里"；那 ~10 秒停顿仍未定案） | 逐块计划、每块判据、"新基线六个字段"与"开工前要确认的三件事"见 `rewrite/ANDROID_REWRITE.zh-CN.md` §十一；§9.7 的接管点表已有批注⑥（N4-b）/⑦（N4-c）/⑧（N4-d 第一部分）/⑨（N4-d 第二部分）；新基线读数表 `.work/logs/vk2-readings.tsv`（N0 补录 + N1 ~ **N4-f** 十二行，六个字段已填满） | — |
 | M4 | 未开始 | — | — |
 
@@ -331,6 +332,17 @@ mach-o 段查找一律返回找不到；安卓 SIGSEGV 拿不到 ESR 读写位�
   ⇒ **"顶点数据本身坏掉"这一支被排除，只剩"顶点着色器输出"**（N4-g 先问 `VK_EXT_transform_feedback` 能力）。
   画面仍是全零（截图轮 `DM_WIN_SRC=28`：781 次读成功、亮度 0/0/0，`n4b-n4f-shot-a.png` 17718 字节）。
   读数 `.work/logs/n4-n4f-vtx-{a,a2,a3,a4,a5,b1,b2}.log`，结论 `ANDROID_PLAN` §八·N4-f。
+- **★ 2026-10-16（A1）真机装上 Vulkan 校验层：卡点 A **不是**"API 用法错误"** —— 层（Khronos 1.4.363，
+  `libVkLayer_khronos_validation.so` 27,684,688 字节）进 APK 的 `lib/arm64-v8a/`，`adb shell setprop
+  debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用（**不用 root、不改代码**），一轮 60 秒照出
+  **218 条 Error / 16 种 VUID**。**对本卡点最要紧的是一条负结果**：**没有一条是"draw 层面的用法错误"**
+  （没有"顶点缓冲未绑定 / 管线与渲染通道不兼容 / 描述符未绑定 / 顶点属性与着色器声明不匹配"）⇒
+  **我们的 draw 在 API 层面合法**，**几何是自己算没了**（与 N4-e 的"片元在光栅化之前就没了"、N4-f 的
+  "顶点数据 / 常量缓冲都正常"完全一致）。顺带**修掉一条真误用并复验**：`shaderDrawParameters` 从未启用，
+  而 1839 份着色器在用 `gl_BaseInstance`（修后层不再报它），但**画面没变** ⇒ 按"一次只改一个变量"记成负结果。
+  其余 15 种（SPIR-V 自身不合法 / 绑内存的类型与 dedicated / `vkCmdCopyImage` 的 aspectMask / 信号量重复
+  signal / clip-cull 超上限…）已逐条列档。读数 `.work/logs/logcat-vk-a1.txt`（2.45 MB）与 `logcat-vk-a2.txt`
+  （修后），结论 `ANDROID_PLAN` §八·A1、配方 `TOOLS` §G。
 
 ### 6.2 卡点 B：每轮约 10 秒的 GPU/显示通路停摆（当前主战场）
 
@@ -841,14 +853,53 @@ Android/Vulkan 后端"），是一份通用蓝图：阶段划分、高风险坑 
 
 **A. 卡点 A「渲染目标读回全零」（§6.1）**
 
-- [ ] **A1 真机装 Vulkan Validation Layers** —— plan §7.3 把它写进验收表（"开发环境中无未解决的关键 Vulkan 使用错误"）、§5.1 列为工具。
-  现状：真机**没有校验层**，项目代码里三处自述（`vk_tex.c:1475`、`vk_pipe.c:585`、`nvn_vk.c:1853`），
+- [x] **★ A1 真机装 Vulkan Validation Layers —— 2026-10-16 做完，答案是"有帮助"，而且它当场点了一条真误用**
+  （plan §7.3 把它写进验收表"开发环境中无未解决的关键 Vulkan 使用错误"、§5.1 列为工具）。
+  **现状（做之前）**：真机**没有校验层**，项目代码里三处自述（`vk_tex.c:1475`、`vk_pipe.c:585`、`nvn_vk.c:1853`），
   而 `vk_pipe.c:582-586` 记下的那次事故——"绑定号 off-by-16 ⇒ 管线读的绑定从未绑过 ⇒ 几何塌陷 ⇒
   348k 次绘制、一个像素不落、零报错"——**正是校验层一眼能喊出来的形状**（当时靠人工反查才找到）。
-  动作：`libVkLayer_khronos_validation.so` 放进 APK 的 `lib/arm64-v8a/`（手打 APK 不需要 Gradle，现有构建脚本即可）、
-  清单加 `android:debuggable="true"`、调试开关下把 `VK_LAYER_KHRONOS_validation` 加进 `ppEnabledLayerNames`
-  并用 `VK_EXT_debug_utils` 收消息。判据：真机日志里能看到校验层消息；卡点 A 的候选原因被逐条点名或逐条排除。
-  **这条不依赖换设备，是卡点 A 当前最便宜的一刀。**
+  **怎么做成的（比台账原计划省两步）**：`libVkLayer_khronos_validation.so`（**27,684,688 字节**，
+  Khronos `android-binaries-1.4.363.0.zip`，用 `.work/vallayer_dl.py --unpack` 取）放进 APK 的
+  `lib/arm64-v8a/`（手打 APK 不需要 Gradle）——**清单里"`android:debuggable="true"`"这条本来就写着**（不用加），
+  而"加进 `ppEnabledLayerNames` + 用 `VK_EXT_debug_utils` 收消息"这两步**也没用上**：Android 的 loader 认
+  `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation`（shell 有权限、app 是 debuggable ⇒ 生效）
+  ⇒ **一行代码都不用改**就装上了。构建侧只加了**一个缺省关的可选段**（`build_apk.cmd` 里 `DM_VKLAYER=1` 才把层打进包），
+  常态构建逐字节不变（已用占位 .so 验过两次：**不设开关时 `3b/5` 那段根本不出现**）。
+  **自证（两层）**：① `debug.vulkan.layers` 设完读回一致；② logcat 里
+  `added global layer 'VK_LAYER_KHRONOS_validation' from library '/data/app/~~…/lib/arm64/libVkLayer_khronos_validation.so'`
+  + `Loaded layer VK_LAYER_KHRONOS_validation` ⇒ **层真的从 app 私有目录被加载了**（这条路先量过：
+  `/data/app/…/lib/arm64/` 里确有抽取出来的 `libdm.so`）。
+  **读数（A 臂一轮 60 秒，`.work/logs/logcat-vk-a1.txt` 2.45 MB）**：**218 条 Validation Error / 20 条 Warning**，
+  VUID 去重 **16 种**（`.work/vklayer_report.py` 归类、`.work/vklayer_msgs.py` / `vklayer_ctx.py` 抽完整消息体）：
+  · **★ 真误用（已修，见下）**：`pCode-08740` 里 **`SPIR-V Capability DrawParameters was declared, but …
+    (VkPhysicalDeviceVulkan11Features::shaderDrawParameters)`** —— 而 `vk_device.c` 从来只挂了 Vulkan13 + divisor
+    两个特性结构 ⇒ **`shaderDrawParameters` 从未启用过**。离线核对：`.work/spv` 里 **1839 份模块带
+    `OpDecorate … BuiltIn 4425`（`gl_BaseInstance`）**、0 份带 `BaseVertex(4424)` / `DrawIndex(4426)`；
+    设备**支持**它（`cmd gpu vkjson`：`core11.features.shaderDrawParameters = 1`）⇒ 已挂进特性链（`DM_DRAWPARAMS` 缺省开、
+    `=0` 可关），自证行 `[vk] shaderDrawParameters：设备支持 1、本轮启用 1` 已见；
+  · **`pCode-08737`（24 条）= `spirv-val` 直接判我们的 SPIR-V 不合法**：
+    `Capability StorageImageWriteWithoutFormat is required to write to storage image` + `OpImageWrite`（驱动宽容接受了）；
+  · `pCode-08742`（20 条）`SPV_EXT_fragment_shader_interlock` 声明了但扩展没启用；`Float64` 声明了但设备不支持
+    （`features.shaderFloat64 = 0`）——**离线核对：0 份模块真的声明 64 位类型 ⇒ 只是"声称"，不是成因**；
+  · `maxCombinedClipAndCullDistances-00710`（40 条）：顶点着色器 **ClipDistance 8 + CullDistance 1 = 9 > 设备上限 8**；
+  · `vkBindBufferMemory-memory-01035/01508/02726`（各 28 条）：**内存类型不合 / dedicated allocation 上绑了别的 buffer**；
+  · `VkImageCreateInfo-imageCreateMaxMipLevels-02251`（39）、`VkImageViewCreateInfo-usage-08931`（40）/`-image-04441`（20）、
+    `vkCmdCopyImage-aspectMask-00142/00143`（各 40）、`vkQueueSubmit-pSignalSemaphores-00067`（16）、
+    `vkCreateDevice-ppEnabledExtensionNames-01387`（4）、`VkSwapchainCreateInfoKHR-compositeAlpha-01280`（4）、
+    `UNASSIGNED-vkAllocateMemory-maxMemoryAllocationSize`（2，N0 已知那档）。
+  **★ 对卡点 A 最有价值的一条是"负结果"**：**这 16 种里没有一条是"draw 层面的用法错误"**（没有"顶点缓冲未绑定"、
+  "管线与渲染通道不兼容"、"描述符未绑定"、"顶点属性与着色器声明不匹配"）⇒ **我们的 draw 调用在 API 层面是合法的**
+  ⇒ 与 N4-e/N4-f 的收窄一致（**几何是自己算没了，不是"没绑上"**）⇒ 下一步只剩"顶点着色器输出"（**N4-g**）。
+  **修完 `shaderDrawParameters` 之后画面没变**（查看器 `DM_WIN_SRC=28` 仍是 `亮度 0/0/0`）—— 按"一次只改一个变量"
+  记成**负结果**（很可能 Adreno 对未启用的 `gl_BaseInstance` 给 0，而这局只用 base 0），**不据此下任何成因结论**。
+  **意外读数**：带层的那一轮**出图 1453 帧**（平时 72~107）⇒ 层的插桩把时序整个改了、**那一轮没停住**（"停顿"与
+  "速度/时序"相关的一个新线索，只记不上判据）。
+  **器械与脚本**：`.work/vallayer_probe.py`（开工前能力调研）、`vallayer_get.py` / `vallayer_dl.py`（取层）、
+  `vallayer_head.py`（HEAD 探测）、`vklayer_drytest.py`（占位验证打包段）、`vklayer_round.py`（一轮：带层出包 → 装机 →
+  设属性 → 抓 logcat → 跑 → 拉日志 → **清属性回退**）、`vklayer_off.py`（退回常态）、`vklayer_peek.py`（实时看）、
+  `vklayer_report.py`（按 VUID 归类）、`vklayer_msgs.py` / `vklayer_ctx.py`（完整消息体）、
+  `vklayer_vuid_check.py`（离线核 capability）、`vklayer_builtin_check.py`（离线核 BuiltIn）、`vklayer_fp64_check.py`（离线核 64 位算术）。
+  **这条不依赖换设备，是卡点 A 当前最便宜的一刀** —— 现在已经开过刃了。
 - [ ] **A2 按 plan 坑 07 的清单逐项对照**（plan §7.2 坑 07：绑定编号 / Uniform 布局 / Buffer 对齐 / 纹理格式 / 采样状态）。
   已排除：绑定号（M3-2k / M3-2l）、描述符空白（UBO 名号 −3、SSBO 由 `cb_offset` 反推、texel buffer）、深度测试、
   `renderArea`（M3-2m）。**剩下"纹理格式、采样状态、Buffer 对齐"三项没有被显式点名过**。

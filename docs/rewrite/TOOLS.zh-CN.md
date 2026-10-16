@@ -436,3 +436,41 @@
   原则 4（绑定以 SPIR-V 反射为唯一真源）；**没有动那 ~10 秒的停顿**（仍是"已知且未定案"）。
 - **⚠ 缺两张表**：`F·N4-d` 与 `F·N4-e` 两张事后表**没有补**（那两轮的过程分别记在 `ANDROID_PLAN` §八·N4-d/
   N4-e 与 `TOOLS` B⁸ / B⁹ / B¹⁰ 里）。
+
+## G. 真机装 Vulkan 校验层（配方 + 脚本，2026-10-16 在第一台 Adreno 830 / Android 16 上跑通）
+
+**一句话**：层 `.so` 放进 APK 的 `lib/arm64-v8a/`，再 `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation`
+—— **不用 root、不用改一行代码**（清单里的 `android:debuggable="true"` 是这件事的前置，本项目早就写着）。
+
+| 环节 | 做法 / 读数 |
+|---|---|
+| **先量能力**（别盲改） | `.work/vallayer_probe.py`：`getprop debug.vulkan.layers`（空）、`setprop` 后能否读回（**能**，shell 有权限）、`dumpsys package <pkg>` 的 flags 里有没有 `DEBUGGABLE`（**有**）、`cmd gpu vkjson` 的**实例级** `apiVersion`（**4210688 = 1.4.0** ⇒ 与 1.4.363 的层兼容；设备级 `4206876 = 1.3.284` 是驱动、不是 loader） |
+| **layer 放哪** | 安卓的 loader 只从 **app 私有的 native 库目录**找层。先量过这个前提：`/data/app/~~…/<pkg>-…/lib/arm64/` 里**确有抽取出来的 `libdm.so`**（说明本包走的是 `extractNativeLibs=true` 那条路）⇒ 层放同一个目录就能被 `opendir` 扫到 |
+| **进包** | `dm/android/apk/build_apk.cmd` 里**一个缺省关的可选段**：`DM_VKLAYER=1` 才把层按 NoCompression 加进 `lib/arm64-v8a/`（不设时整段不出现、常态包逐字节不变；用 4 KB 占位 .so 验过两次） |
+| **怎么取层** | 只有 GitHub release 一个来源：`…/releases/download/vulkan-sdk-1.4.363.0/android-binaries-1.4.363.0.zip`（**32,748,819 字节**，里面的 `arm64-v8a/libVkLayer_khronos_validation.so` = **27,684,688 字节**）。⚠ **GitHub API 会 403 rate limit**（匿名配额），走 HTML / 直链；⚠ **本机走 HTTPS 代理**，`curl` 必须带 `--connect-timeout 20 --max-time 1800 --retry 5 --retry-all-errors --speed-limit 2048 --speed-time 60 -C -`（实测在 26 MB 处断一次，续传才完）；⚠ `urllib` 对 github.com 会 `IncompleteRead`（32768 / 65536 / 262144 字节处截断）⇒ **别用它下 GitHub 的东西** |
+| **启用与自证** | `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` + 读回；层活着的**硬证据**在 logcat：`added global layer 'VK_LAYER_KHRONOS_validation' from library '/data/app/…/lib/arm64/libVkLayer_khronos_validation.so'` 与 `Loaded layer VK_LAYER_KHRONOS_validation`（**"0 条"= 没加载，">0 条"= 活着**，这是判据，别用"有没有报错"当"有没有加载"） |
+| **怎么收消息** | 层用 `__android_log_print`（tag `VALIDATION`）**和** stderr 各打一遍 ⇒ logcat 里每条消息出现两次（第二次的 tag 是我们自己的 `dmhost`）⇒ **按 `MessageID` 去重**再统计 |
+| **一轮怎么跑** | `.work/vklayer_round.py --conf <conf> --tag <tag> --secs 45 --build --install`：出包（带层）→ 装机 → 设属性 → **`logcat -c` 后起一个 logcat 抓取进程** → 启动 app → 跑 → 停抓取 → 拉我们的日志 → **清属性回退**。读数落 `.work/logs/logcat-<tag>.txt` 与 `n4-<tag>.log` |
+| **退回常态** | `.work/vklayer_off.py`：出干净包（不带 `DM_VKLAYER`）→ 装机 → 清属性 → 打 `nativeLibraryDir` 清单自查（应当只剩 `libdm.so`） |
+
+**读 logcat 的三个坑**（都是本轮踩的）：
+
+1. **`Validation Error: [ VUID-… ] | MessageID = 0x…` 只是首行**，"具体原因"（哪个 capability / 哪个 buffer / 数组多大）
+   在**紧跟的续行**里（同 tag 同 tid）⇒ **只看首行会漏掉最关键那句**。用 `.work/vklayer_ctx.py <tag> <关键字> [前] [后]`
+   把原文连上下文打出来（**最少加工最少出错**；本轮 `vklayer_msgs.py` 第一版就因为 logcat 前缀正则写错、续行没拼上而"看起来什么都没有"）。
+2. **VUID 名字中间可以有 `-`**（`VUID-vkCreateDevice-ppEnabledExtensionNames-01387`）⇒ 正则别写 `VUID-[A-Za-z0-9_]+-\d+`
+   （那样**一种都匹配不到**，而"匹配不到"与"没有报错"长得一模一样 —— 第 ⑨ 条"判据本身要能回答题目"的又一例）。
+3. **总数相同 ≠ 内容相同**：`pCode-08740` 是**每个 shader module 报一次、只报第一个未满足的 capability** ⇒
+   修掉一条会改报另一条 ⇒ **必须按 capability / extension 名逐项对比**（`.work/vklayer_cap_diff.py`）。
+
+**离线核对层点名的东西**（不必上设备，`.work/spv/*.spv` 就够）：
+
+| 脚本 | 问什么 | 本轮读数 |
+|---|---|---|
+| `vklayer_vuid_check.py` | 每份 `.spv` 声明了哪些 `OpCapability` | 6923 份都带同一套（`Shader`/`Float64`/`GroupNonUniform*`/`ImageBuffer`…）⇒ **是"声称"，不是"使用"** |
+| `vklayer_builtin_check.py` | `OpDecorate … BuiltIn <值>` 用了哪些内建变量 | **1839 份用 `BuiltIn 4425` = `gl_BaseInstance`**（`BaseVertex`/`DrawIndex` 0 份） |
+| `vklayer_fp64_check.py` | 有没有真的声明 64 位类型 / 算术 | **0 份**（`OpTypeFloat(64)` / `OpTypeInt(64)` 都是 0）⇒ `Float64` 报错是噪音 |
+
+⚠ **`builtin_check` 的已知局限**：它只看 `OpDecorate`，**不看 `OpMemberDecorate`**（结构体成员的 BuiltIn，比如
+`gl_PerVertex` 里的 `ClipDistance`）⇒ 层报"ClipDistance 数组 8 + CullDistance 1"而本脚本报"0 份"就是这原因 ——
+**"脚本说没有"不等于"真的没有"，先看它的覆盖范围**。

@@ -911,6 +911,18 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
    - **A1 真机装 Vulkan Validation Layers**：真机现在没有校验层，而 `vk_pipe.c:582-586` 记的那次"绑定号 off-by-16
      ⇒ 管线读的绑定从未绑过 ⇒ 几何塌陷 ⇒ 348k 次绘制、一个像素不落、零报错"**正是校验层一眼能喊出来的形状**。
      它回答的是**卡点 A（画面全零）**，不依赖换设备 ⇒ 优先级与第 1 条并列，排在"用法侧再砍一刀"之前。
+     **✓ 回勾（2026-10-16）：做完了，答案是"有帮助"** —— 层的 `libVkLayer_khronos_validation.so`（27,684,688 字节）
+     进 APK 的 `lib/arm64-v8a/`，用 `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用
+     （**清单里 `android:debuggable="true"` 本来就有 ⇒ 一行代码都不用改**；构建侧只加了一个缺省关的
+     `DM_VKLAYER=1` 可选段）。层真从 app 私有目录加载了（logcat `added global layer … from library
+     '/data/app/…/lib/arm64/libVkLayer_khronos_validation.so'` + `Loaded layer`）。一轮 60 秒照出
+     **218 条 Error / 16 种 VUID**，其中**当场点了一条真误用并已修**：`SPIR-V Capability DrawParameters` 归
+     `VkPhysicalDeviceVulkan11Features::shaderDrawParameters` 管，而我们从没挂过这个结构，**游戏的顶点着色器
+     1839 份都在用 `gl_BaseInstance`**（离线 `.work/spv` 里 `BuiltIn 4425`）⇒ 已挂进特性链，**复验轮里层不再报它**。
+     **对卡点 A 最要紧的是一条负结果**：**16 种 VUID 里没有一条是"draw 层面的用法错误"**（没有"顶点缓冲未绑定 /
+     管线与通道不兼容 / 描述符未绑定 / 顶点属性不符"）⇒ **我们的 draw 在 API 层面合法**，与 N4-e/N4-f 的
+     "几何是自己算没了"一致 ⇒ **下一步只剩顶点着色器输出（N4-g）**。详细读数见「八、A1」，台账回勾见
+     `docs/ANDROID_PROGRESS.zh-CN.md` §14 A1。
    - **B2 + B3 device-lost 的失败路径与仪器**：第 2 条里那件仪器（"最后一次成功提交 ↔ 第一条 -4"）的规格，
      plan §10.1 给全了三条 —— 记录**出错的 Vulkan 调用 / 设备信息 / 前序 GPU 操作**（前序操作序列才是"谁弄丢的"的线索）；
      同时要把"哪些情况重建设备、哪些必须终止本轮渲染流程"写下来（现状是 `-4` 后"记录并继续"，等于假设资源仍可用）。
@@ -3895,6 +3907,93 @@ N4-f 引入的**。六个新基线字段沿用（本轮没有动搬运量 / 提�
 在不在；**在**就用它把顶点着色器的 `gl_Position` 输出抓下来，**直接回答"经变换后到底在不在裁剪体里"**（这才是
 N4-e 收出来的那个是非题的另一半）；**不在**就走"对着色器产物做离线核对（`gl_Position` 的表达与输出位置）+
 用 `DM_PASS_PROBE` 的已知色底子做一个最小"我们自己的三角形"落屏自证"。
+
+---
+
+### A1：真机装上 Vulkan 校验层 —— 它当场点了一条真误用，并给出一条**决定性的负结果**（2026-10-16，第一台 Adreno 830，A 臂 2 轮：`vk-a1` 修前 / `vk-a2` 修后）
+
+**为什么做**：plan §7.3 把"开发环境中无未解决的关键 Vulkan 使用错误"写进验收表，而项目里三处自述都写着
+"没有校验层"（`vk_tex.c:1475`、`vk_pipe.c:585`、`nvn_vk.c:1853`）。更直接的理由：`vk_pipe.c:582-586` 记下的那次
+事故——"绑定号 off-by-16 ⇒ 管线读的绑定从未绑过 ⇒ 几何塌陷 ⇒ **348k 次绘制、一个像素不落、零报错**"——
+**正是校验层一眼能喊出来的形状**；而当前卡点 A（画面全零）与它同形。
+
+**怎么装（比台账原计划省两步，一行代码都不改）**
+
+| 步骤 | 做法 |
+|---|---|
+| 取层 | `.work/vallayer_dl.py --unpack` —— `android-binaries-1.4.363.0.zip`（32,748,819 字节）里的 `arm64-v8a/libVkLayer_khronos_validation.so`（**27,684,688 字节**，sha256 落 `.work/vklayer/`）。路径：`https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases/download/vulkan-sdk-1.4.363.0/android-binaries-1.4.363.0.zip`。⚠ 本机走 HTTPS 代理，`curl` 要带 `--connect-timeout 20 --max-time 1800 --retry 5 --retry-all-errors --speed-limit 2048 --speed-time 60 -C -`（实测会在 26 MB 处断一次，续传才下完）；`urllib` 对这个对端不稳（`IncompleteRead`）。 |
+| 进包 | `dm/android/apk/build_apk.cmd` 里**新增一个缺省关的可选段**：`DM_VKLAYER=1` 才把层按"不压缩"加进 `lib/arm64-v8a/`（**不设时那段根本不出现**，已用 4 KB 占位 .so 验过两次：常态包尺寸一字不变） |
+| 清单 | **不用改** —— `AndroidManifest.xml` 里 `android:debuggable="true"` 本来就有（第 53 行） |
+| 启用 | `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation`（shell 有权限；app 是 debuggable ⇒ loader 读得到）⇒ **层被强制启用，不必改 `ppEnabledLayerNames`、也不必接 `VK_EXT_debug_utils`** |
+| 前置量过 | ① loader 实例版本 = **1.4.0**（`cmd gpu vkjson` 的实例级 `apiVersion = 4210688`）⇒ 与 1.4.363 的层兼容；② `/data/app/…/lib/arm64/` 里**确有抽取出来的 `libdm.so`** ⇒ loader 的 app 私有层搜索路径可用；③ `getprop ro.debuggable = 0`（全局不是调试版）但 **app 的 flags 里有 `DEBUGGABLE`** |
+| 自证 | logcat：`added global layer 'VK_LAYER_KHRONOS_validation' from library '/data/app/~~…/lib/arm64/libVkLayer_khronos_validation.so'` + `Loaded layer VK_LAYER_KHRONOS_validation`（**从 app 私有目录加载**，不是 system/vendor） |
+
+**读数（`vk-a1`，60 秒，`.work/logs/logcat-vk-a1.txt` 2.45 MB）**：**218 条 Validation Error / 20 条 Warning**，
+VUID 去重 **16 种**。逐条定性（`vklayer_report.py` 归类 → `vklayer_ctx.py` 抽完整消息体 → 三类离线核对脚本）：
+
+| VUID | 条数 | 具体内容（层原话） | 定性 |
+|---|---|---|---|
+| `pCode-08740` | 40 | `SPIR-V Capability DrawParameters was declared, but … VkPhysicalDeviceVulkan11Features::shaderDrawParameters`；另有 `Float64`、`FragmentShaderPixelInterlockEXT` | **★ 真误用，已修**（见下）。`Float64` = **噪音**：离线扫 6923 份 `.spv`，**0 份真的声明 64 位类型**（设备也不支持 `shaderFloat64`） |
+| `pCode-08742` | 20 | `SPIR-V Extension SPV_EXT_fragment_shader_interlock was declared, but … VK_EXT_fragment_shader_interlock` | 真误用（片元阶段，待排） |
+| `pCode-08737` | 24 | **`spirv-val` 判我们的 SPIR-V 不合法**：`Capability StorageImageWriteWithoutFormat is required to write to storage image` + `OpImageWrite` | **真 bug**（SPIR-V 自身不合法），驱动宽容接受了 |
+| `maxCombinedClipAndCullDistances-00710` | 40 | `shader [VERTEX] has a ClipDistance BuiltIn array size of 8 and a CullDistance BuiltIn array size of 1 which sum to 9 and exceed maxCombinedClipAndCullDistances of 8` | 真误用（`shaderClipDistance/CullDistance` **已启用**，是**总数超上限**） |
+| `vkBindBufferMemory-memory-01035/01508/02726` | 各 28 | `buffer requires memoryTypeBits (0x41) but bound memory … was allocated with memoryTypeIndex (4)`；`memory … is dedicated allocation, but … must be equal … and memoryOffset must be zero` | 真误用（**绑内存那一层**，与新地基的分块池同形，待排） |
+| `VkImageCreateInfo-imageCreateMaxMipLevels-02251` | 39 | mip 层数超该格式/尺寸允许的最大 | 真误用 |
+| `VkImageViewCreateInfo-usage-08931` / `-image-04441` | 40 / 20 | view 的 usage 与 image 不符 / view 与 image 不匹配 | 真误用 |
+| `vkCmdCopyImage-aspectMask-00142/00143` | 各 40 | `aspectMask must specify aspects present in src/dstImage` | 真误用（拷贝那一层） |
+| `vkQueueSubmit-pSignalSemaphores-00067` | 16 | 提交时 signal 的信号量已被别的 submit pending | 真误用 |
+| `vkCreateDevice-ppEnabledExtensionNames-01387` | 4 | 启用的 device 扩展缺它依赖的扩展 | 真误用（待查是哪一个） |
+| `VkSwapchainCreateInfoKHR-compositeAlpha-01280` | 4 | `compositeAlpha` 不在 surface 支持的位里 | 真误用（上屏那一层） |
+| `UNASSIGNED-vkAllocateMemory-maxMemoryAllocationSize` | 2 | 单次分配超 `maxMemoryAllocationSize` | **N0 已知**（1088 MB 那档，取了 960 MB） |
+
+**★ 修掉的那条（真误用 + 闭环验证）**
+
+层说 `SPIR-V Capability DrawParameters was declared, but …` ⇒ 顺藤摸下去：
+
+- **离线**（`.work/vklayer_builtin_check.py` 扫 `.work/spv/*.spv` 的 `OpDecorate … BuiltIn`）：
+  **1839 份模块用 `BuiltIn 4425` = `gl_BaseInstance`**（`BaseVertex(4424)` / `DrawIndex(4426)` 都是 0 份）；
+- **我们的代码**（`vk_device.c`）：特性链上只挂了 `VkPhysicalDeviceVulkan13Features` 与
+  `VK_EXT_vertex_attribute_divisor` 的特性结构，**`VkPhysicalDeviceVulkan11Features` 从来没挂过**
+  ⇒ `shaderDrawParameters` **从未启用** ⇒ 规范上 `gl_BaseInstance` 的值是**未定义的**；
+- **设备支持**它（`cmd gpu vkjson`：`core11.features.shaderDrawParameters = 1`）；
+- **修**：把 `VkPhysicalDeviceVulkan11Features`（只置 `shaderDrawParameters`）挂进**查询链与启用链各一次**，
+  加自证行，`DM_DRAWPARAMS=0` 可关（缺省开 = 正确行为）；
+- **闭环**：`vk-a2`（带层 + 新代码）里 **层不再报那条 VUID**。判据不是"总数"——`pCode-08740` 是**每个 module
+  报一次**（报"第一个未满足的 capability"），修掉一条会改报另一条 ⇒ 总数不变。**按名字逐项对比**（`.work/vklayer_cap_diff.py`）：
+
+  | capability / extension（每条消息在 logcat 里出现两次：`VALIDATION` 与 `dmhost`） | `vk-a1` 修前 | `vk-a2` 修后 |
+  |---|---|---|
+  | `SPV_EXT_fragment_shader_interlock` | 20 | 20 |
+  | `Float64` | 12 | **14** |
+  | `FragmentShaderPixelInterlockEXT` | 6 | 6 |
+  | **`DrawParameters`** | **2** | **0 ← 修后消失** |
+
+  （`Float64` 从 12 涨到 14：原来被 `DrawParameters` 遮住的那两条现在报出来了 —— 也说明这份读数是"同一批
+  shader module、同一轮绘制"下的同类可比读数。）
+- ⚠ **但画面没变**：查看器 `DM_WIN_SRC=28` 仍是 `亮度 均值 0.0 / 最小 0 / 最大 0` ⇒ 按"一次只改一个变量"记成
+  **负结果**（很可能 Adreno 对未启用的 `gl_BaseInstance` 给 0，而这局只用 base 0）⇒ **不据此下任何成因结论**。
+
+**★★ 对卡点 A 最有价值的一条是负结果**
+
+**这 16 种里没有一条是"draw 层面的用法错误"** —— 没有"顶点缓冲未绑定"（`VUID-vkCmdDraw-None-04007` 那一类）、
+没有"管线与渲染通道不兼容"、没有"描述符未绑定"、没有"顶点属性与着色器声明不匹配"。
+⇒ **我们的 draw 调用在 API 层面是合法的**；结合 N4-e（光栅化侧全放开仍全零）与 N4-f（顶点数据 / 常量缓冲都正常），
+**几何是自己算没了，不是"没绑上"** ⇒ 下一步只剩 **顶点着色器输出**（N4-g）。
+
+**两条附带读数**
+
+- **带层那两轮的"出图"是 1453 / 1412 帧**（不带层时 72~107）⇒ 层的插桩把时序整个改了，**那两轮没停住**
+  （"停顿"与"速度 / 时序"相关的一个新线索，**只记不上判据**）。
+- 层是**纯软件**的：设备不需要重启、不需要 root、`setprop` 一清就回到常态（`.work/vklayer_off.py` 收尾：
+  出干净包 → 装机 → 清属性 → 打 `nativeLibraryDir` 的清单自查）。
+
+**器械（都在 `.work/`，全部走 `.venv` Python）**：`vallayer_probe.py`（开工前能力调研）、
+`vallayer_get.py` / `vallayer_dl.py`（取层，后者带续传）、`vallayer_head.py`（HEAD 探测）、
+`vklayer_drytest.py`（占位验证打包段）、`vklayer_round.py`（一轮：带层出包 → 装机 → 设属性 → **抓 logcat** → 跑 →
+拉日志 → **清属性回退**）、`vklayer_peek.py`（跑着的时候实时看）、`vklayer_report.py`（按 VUID 归类）、
+`vklayer_msgs.py` / `vklayer_ctx.py`（抽完整消息体 —— 层的"具体原因"在 `MessageID` 之后的续行里，**只看首行会漏掉最关键那句**）、
+`vklayer_vuid_check.py`（离线核 `OpCapability`）、`vklayer_builtin_check.py`（离线核 `BuiltIn`）、
+`vklayer_fp64_check.py`（离线核 64 位算术）、`vklayer_off.py`（退回常态）。
 
 ---
 

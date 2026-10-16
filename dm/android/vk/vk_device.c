@@ -41,6 +41,7 @@ static int g_dyn_render;                       // 动态渲染可用（回放层
 static int g_fill_non_solid;                   // 非实心多边形模式（线框等）| non-solid polygon modes (wireframe and such)
 static int g_attr_divisor, g_attr_divisor_zero; // 顶点流每实例步进 > 1 / 可为 0 | per-instance vertex stream step > 1 / may be 0
 static int g_aniso;                            // 各向异性过滤（采样器用）| anisotropic filtering (for samplers)
+static int g_drawparams;                       // shaderDrawParameters（gl_BaseInstance 才有定义）| shaderDrawParameters (what makes gl_BaseInstance defined); see the A1 note at vkCreateDevice
 static VkExtensionProperties *g_exts; static uint32_t g_nexts;
 static void *g_window;                         // 窗口（M3）：有它才开 surface / 交换链 / 呈现队列 | the window (M3): with it, surface, swapchain and the present queue are enabled
 static VkSurfaceKHR g_surf;
@@ -476,17 +477,41 @@ void vk_device_init(void) {
     // "record state, open no pass" rather than failing device creation.
     VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vdf = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT };
+    // ★ A1（真机装了 Vulkan 校验层之后）照出来的一条**真误用**：游戏的顶点着色器**大量使用 `gl_BaseInstance`**
+    // ——`.work/spv` 里 1839 份模块带 `OpDecorate … BuiltIn 4425`——而它归
+    // `VkPhysicalDeviceVulkan11Features::shaderDrawParameters` 管；这个结构**从来没有挂进过特性链**
+    // （此前只挂了 Vulkan13 的 f13 与 divisor 的 vdf）⇒ `gl_BaseInstance` 读到的是**未定义值**
+    // ⇒ 顶点经变换后位置全错 ⇒ **片元在光栅化之前就没了**（正是 N4-e / N4-f 一层层收出来的那个现象）。
+    // 设备支持它（`adb shell cmd gpu vkjson`：`core11.features.shaderDrawParameters = 1`）⇒ 照"先查再开"的规矩办。
+    // `DM_DRAWPARAMS=0` 可以把它关回去（只为 A/B 自证这一条到底有没有用；缺省开 = 正确行为）。
+    // ★ A real misuse the validation layer caught on the device: the guest's vertex shaders use `gl_BaseInstance`
+    // heavily (1839 of the `.work/spv` modules carry `OpDecorate … BuiltIn 4425`), and that variable is governed by
+    // VkPhysicalDeviceVulkan11Features::shaderDrawParameters -- a struct that never made it into the feature chain
+    // before (only Vulkan13's f13 and the divisor's vdf were chained), so `gl_BaseInstance` read **undefined**
+    // values, which puts the transformed vertices in the wrong place and drops every fragment before rasterization
+    // (exactly what N4-e/N4-f narrowed the picture down to). The device supports it
+    // (`adb shell cmd gpu vkjson`: core11.features.shaderDrawParameters = 1), so it is asked for, then enabled.
+    // `DM_DRAWPARAMS=0` turns it back off, only for the A/B self-check; the default (on) is the correct behaviour.
+    VkPhysicalDeviceVulkan11Features f11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
     int have_vd = vk_have_ext("VK_EXT_vertex_attribute_divisor");
+    const char *dp_env = getenv("DM_DRAWPARAMS");
+    int want_drawparams = (dp_env && dp_env[0] == '0') ? 0 : 1;
     VkPhysicalDeviceFeatures core = { 0 };
     {
         VkPhysicalDeviceFeatures2 q = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
         void *tail = &f13;
         if (have_vd) { vdf.pNext = &f13; tail = &vdf; }   // 扩展不在链上时不挂它的结构 | the extension's struct is not chained when the extension is absent
+        f11.pNext = tail; tail = &f11;                    // 一起查 shaderDrawParameters（设备有没有）| also query shaderDrawParameters
         q.pNext = tail;
         vkGetPhysicalDeviceFeatures2(g_phys, &q);
         core = q.features;
     }
     g_dyn_render = f13.dynamicRendering ? 1 : 0;
+    // shaderDrawParameters：设备有、开关没关 ⇒ 开；设备没有就只能报黄（那时 gl_BaseInstance 依然是未定义的）
+    int have_dp = f11.shaderDrawParameters ? 1 : 0;   // 先把"设备支持"记下来（下面会把 f11 那一位改成"本轮启用"）
+    g_drawparams = (want_drawparams && have_dp) ? 1 : 0;
+    if (!have_dp)
+        LOG("【黄】设备不支持 shaderDrawParameters：用了 gl_BaseInstance 的着色器行为未定义（顶点位置会错）");
     if (!g_dyn_render) LOG("【黄】设备不支持动态渲染（Vulkan 1.3）：渲染通道这一层退回只记状态");
     // 非实心多边形模式（线框）与顶点流的每实例步进：先问再开，没有就由管线层退化并报黄
     // Non-solid polygon modes (wireframe) and per-instance vertex stream steps: asked for before being enabled;
@@ -539,8 +564,15 @@ void vk_device_init(void) {
             vdf.pNext = &f13;
             tail = &vdf;
         }
+        // shaderDrawParameters 挂进启用链（**这就是 A1 照出来的那条真误用的修**：不挂它，gl_BaseInstance 未定义）
+        // shaderDrawParameters joins the enable chain -- this is the fix for the real misuse A1 caught: without it
+        // gl_BaseInstance is undefined.
+        f11.shaderDrawParameters = g_drawparams ? VK_TRUE : VK_FALSE;
+        f11.pNext = tail; tail = &f11;
         feats.pNext = tail;
     }
+    LOG("[vk] shaderDrawParameters：设备支持 %d、本轮启用 %d（DM_DRAWPARAMS 缺省开；游戏的顶点着色器在用 gl_BaseInstance）",
+        have_dp, (int)g_drawparams);
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &feats,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = nec,
                                .ppEnabledExtensionNames = en };

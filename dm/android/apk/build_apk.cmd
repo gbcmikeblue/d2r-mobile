@@ -60,6 +60,24 @@ rem zipalign -p then makes the page alignment real
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $apk='%WORK%\base.apk'; $so='%WORK%\libdm.so'; $z=[System.IO.Compression.ZipFile]::Open($apk,'Update'); $old=$z.GetEntry('lib/arm64-v8a/libdm.so'); if($old){$old.Delete()}; $e=$z.CreateEntry('lib/arm64-v8a/libdm.so',[System.IO.Compression.CompressionLevel]::NoCompression); $o=$e.Open(); $b=[System.IO.File]::ReadAllBytes($so); $o.Write($b,0,$b.Length); $o.Close(); $z.Dispose(); Write-Output ('  libdm.so ' + $b.Length + ' 字节已入包')" || exit /b 7
 
+rem 可选：把 Vulkan 校验层一起打进包（**只在显式设了 DM_VKLAYER=1 时**；缺省完全跳过 ⇒ 常态构建一字不变）。
+rem 为什么需要它（这是"卡点 A 画面全零"的一条正面取证手段，见 docs/ANDROID_PROGRESS §14 A1）：安卓的 loader 只从
+rem **应用私有的 native 库目录**里找层（真机实测该目录里确有抽取出来的 libdm.so ⇒ 这条路通），而"启用"还要
+rem `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation`（app 必须 debuggable，本清单里已声明）。
+rem 层二进制用 .work\vallayer_get.py 取回，放在 .work\vklayer\arm64-v8a\ 下（不进仓库）。
+rem Optional: also package the Vulkan validation layer, **only when DM_VKLAYER=1 is set**; skipped by default so the
+rem normal build is unchanged. Android's loader only looks for layers in the app's private native library directory
+rem (measured: it really does contain the extracted libdm.so), and the layer still has to be enabled with
+rem `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` (the app must be debuggable, as declared).
+rem Fetch the layer with .work\vallayer_get.py into .work\vklayer\arm64-v8a\ (not committed).
+set "VKLAYER=%REPO%\.work\vklayer\arm64-v8a\libVkLayer_khronos_validation.so"
+if not "%DM_VKLAYER%"=="1" goto :dm_after_layer
+if not exist "%VKLAYER%" ( echo [红] DM_VKLAYER=1 但找不到 %VKLAYER%；先跑 .work\vallayer_get.py --go & exit /b 7 )
+echo == 3b/5 把 Vulkan 校验层也打进包（DM_VKLAYER=1；诊断轮用）==
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $apk='%WORK%\base.apk'; $so='%VKLAYER%'; $z=[System.IO.Compression.ZipFile]::Open($apk,'Update'); $old=$z.GetEntry('lib/arm64-v8a/libVkLayer_khronos_validation.so'); if($old){$old.Delete()}; $e=$z.CreateEntry('lib/arm64-v8a/libVkLayer_khronos_validation.so',[System.IO.Compression.CompressionLevel]::NoCompression); $o=$e.Open(); $b=[System.IO.File]::ReadAllBytes($so); $o.Write($b,0,$b.Length); $o.Close(); $z.Dispose(); Write-Output ('  libVkLayer_khronos_validation.so ' + $b.Length + ' 字节已入包')" || exit /b 7
+:dm_after_layer
+
 echo == 4/5 zipalign（-p：不压缩的 .so 按页对齐）==
 "%BT%\zipalign.exe" -p -f 4 "%WORK%\base.apk" "%WORK%\aligned.apk" || exit /b 8
 

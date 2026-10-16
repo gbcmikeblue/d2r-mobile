@@ -1,4 +1,4 @@
-# 新会话提示词（新图形层重写 · 续接 = N4-g 问"顶点着色器输出"（经变换后在不在裁剪体里））
+# 新会话提示词（新图形层重写 · A1 校验层已完成（draw 层面已排除），下一块 = N4-g 问"顶点着色器输出"）
 
 > **怎么用**：开新会话时，把下面 ```` ```text ```` 代码块里的内容**整段复制**发给新会话即可（它自包含：
 > 仓库、分支、该读哪几处、已完成的 N0/N1/N2/N3/N4-a/N4-b/N4-c/N4-d/N4-e/N4-f 读数、本轮（N4-g）做什么、
@@ -59,9 +59,10 @@ Mac 侧交接件（`docs/mac/jiaojie.log`）的口径差异已落档（`docs/mac
    （绑定以 SPIR-V 反射为唯一真源）。
 4) `docs/ANDROID_PLAN.zh-CN.md`「八、N0 … N4-f」十二节（前几轮的读数、结论、探针自己踩的坑与更正）
    +「七、下一步」第 0 条的回勾（**N4-f 的回勾是最后一条**）。
-5) `docs/rewrite/TOOLS.zh-CN.md`（工具与仪器清单，尤其 **B′ ~ B¹¹「每个里程碑期间量出来的仪器事实」**
-   与 F 的勾选表）+ `docs/CROSS_MACHINE.zh-CN.md` 第七节（现在停在哪 / 怎么跑一轮 / `.work` 脚本索引）
-   + 第五节（设备侧）。
+5) `docs/rewrite/TOOLS.zh-CN.md`（工具与仪器清单，尤其 **B′ ~ B¹¹「每个里程碑期间量出来的仪器事实」**、
+   F 的勾选表、以及 **§G「真机装 Vulkan 校验层（配方 + 脚本）」** —— 安卓上装层**不用 root、不用改代码**，
+   `.work/vklayer_*.py` 一条链已经跑通）+ `docs/CROSS_MACHINE.zh-CN.md` 第七节（现在停在哪 / 怎么跑一轮 /
+   `.work` 脚本索引）+ 第五节（设备侧）。
 
 现状一句话：宿主侧（M1）完成、宿主复用 ≈95%；**旧图形层的地基不成立** —— Metal 的三条平台语义
 （指针即缓冲 / 写完即可见 / 小提交便宜）在 Vulkan 上**都没有对应物**，而安卓侧假定它们存在。新路径 = 把这三件事
@@ -81,6 +82,14 @@ Mac 侧交接件（`docs/mac/jiaojie.log`）的口径差异已落档（`docs/mac
 两臂逐项相同；分量类型与 SPIR-V 声明对上）⇒ **只剩"顶点着色器输出"**（位置经变换后全在裁剪体之外 / 输出 NaN）。
 那 ~10 秒的驱动级停顿**仍未定案**（两臂同形、7 轮以上复现；N4-d 只落到线程上：客体主线程 `dm-guest`
 4.6 kHz 睡→醒、前端被 `kgsl-events` 叫醒、我方 `vkQueueSubmit` 卡 11.7 s）。
+**A1（台账项：真机装 Vulkan 校验层）也已完成**（2026-10-16）：层的 `libVkLayer_khronos_validation.so`
+（27,684,688 字节）进 APK 的 `lib/arm64-v8a/`（`build_apk.cmd` 里**缺省关**的 `DM_VKLAYER=1` 可选段）+
+`adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` —— **不用 root、不改一行代码**。
+一轮照出 **218 条 Error / 16 种 VUID**：**修掉一条真误用**（`shaderDrawParameters` 从未启用，而
+**1839 份着色器在用 `gl_BaseInstance`**；修后层不再报它，**但画面没变** ⇒ 按"一次只改一个变量"记成负结果）；
+**★ 最要紧的是一条负结果**：**16 种里没有一条是"draw 层面的用法错误"**（顶点缓冲绑定 / 管线与渲染通道
+兼容性 / 描述符 / 顶点属性都不报）⇒ **我们的 draw 在 API 层面合法、几何是自己算没了** ⇒
+**下一步只剩"顶点着色器输出"**（N4-g）。配方见 `TOOLS` §G，读数见下面「M)」。
 **旧路全部保留、可随时退回**（`DM_GFX2` 缺省关）。
 
 已经量出来的（**直接用，不要重量**）：
@@ -374,6 +383,46 @@ L) **N4-f（前半：顶点数据 / 常量缓冲）的读数**（2026-10-16 上�
    + 设备丢失型 2（`VK_ERROR_DEVICE_LOST：vkQueueSubmit`）；B 臂 2 轮 = 停顿型（出图 58/91，空隙 11.2/12.0 s）。
 · 读数 `.work/logs/n4-n4f-vtx-{a,a2,a3,a4,a5,b1,b2}.log`；抽表 `.work/n4f_report.py`、
    conf `.work/n4f_confs.py`、多轮跑法 `.work/n4d_rounds.py`。
+
+M) **A1（真机装 Vulkan 校验层）的读数**（2026-10-16 上一轮做完；配方见 `TOOLS` §G，结论见 `ANDROID_PLAN` §八·A1）：
+· **装置**：层 `.so`（`libVkLayer_khronos_validation.so`，**27,684,688 字节**，取自 Khronos
+   `android-binaries-1.4.363.0.zip`）进 APK 的 `lib/arm64-v8a/` —— `build_apk.cmd` 里新增一个**缺省关**的
+   `DM_VKLAYER=1` 可选段（不设时那段根本不出现 ⇒ 常态包一字不变）；启用靠
+   `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` ⇒ **不用 root、不改一行代码**
+   （清单里 `android:debuggable="true"` 本来就有）。**自证**：logcat
+   `added global layer 'VK_LAYER_KHRONOS_validation' from library '/data/app/…/lib/arm64/libVkLayer_khronos_validation.so'`
+   + `Loaded layer VK_LAYER_KHRONOS_validation`（**"0 条"= 没加载**，这是判据）。
+· **读数**：一轮 60 秒 **218 条 Error / 20 条 Warning、16 种 VUID**（`.work/logs/logcat-vk-a1.txt` 2.45 MB）。
+· **★ 修掉一条真误用（已复验）**：层说 `SPIR-V Capability DrawParameters was declared, but …
+   VkPhysicalDeviceVulkan11Features::shaderDrawParameters` ⇒ 离线扫 `.work/spv`：**1839 份模块用
+   `BuiltIn 4425`（`gl_BaseInstance`）**（`BaseVertex` / `DrawIndex` 都是 0 份）；而 `vk_device.c` 只挂了
+   Vulkan13 + divisor，**这个结构从来没挂过** ⇒ `gl_BaseInstance` 读的是未定义值。**修**：把
+   `VkPhysicalDeviceVulkan11Features`（只置 `shaderDrawParameters`）挂进查询链与启用链各一次，
+   `DM_DRAWPARAMS=0` 可关（缺省开 = 正确行为）。**复验**（**按 capability 名逐项对比**，`.work/vklayer_cap_diff.py`）：
+   **`DrawParameters` 2 → 0**（`Float64` 12 → 14，被遮住的那两条改报出来）⇒ 修完记得用这个脚本，
+   **别用"总条数"当判据**。
+· **⚠ 但画面没变**：查看器 `DM_WIN_SRC=28` 仍 `亮度 0.0 / 0 / 0` ⇒ **按"一次只改一个变量"记成负结果**
+   （很可能 Adreno 对未启用的 `gl_BaseInstance` 给 0，而这局只用 base 0）⇒ **不据此下任何成因结论**。
+· **★★ 对当前卡点最要紧的是负结果**：**16 种 VUID 里没有一条是"draw 层面的用法错误"** ——
+   没有"顶点缓冲未绑定"（`VUID-vkCmdDraw-None-04007` 那一类）、没有"管线与渲染通道不兼容"、没有
+   "描述符未绑定"、没有"顶点属性与着色器声明不匹配" ⇒ **我们的 draw 在 API 层面是合法的**；
+   与 N4-e（"片元在光栅化之前就没了"）+ N4-f（顶点数据 / 常量缓冲都正常）**完全一致** ⇒
+   **几何是自己算没了，不是"没绑上"** ⇒ **只剩"顶点着色器输出"**（N4-g）。
+· **其余 15 种真误用（已列档；别当成画面全零的成因，但都要排）**：SPIR-V 自身不合法（`spirv-val`：
+   `Capability StorageImageWriteWithoutFormat is required to write to storage image` + `OpImageWrite`）、
+   `Float64` 声明了但设备不支持（**离线核对：0 份真的声明 64 位类型 ⇒ 噪音**）、
+   `SPV_EXT_fragment_shader_interlock` 未启用、`ClipDistance 8 + CullDistance 1 = 9 > 设备上限 8`、
+   `vkBindBufferMemory-memory-01035/01508/02726`（内存类型不合 / dedicated allocation 上绑了别的 buffer）、
+   `vkCmdCopyImage-aspectMask-00142/00143`、`vkQueueSubmit-pSignalSemaphores-00067`、
+   `vkCreateDevice-ppEnabledExtensionNames-01387`、`VkSwapchainCreateInfoKHR-compositeAlpha-01280`、
+   `VkImageCreateInfo-imageCreateMaxMipLevels-02251`、`VkImageViewCreateInfo-usage-08931` / `-image-04441`、
+   `UNASSIGNED-vkAllocateMemory-maxMemoryAllocationSize`（N0 已知）。
+· **意外读数**：带层的两轮**出图 1453 / 932 帧**（不带层时 72~107）⇒ 层的插桩把时序整个改了、
+   **那两轮没停住**（"停顿"与"速度 / 时序"相关的新线索，**只记不上判据**）。
+· **设备已退回常态**（`.work/vklayer_off.py`：干净包 + 属性清空 + `lib/arm64/` 只剩 `libdm.so`）。
+· 读数 `.work/logs/logcat-vk-a{1,2}.txt` + `n4-vklayer-fix-a.log`；脚本 `vallayer_probe.py` / `vallayer_dl.py` /
+   `vklayer_round.py` / `vklayer_off.py` / `vklayer_report.py` / `vklayer_ctx.py` / `vklayer_cap_diff.py` /
+   `vklayer_{vuid,builtin,fp64}_check.py`。
 
 本轮目标：**N4-g —— 只剩"顶点着色器输出"**（顶点数据与常量缓冲上一轮已整片排除；下一个"是非题"是：
 **游戏那些绘制的顶点，经变换后到底在不在裁剪体里、有没有 NaN / Inf**）：

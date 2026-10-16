@@ -223,7 +223,32 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
 > **这一节会过期。** 记于 2026-10-15（M3-3c 的内容基线 `ed900fb`；前几轮「M3-3b」/「M3-3a」/「M3-2z」）；
-> **最新提交**：`de08e13`（2026-10-16，**N4-f = "顶点数据本身"与"常量缓冲"都是正常的（前半答完）** ——
+> **最新提交**：`<待 docs 收尾提交回填>`（2026-10-16，**A1 = 真机装上 Vulkan 校验层 —— 答案是"有帮助"，
+> 而且它给出一条决定性的负结果**）：层的 `libVkLayer_khronos_validation.so`（**27,684,688 字节**，
+> `android-binaries-1.4.363.0.zip`）进 APK 的 `lib/arm64-v8a/`（`build_apk.cmd` 里新增的**缺省关**的
+> `DM_VKLAYER=1` 可选段），用 `adb shell setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用
+> —— **不用 root、不用改一行代码**（清单里 `android:debuggable="true"` 本来就有；`/data/app/…/lib/arm64/`
+> 里确有抽取出来的 `libdm.so`，所以 loader 的 app 私有层搜索路径可用）。自证：logcat
+> `added global layer … from library '/data/app/…/lib/arm64/libVkLayer_khronos_validation.so'` + `Loaded layer`。
+> **一轮 60 秒照出 218 条 Error / 16 种 VUID**：
+> ① **★ 修掉一条真误用（已复验）**：`SPIR-V Capability DrawParameters` 归
+> `VkPhysicalDeviceVulkan11Features::shaderDrawParameters` 管，而 `vk_device.c` 只挂了 Vulkan13 + divisor，
+> **这个结构从来没挂过** ⇒ **游戏的顶点着色器 1839 份在用 `gl_BaseInstance`**（离线 `.work/spv` 的
+> `BuiltIn 4425`）⇒ 已挂进特性链（`DM_DRAWPARAMS` 缺省开），**修后层不再报它**（按 capability 逐项对比：
+> `DrawParameters` 2 → 0）；**但画面没变**（查看器仍 `0/0/0`）⇒ 按"一次只改一个变量"记成**负结果**；
+> ② **★ 对卡点 A 最要紧的是一条负结果**：**16 种 VUID 里没有一条是"draw 层面的用法错误"**（没有"顶点缓冲
+> 未绑定 / 管线与渲染通道不兼容 / 描述符未绑定 / 顶点属性与着色器声明不匹配"）⇒ **我们的 draw 在 API 层面
+> 合法，几何是自己算没了**（与 N4-e / N4-f 的收窄一致）⇒ **下一步只剩顶点着色器输出（N4-g）**；
+> ③ 其余 15 种真误用已逐条列档：SPIR-V 自身不合法（`spirv-val`：缺 `StorageImageWriteWithoutFormat`）、
+> `Float64` 声明了但设备不支持（**离线核对：0 份真的声明 64 位类型 ⇒ 噪音**）、
+> `SPV_EXT_fragment_shader_interlock` 未启用、`ClipDistance 8 + CullDistance 1 = 9 > 上限 8`、
+> `vkBindBufferMemory` 的内存类型与 dedicated、`vkCmdCopyImage` 的 aspectMask、信号量重复 signal、
+> 交换链 `compositeAlpha`、`imageCreateMaxMipLevels`、`ImageViewCreateInfo` 两族…
+> ④ 意外读数：**带层的两轮"出图"是 1453 / 932 帧**（不带层时 72~107）⇒ 层的插桩把时序整个改了、
+> **那两轮没停住**（只记不上判据）。设备已用 `.work/vklayer_off.py` **退回常态**（干净包 + 属性已清 +
+> `lib/arm64/` 只剩 `libdm.so`）。读数 `.work/logs/logcat-vk-a1.txt`（2.45 MB）/ `logcat-vk-a2.txt`；
+> 结论 `ANDROID_PLAN` §八·A1，配方 `TOOLS` §G。
+> 其前 `de08e13`（2026-10-16，**N4-f = "顶点数据本身"与"常量缓冲"都是正常的（前半答完）** ——
 > **回放逻辑一行未改**，只加了一个**缺省关、只读**的诊断开关 `DM_VTX_PROBE=1`（挂在**既有判据行**那一点上：
 > 前 8 次绘制 + 每 2048 次）：
 > ① 读**影子里的**字节（新地基的池 = 本进程可读写的普通内存；旧路的池也是 `mmap` 回来的 ⇒ **两臂都能读**）：
@@ -427,7 +452,19 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 现在停在哪
 
-- **★ 最新一轮（「N4-f」，2026-10-16，提交 `de08e13`）停在**：**"顶点数据本身"与"常量缓冲"
+- **★ 最新一轮（「A1」，2026-10-16，提交 `<待 docs 收尾提交回填>`）停在**：**真机装上 Vulkan 校验层，
+  答案是"有帮助"**。做法：层 `.so`（27,684,688 字节）进 APK 的 `lib/arm64-v8a/`（`DM_VKLAYER=1` 时才进），
+  `setprop debug.vulkan.layers VK_LAYER_KHRONOS_validation` 启用 —— **不用 root、不改代码**。
+  一轮照出 **218 条 Error / 16 种 VUID**，**修掉一条真误用**（`shaderDrawParameters`，1839 份着色器在用
+  `gl_BaseInstance`；修后层不再报它，**但画面没变** ⇒ 负结果）；**最要紧的是一条负结果**：
+  **没有一条是"draw 层面的用法错误"** ⇒ 我们的 draw 在 API 层面合法 ⇒ **下一步只剩顶点着色器输出（N4-g）**。
+  - 跑法：`.work/vklayer_round.py --conf .work/vklayer-a.conf --tag vk-a1 --secs 60 --build --install`
+    （出包带层 → 装机 → 设属性 → **抓 logcat** → 跑 → 拉日志 → **清属性回退**）；
+    退回常态：`.work/vklayer_off.py`；归类：`.work/vklayer_report.py`（按 VUID）、
+    `.work/vklayer_ctx.py`（完整消息体）、`.work/vklayer_cap_diff.py`（按 capability 名逐项对比）。
+  - 读数：`.work/logs/logcat-vk-a1.txt`（2.45 MB，修前）/ `logcat-vk-a2.txt`（修后）；配方见 `TOOLS` §G，
+    结论见 `ANDROID_PLAN` §八·A1。
+- **「N4-f」（2026-10-16，提交 `de08e13`）停在**：**"顶点数据本身"与"常量缓冲"
   都是正常的（N4-f 的前半答完）** ⇒ 只剩"**顶点着色器输出**"（位置经变换后全在裁剪体之外 / 输出 NaN/Inf）。
   改了什么：**回放逻辑一行未改**，只加了一个**缺省关、只读**的诊断开关 `DM_VTX_PROBE=1`（挂在**既有判据行**
   那一点上：前 8 次绘制 + 每 2048 次）—— `nvn_vk.c` 里新增采样函数 + 格式解码/NaN·Inf 判断三个小函数
@@ -688,10 +725,11 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 下一步（细节在 ANDROID_PLAN「七、下一步」）
 
-> **新路径（Vulkan 原生重写）现在停在「N4-g」**：`N0 ~ N4-f` 已完成；**只剩"顶点着色器输出"**
-> （`N4-f` 已把"顶点数据 / 常量缓冲"这一半答完：**都是正常的**）。**下一轮第一件事 = 问设备能力
-> `VK_EXT_transform_feedback`**（有就抓 `gl_Position` 直接回答"经变换后在不在裁剪体里"）。细节见上面
-> 的"最新提交"段与 `ANDROID_PLAN`「七、下一步」第 0 条的最后一条回勾。
+> **新路径（Vulkan 原生重写）现在停在「N4-g」**：`N0 ~ N4-f` 已完成，台账里的 **A1（真机装 Vulkan 校验层）
+> 也已完成**（它照出 16 种 VUID、修掉一条真误用，并给出一条决定性的负结果：**我们的 draw 在 API 层面合法**）。
+> **只剩"顶点着色器输出"**（`N4-f` 已把"顶点数据 / 常量缓冲"这一半答完：**都是正常的**）。
+> **下一轮第一件事 = 问设备能力 `VK_EXT_transform_feedback`**（有就抓 `gl_Position` 直接回答"经变换后
+> 在不在裁剪体里"）。细节见上面的"最新提交"段与 `ANDROID_PLAN`「七、下一步」第 0 条的最后两条回勾。
 > **2026-10-16 现状更新：换设备对照做过了（「M3-3d」），结论是"卡点 B 的读数没拿到"** ——
 > 第二台不是"又一台骁龙"，而是 **Redmi `pearl` / MediaTek MT6896 / **Mali-G610 MC6** / Android 15 / Vulkan 1.1.177**。
 > 它在卡点 B 之前连撞两关：① **装机**（`adb install` / `pm install` 被 MIUI 拦：`INSTALL_FAILED_USER_RESTRICTED`；
@@ -783,6 +821,15 @@ PC 侧的路径与工具见第二、三节；这里只说**跑一次并拿到读
 | `.work/n4f_confs.py` | **N4-f 起**：写那一轮的 conf（A 臂 = `DM_GFX2=1` + `DM_VTX_PROBE=1`、B 臂 = 旧路对照、截图轮 = `DM_WIN_SRC=28`）—— 都与 N4-c 的 A/B 臂 conf **逐字相同、只加 `DM_VTX_PROBE=1`**，这样"这一轮的形态是不是 N4-c 那个"可以直接对着看 |
 | `.work/n4f_report.py` | **N4-f 起**：抽表 —— 每轮的 `【顶点采样】` 行（格式→分量数、步长、偏移、形状分布、前几个顶点）、心跳那一格的累计、逐槽 `|max|`。⚠ **正则要跟紧读数格式**（那一轮的采样行格式中途改过一次：从"只查第一个常量槽"改成"扫全部槽"） |
 | `.work/n4f_tsv_append.py` | **N4-f 起**：把 N4-f 行追加到 `.work/logs/vk2-readings.tsv`（UTF-8 无 BOM、行尾 LF） |
+| `.work/vallayer_probe.py` | **A1 起**：装层之前的**能力调研**（`debug.vulkan.layers` 能否设、app 有没有 `DEBUGGABLE`、`cmd gpu vkjson` 的 **loader** 与驱动版本、本机有没有层 `.so`、GitHub 通不通）。**先跑它再动手** |
+| `.work/vallayer_get.py` / `vallayer_dl.py` / `vallayer_head.py` | **A1 起**：取层（`android-binaries-*.zip` → `arm64-v8a/libVkLayer_khronos_validation.so`）。⚠ GitHub API 会 **403 rate limit** ⇒ 走 HTML / 直链；⚠ 本机走 HTTPS 代理，`curl` 要带 `--connect-timeout 20 --max-time 1800 --retry 5 --retry-all-errors --speed-limit 2048 --speed-time 60 -C -`（实测 26 MB 处断一次，续传才完）；⚠ **`urllib` 对 github.com 会 `IncompleteRead`**。`vallayer_dl.py` 是能下完的那个 |
+| `.work/vklayer_drytest.py` | **A1 起**：用 4 KB **占位 .so** 验证 `build_apk.cmd` 里那条"带层打包"的可选段（不必等 32 MB 下完），跑完自动删占位 |
+| `.work/vklayer_round.py` | **A1 起**：一轮真机（带层出包 → 装机 → 设属性 → **抓 logcat** → 跑 → 拉日志 → **清属性回退**），并把"层加载了没 / 喊了什么"打在屏幕上 |
+| `.work/vklayer_off.py` | **A1 起**：退回常态（干净包 → 装机 → 清属性 → 打 `nativeLibraryDir` 清单自查） |
+| `.work/vklayer_peek.py` | **A1 起**：**跑着的时候**实时看 logcat（判"层到底加载了没"，能省一整轮） |
+| `.work/vklayer_report.py` / `vklayer_msgs.py` / `vklayer_ctx.py` | **A1 起**：按 VUID 归类 / 抽完整消息体 / 打原文上下文。⚠ 层的"具体原因"在 `MessageID` **之后的续行**里（只看首行会漏最关键那句）；⚠ **VUID 名字中间可以有 `-`**，正则别写窄；⚠ **总数相同 ≠ 内容相同**（每个 module 只报第一个未满足的 capability） |
+| `.work/vklayer_cap_diff.py` | **A1 起**：按 capability / extension **名**逐项对比两轮（修前 / 修后）—— 这才是"那条报错真的没了吗"的判据 |
+| `.work/vklayer_{vuid,builtin,fp64}_check.py` | **A1 起**：**离线**核层点名的东西（不必上设备）—— 分别扫 `OpCapability` / `OpDecorate … BuiltIn` / 64 位类型与算术。⚠ `builtin_check` **只看 `OpDecorate`、不看 `OpMemberDecorate`**（结构体成员的 BuiltIn，比如 `gl_PerVertex` 里的 `ClipDistance`，会漏） |
 | `.work/n4e_{scan_confs,probe_conf,passprobe_confs,raster_confs,brute_conf}.py` | **N4-e 起**：写各轮 conf（扫描器 / `DM_GFX_PROBE` 对照 / 通道探针两档 / 光栅化排除两轮 / 光栅放开轮） |
 
 ```powershell
@@ -969,3 +1016,22 @@ adb 要经 `run-as` 才看得到（`adb shell run-as ai.d2rm.dm ls -l files`）�
 - **归一化顶点格式的"数量级"没有诊断力**（N4-f 读数）：`0x2b` = 4×ShortSNORM 的值域天然是 [-1,1]
   ⇒ 只能贡献"NaN/Inf = 0"与"不是全零"两条；要判"数量级离谱"必须看**浮点类**（`0x22` = 3×Float、
   `0x2e` = 4×Float；NVN 格式号：分量数 = `(f-1)/12 + 1`、组内类型 = `(f-1)%12`）。
+- **🔴 判据别只看首行（A1 现场，最贵的一条）**：Khronos 校验层的消息**跨多行** ——
+  `Validation Error: [ VUID-… ] | MessageID = 0x…` 只是**第一行**，"具体原因"（哪个 capability / 哪个 buffer /
+  数组多大）在**紧跟的续行**（同 tag 同 tid）里。本机 `.work/vklayer_msgs.py` 第一版就因为 logcat 前缀正则
+  写错、续行没拼上，打印出来"每种 VUID 都只有一句 `MessageID`" —— **看着像"层没说什么"，其实是最关键那句被丢了**。
+  碰到 digest 不出来的东西，用 `.work/vklayer_ctx.py <tag> <关键字>` **原样打上下文**（最少加工最少出错）。
+- **🔴 "总数相同"不等于"内容相同"（A1 现场）**：`VUID-VkShaderModuleCreateInfo-pCode-08740` 是
+  **每个 shader module 报一次、只报第一个未满足的 capability** ⇒ 修掉 `DrawParameters` 之后同一个 module
+  改报 `Float64`，**总数 40 一点没变**。判"那条真的没了吗"必须**按 capability / extension 名逐项对比**
+  （`.work/vklayer_cap_diff.py`：`DrawParameters` 2 → 0，`Float64` 12 → 14）—— 与坑 ⑩ 的"统计快照的位置会改总数"同源。
+- **🔴 正则里的 `-`（A1 现场）**：VUID 名字**中间可以有 `-`**（`VUID-vkCreateDevice-ppEnabledExtensionNames-01387`）
+  ⇒ `VUID-[A-Za-z0-9_]+-\d+` **一种都匹配不到**，而"匹配不到"与"没有报错"长得一模一样。
+  写判据的正则时，**先拿已知会出现的样本喂一遍**（第 ⑨ 条的又一例）。
+- **🔴 离线脚本的"覆盖范围"要先说清（A1 现场）**：`vklayer_builtin_check.py` 只看 `OpDecorate`、不看
+  `OpMemberDecorate` ⇒ 它报"`ClipDistance` 0 份"，而层报"顶点着色器 ClipDistance 数组 8 + CullDistance 1"
+  （那两个是**结构体成员**上的 BuiltIn，走 `OpMemberDecorate`）⇒ **"脚本说没有"不等于"真的没有"**，
+  先用一个**已知存在**的样本把脚本喂一遍再信它。
+- **一句结论：安卓上装 Vulkan 校验层不需要 root 也不需要改代码**（A1 的正面配方见 `TOOLS` §G）：
+  层 `.so` 进 APK 的 `lib/arm64-v8a/` + `setprop debug.vulkan.layers <层名>`，app 只要 `android:debuggable="true"`。
+  前提是**该 app 的 native 库目录里确有抽取出来的 `.so`**（先 `ls` 一下 `/data/app/…/lib/arm64/` 确认）。
