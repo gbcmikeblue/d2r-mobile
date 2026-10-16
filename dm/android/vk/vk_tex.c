@@ -524,6 +524,13 @@ static const char *const ONE_SUBMIT_RB = "vk：一次性提交（读回 / 对照
 static const char *const ONE_SUBMIT_UP = "vk：一次性提交（上传）";
 static const char *const ONE_IDLE_RB   = "一次性提交等空闲（读回 / 对照，等驱动，可能跑在客体线程上）";
 static const char *const ONE_IDLE_UP   = "一次性提交等空闲（上传，等驱动，可能跑在客体线程上）";
+// N4-d：新地基下这里**不等队列空闲**（等的是它自己的定向栅栏，见下面的 `use_fence` 分支），所以台账里
+// **名字也要分开** —— 否则会出现"心跳说等队列空闲 0、等待站点却写等空闲"的自相矛盾（「M3-3a」的教训：
+// 两条路共用一个站点名时，"这 10 秒是谁等的"分不出来）。
+// N4-d: under the new foundation this site waits on its own directed fence, so the ledger name must differ too --
+// otherwise the heartbeat's "queue-idle 0" contradicts a wait site named "wait idle".
+static const char *const ONE_WAIT_RB   = "一次性提交等定向栅栏（读回 / 对照，等驱动，可能跑在客体线程上）";
+static const char *const ONE_WAIT_UP   = "一次性提交等定向栅栏（上传，等驱动，可能跑在客体线程上）";
 static int one_end_on(VkCommandBuffer cb, int up) {
     { VkResult er = vkEndCommandBuffer(cb);
       if (er != VK_SUCCESS) { step_fail("vkEndCommandBuffer 返回 %d", (int)er); return 0; } }
@@ -556,7 +563,7 @@ static int one_end_on(VkCommandBuffer cb, int up) {
     // M3-3a：**上传**也走这里（`ent_upload` 的 `g_cb_up`），同一条路上客体线程一样会久等 —— 所以站点名分两路。
     // M3-3a: **uploads** come through here too (`ent_upload`'s `g_cb_up`) and the guest thread waits just as long, so the
     // site name splits per path.
-    dm_waitled_enter(up ? ONE_IDLE_UP : ONE_IDLE_RB);
+    dm_waitled_enter(use_fence ? (up ? ONE_WAIT_UP : ONE_WAIT_RB) : (up ? ONE_IDLE_UP : ONE_IDLE_RB));
     VkResult r;
     if (use_fence) {
         vk_idle_avoided();      // 这一处**没有**等队列空闲（自证：G4 的第三条判据要把"替代掉"也报出来）

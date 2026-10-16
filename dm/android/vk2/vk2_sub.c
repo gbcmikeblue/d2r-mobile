@@ -100,6 +100,15 @@ static void slot_reap(vk2_slot *s) {
     // submit, so the replay layer's work (post ops, round-trip readback, descriptor pool) can only happen here.
     uint64_t frame = s->frame;
     VkFence  fen = s->fence;
+    // N4-d：**`reaped_max` 必须在这里更新**（"已确认完成的最大 frame"）。原来只有"真等栅栏"那几条路
+    // （begin 等到最老那个 / wait / wait_timeout / wait_all）会推它，而游戏轮的主路是**轮询回收**
+    // （`vk2_sub_begin` 里 `vkGetFenceStatus` 那一支，N4-c 量到 60 次里 56 次是它）⇒ 水位线虚低：
+    // 新加的判据行第一次跑就报"提交到 79、完成到 3"（**那是读数错，不是队列不动**）。
+    // 所有回收路径都经过这里，而且都在"栅栏已经被观察到 signal"之后（调用点见 reap_done_up_to / 轮询支）⇒ 放这里最稳。
+    // N4-d: reaped_max has to be maintained here. Only the "really waited" paths used to push it, while a game round
+    // reaps mostly by polling, so the high-water mark read far too low (the new criterion line reported
+    // "submitted 79, completed 3" -- a wrong reading, not a stuck queue).
+    if (g_st.reaped_max < frame) g_st.reaped_max = frame;
     if (g_reap_fn) { g_st.reap_hook_calls++; g_reap_fn((int)(s - g_slots), frame, fen, g_reap_ud); }
     s->in_flight = 0;
     s->frame = 0;

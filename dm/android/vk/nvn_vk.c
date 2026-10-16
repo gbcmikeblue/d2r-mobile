@@ -1100,10 +1100,25 @@ int vk_diag_line(char *buf, size_t cap) {
     // N4-c: G4's third criterion rides on this line (once a second, and it shows in screenshots): the queue-idle
     // count must be zero under the new foundation, and the "avoided" count proves the sites really ran.
     if (g_vk2_gpu && n > 0 && (size_t)n < cap)
-        snprintf(buf + n, cap - (size_t)n,
-                 "；**等队列空闲 %llu**（新地基下必须 0）/ 被定向栅栏替代 %llu；提交侧 %s",
-                 (unsigned long long)vk_idle_calls(), (unsigned long long)vk_idle_calls_skipped(),
-                 g_vk2_sub_ok ? "新地基（vk2_sub）" : "旧路 8 槽");
+        n += snprintf(buf + n, cap - (size_t)n,
+                      "；**等队列空闲 %llu**（新地基下必须 0）/ 被定向栅栏替代 %llu；提交侧 %s",
+                      (unsigned long long)vk_idle_calls(), (unsigned long long)vk_idle_calls_skipped(),
+                      g_vk2_sub_ok ? "新地基（vk2_sub）" : "旧路 8 槽");
+    // N4-d 第 0 条：**我方自己的超时**与两条水位线挂在**这一行**上 —— 这一行是**带时间戳**的（宿主每秒一条），
+    // 而 `【红】` 那几条（模块自己打的）没有时间戳 ⇒ 只有把计数搬到这里，才能回答"超时发生在停顿窗口里的
+    // 哪一刻"（判据：出图冻住 + 提交到 frame 涨、完成到 frame 不涨 ⇒ 队列真的不动）。
+    // N4-d item 0: our own timeout counters and the two high-water marks ride this line because it is the timestamped
+    // one (one per second from the host); the module's own 【红】 lines carry no timestamp.
+    if (g_vk2_gpu && n > 0 && (size_t)n < cap) {
+        vk2_sub_stats ss; vk2_sub_stats_get(&ss);
+        vk2_xfer_stats xs; vk2_xfer_stats_get(&xs);
+        n += snprintf(buf + n, cap - (size_t)n,
+                      "；**我方超时** 回读拷贝 %llu / 取槽 %llu；**提交到 %llu、完成到 %llu**（在飞 %d）"
+                      "；ReadTexels 读到 GPU 写过的贴图 %llu 次",
+                      (unsigned long long)xs.fence_timeouts, (unsigned long long)ss.timeout_fails,
+                      (unsigned long long)g_fence, (unsigned long long)ss.reaped_max, vk2_sub_pending(),
+                      (unsigned long long)vk_tex_reads_gpu_written());
+    }
     return n;
 }
 
@@ -1560,6 +1575,30 @@ uint64_t mtl_sub_commit(void) {
     gpu_note_frame(i, atomic_load(&g_cur_frame));   // 这次提交属于哪一帧（完成是滞后的，回查靠帧号） | which frame this submission belongs to (completion is late; the lookup goes by frame number)
     g_sub_total++;
 report_ops:
+    // N4-d：**这两条判据各占一行、按"每 60 次提交 + 第 1 次"节流**（与 N4-c 的 60 次口径一致），两臂都打。
+    // ① `ReadTexels 读到 GPU 写过的贴图 N 次` —— N4-c 的读数里**它一次都没出现**：原来挂在下面"每 300 次提交"
+    //    那个块里，而游戏一轮只有 ~100~200 次提交 ⇒ **没有读数**（没有读数 ≠ 是 0，见 TOOLS B⁷）。
+    // ② **我方自己的超时**（回读拷贝 / 取槽 / 提交失败 / 取不到槽）与"**提交到哪个 frame、完成到哪个 frame**"——
+    //    N4-d 第 0 条要回答的"停顿窗口里那条队列是不是完全不动"就靠这两个水位线（t. 与心跳那一行对照）。
+    // N4-d: both criteria get their own line, throttled at every 60th submission plus the first (the same throttle
+    // N4-c used), and they print on **both** arms. ① the ReadTexels reading that never appeared in N4-c (it used to
+    // ride the every-300 block, and a game round only submits ~100~200 times); ② our own timeout counters plus the
+    // submit/complete high-water marks, which is what N4-d item 0 needs to answer "did the queue move at all".
+    if (g_sub_total % 60 == 0 || g_sub_total == 1) {
+        if (g_vk2_gpu) {
+            vk2_sub_stats ss; vk2_sub_stats_get(&ss);
+            vk2_xfer_stats xs; vk2_xfer_stats_get(&xs);
+            LOG("[vk] 提交 %llu：ReadTexels 读到 GPU 写过的贴图 %llu 次；**我方超时** 回读拷贝 %llu / 取槽 %llu；"
+                "提交失败 %llu、取不到槽 %llu；**提交到 frame %llu、完成到 frame %llu**（在飞 %d）",
+                (unsigned long long)g_sub_total, (unsigned long long)vk_tex_reads_gpu_written(),
+                (unsigned long long)xs.fence_timeouts, (unsigned long long)ss.timeout_fails,
+                (unsigned long long)ss.submit_fail, (unsigned long long)ss.no_slot_fail,
+                (unsigned long long)g_fence, (unsigned long long)ss.reaped_max, vk2_sub_pending());
+        } else {
+            LOG("[vk] 提交 %llu：ReadTexels 读到 GPU 写过的贴图 %llu 次（0 = 从 VkImage 读回那套暂时还只是工具）",
+                (unsigned long long)g_sub_total, (unsigned long long)vk_tex_reads_gpu_written());
+        }
+    }
     // 每 300 次提交报一次 op 分布：这就是"接下来该实现哪些 op"的实测依据。
     // 只报次数最多的 5 个：宿主的 LOG 有长度上限，一行塞 12 个 op 会被截断（实测截在 119 字符，
     // 而渲染 op 恰恰在截掉的那半截里；前 5 名已足够定实现次序）。
@@ -1635,10 +1674,6 @@ report_ops:
         vk_tex_view_stats(&vb, &vh, &vm);
         LOG("[vk] 视图：底视图 %llu 次、命中子视图 %llu 次、新建子视图 %llu 张",
             (unsigned long long)vb, (unsigned long long)vh, (unsigned long long)vm);
-        // 判据单独一行：宿主的日志有长度上限，挂在别的行上会被截断（这一条踩过）| the judgment gets its own line:
-        // the host's log has a length limit and appending to another line truncates it (learned the hard way)
-        LOG("[vk] ReadTexels 读到 GPU 写过的贴图 %llu 次（0 = 从 VkImage 读回那套暂时还只是工具）",
-            (unsigned long long)vk_tex_reads_gpu_written());
         // N4-b：**每帧搬运字节数**（11.3 的第一个字段）—— 新地基唯一的代价读数，单独一行。
         // N4-b: bytes uploaded per frame, the first of the six baseline fields, on its own line.
         if (g_vk2_gpu && g_vk2_frames)
