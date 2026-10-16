@@ -171,9 +171,13 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 做法上有两条与第一台不同、值得沿用（脚本 `.work/push_dev2.py`）：
 ① **逐文件推 + 远端大小相等就跳过** ⇒ 断了可以整脚本重跑，只补没拿到的；
 ② **`spv` 走 `spv.tar` + 设备端 `tar -xf`**（13847 项 **8 秒**解完；20770 个小文件逐个 `adb push` 会慢得多）。
-唯一的缺口：**这台 MIUI 拒绝 `adb install` / `pm install`**（`INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`，
-`settings put … verifier_verify_adb_installs` 又被 `WRITE_SECURE_SETTINGS` 拒）⇒ **必须在手机上人工打开
-"通过 USB 安装"**（第一台是开着的）。装包/装机脚本 `.work/mkapk.py`（出包走 `build_u8.cmd` 包装，装机先试设备端 `pm install -r`）。
+唯一的缺口曾经是装机：**这台 MIUI 拒绝 `adb install` / `pm install`**（`INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`，
+`settings put … verifier_verify_adb_installs` 又被 `WRITE_SECURE_SETTINGS` 拒）⇒ 须在手机上手工打开"通过 USB 安装"。
+**更正（2026-10-16 当天）**：用户**已经打开了那个开关**（第一台本来就开着）⇒ 装机这一条**应当已解除**，
+但写档时两台都没插在电脑上，所以**还没被验证**；下一轮第一件事：
+`.work/mkapk.py --skip-build --install VC9TGM45MNJB8TSG`（出包走 `build_u8.cmd` 包装，装机先试设备端 `pm install -r`），
+成功后再跑 1~2 轮（预期判定 `启动受阻`）确认"APK 这条路上也被内存换轨挡住"。
+**注意**：装机≠卡点 B 能在第二台上量 —— 那要等零拷贝内存路线（AHB 支路）落地。
 
 ## 六、容易踩的几点
 
@@ -339,9 +343,9 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 > **2026-10-16 现状更新：换设备对照做过了（「M3-3d」），结论是"卡点 B 的读数没拿到"** ——
 > 第二台不是"又一台骁龙"，而是 **Redmi `pearl` / MediaTek MT6896 / **Mali-G610 MC6** / Android 15 / Vulkan 1.1.177**。
-> 它在卡点 B 之前连撞两关：① **MIUI 拒绝 `adb install` / `pm install`**（`INSTALL_FAILED_USER_RESTRICTED`；
-> `settings put global verifier_verify_adb_installs 0` 被 `WRITE_SECURE_SETTINGS` 拒）⇒ **要在手机上人工把
-> "通过 USB 安装"打开**；② `dmhost` 冒烟跑到 `nnosInitialize` 就报 **`内存换轨：建载体缓冲失败`**
+> 它在卡点 B 之前连撞两关：① **装机**（`adb install` / `pm install` 被 MIUI 拦：`INSTALL_FAILED_USER_RESTRICTED`；
+> `settings put` 被 `WRITE_SECURE_SETTINGS` 拒）—— **这条当天已由用户解除**（开关已开，**待下一轮用
+> `.work/mkapk.py --skip-build --install VC9TGM45MNJB8TSG` 验证**）；② `dmhost` 冒烟跑到 `nnosInitialize` 就报 **`内存换轨：建载体缓冲失败`**
 > —— 堆与别名区各只换到 0 MB，随后 `SVC 越出 alias 区` + `Break#1`。原因是 `vk_region.c` 的甲案依赖
 > **可导出**的外部句柄（不透明 fd / dma-buf），而 Mali 上两样都不可导出（dma-buf 只有 IMPORTABLE）。
 > 设备指纹与 4 份探针读数在 `.work/logs/devfp-*` / `probe-*`，结论与下一步见 `ANDROID_PLAN`「八、M3-3d」。

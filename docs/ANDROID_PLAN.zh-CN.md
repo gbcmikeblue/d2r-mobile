@@ -2349,6 +2349,11 @@ on-CPU 6.7 秒 / 10.4 秒），所以当**量级**读，不当精确数。
   `settings put global verifier_verify_adb_installs 0` 与 `settings put secure install_non_market_apps 1` 都被
   `SecurityException: … WRITE_SECURE_SETTINGS` 拒 ⇒ **必须在手机上人工把"通过 USB 安装"打开**（第一台是开着的，所以那边一直是"push + `pm install -r`"）。
   ⇒ **第二台目前装不上 APK**（脚本 `.work/mkapk.py` 里两条路都试过并留了读数）。
+  **更正（同一天，晚些时候）**：用户**已经把这个开关打开了** ⇒ 这一条**应当已解除**；但**写档时两台都没插在电脑上**
+  （`adb kill-server` 后 `adb devices` 空），所以**装机还没有被验证过**。下一轮第一件事就是验证：
+  `.work/mkapk.py --skip-build --install VC9TGM45MNJB8TSG`（期望 `Success` + 装后 sha256 与本地一致），
+  然后跑 1~2 轮把这台的"启动受阻"形状（见第三节）钉住 —— 装机只是把"APK 这条路上也被同一处挡住"补成事实，
+  **不等于卡点 B 能在第二台上量**（那要等第五节的内存路线落地）。
 
 **三、便宜冒烟：不装包先把"能不能跑"问掉（`dmhost` + `patched`，80 MB）**
 `dmhost` 在第二台上直接跑（M1 那条路，adb 推上去即可执行），走得很远：
@@ -2417,13 +2422,17 @@ on-CPU 6.7 秒 / 10.4 秒），所以当**量级**读，不当精确数。
 **六、结论与下一步**
 1. **换设备对照这一步做了，但没拿到卡点 B 的对照读数** —— 第二台在**装包**（MIUI 需人工开"通过 USB 安装"）与**零拷贝内存模型**
    （Mali 无可用外部句柄导出）两处先后卡住。两条都是"人/设计"层面的，不是"再量一轮"能过去的。
+   **其中装包那一条当天就被用户解除了**（开关已开，见第二节的更正）——**它不再是遮挡**，现在只剩"零拷贝内存模型"
+   这一条（设计层面）挡在第二台与卡点 B 之间。
 2. **第二台真正有价值的地方**：它是**非 Adreno** 的第一台。今天暴露的这条依赖（`vk_region.c` 的甲案）在 plan 的
    §14 **E2（坑 09："不同 SoC 支持的格式/扩展不同，要为必要功能设计经验证的回退路径"）**里早有警告，现在成了必答题。
    Android 上还剩一条**本项目没试过**的同源路：**`AHardwareBuffer`**（`VK_ANDROID_external_memory_android_hardware_buffer`
    **两台都有**；AHB 本身是 dma-buf，fd 可以 `mmap(MAP_FIXED)` 到客体地址，再 `vkImportAndroidHardwareBuffer` 进 Vulkan）。
    **要补的探针只有一问**：导入 AHB 之后，能不能在**同一份内存上按偏移绑多块缓冲**（池子的用法）——这是 `vk_region_find` 的前提。
 3. 下一刀的顺序（按分辨力，也按"要不要等人"）：
-   - ① **AHB / dma-buf 路线探针**（`dm/android/vk/`，**不依赖第二台装包**：它可以用 `dmhost` 冒烟跑，第二台已经能跑到设备就绪）；
+   - ⓪ **先验证装机**（开关已开）：`.work/mkapk.py --skip-build --install VC9TGM45MNJB8TSG`，再跑 1~2 轮记录这台的"启动受阻"；
+   - ① **AHB / dma-buf 路线探针**（`dm/android/vk/vk_ahb_probe.c`，**不依赖装包**：它可以用 `dmhost` 冒烟跑，
+     第二台已经能跑到设备就绪；**第一台也跑一遍当对照** —— 甲案在那儿可用）；
    - ② 若走乙案（让驱动选址），先把影响面写清：客体地址空间不再连续 ⇒ `QueryMemory` / `GetInfo` / `vk_region_find` / 回放层的地址反查全要跟着改；
    - ③ **`trace_processor` 读 pftrace 那条路仍然空着**（`.work/trace/` 在当前工作区不存在，要按配方重抓）；
    - ④ 第一台上仍可做的两支：`DM_UP_NOSUB`（上传不提交、只解排布，破坏性取证）与"GPU 保活"（**只当 A/B 臂，不得当修复**）。

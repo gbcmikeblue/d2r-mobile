@@ -459,8 +459,10 @@ iCloud→Drive/自建；mach `vm_*`→`/proc/self/maps`、`__builtin___clear_cac
 
 1. ~~**换设备 / 换驱动**跑同一套 A/B 配方~~ —— **2026-10-16「M3-3d」做了，但读数没拿到**：第二台（**Mali**）先后被
    ① MIUI 的"通过 USB 安装"未开（人工）、② 零拷贝内存池那条路在 Mali 上不存在（设计）挡住。
-   ⇒ 现在这一条**拆成两条**：①-a **AHB / dma-buf 路线的探针**（不依赖装包，第二台已能跑到设备就绪）；
-   ①-b 开了"通过 USB 安装"之后，用**同一份 `ab-clean.conf` + `.work/ab_run.py`** 把第二台的读数补上（数据侧已备齐）。见 §八·M3-3d。
+   ⇒ 现在这一条**拆成三条**：**⓪ 验证装机**（"通过 USB 安装"当天已由用户打开，但还没验证过：
+   `.work/mkapk.py --skip-build --install VC9TGM45MNJB8TSG`，再跑 1~2 轮预期 `启动受阻`）；
+   **①-a AHB / dma-buf 路线的探针**（不依赖装包，第二台已能跑到设备就绪；第一台也跑一遍当对照）；
+   **①-b** 内存路线落地之后，用**同一份 `ab-clean.conf` + `.work/ab_run.py`** 把第二台的卡点 B 读数补上（数据侧已备齐）。见 §八·M3-3d。
 2. **有 `trace_processor` 的机器上读停顿窗口的 trace**（原计划读 `.work\trace\stall.pftrace`，7.1 MB，
    含 `sched/*` 与那些 kgsl 原子名；**注意：当前工作区没有 `.work/trace/` 目录，见 §13**）。
 3. 若还要在这台机上做，下一刀建议是 **"GPU 保活"**（隔 N 毫秒发一次空提交）——
@@ -623,9 +625,9 @@ Android/Vulkan 后端"），是一份通用蓝图：阶段划分、高风险坑 
   项目已因只有一台机连砍三刀（常驻上传环、`HOST_CACHED`、摘前端）都被否。
   **2026-10-16「M3-3d」执行：做了，且选到的是最值钱的那类对照** —— 第二台是 **MediaTek MT6896 / Mali-G610 MC6 /
   Android 15 / Vulkan 1.1.177**（**非 Adreno**，不是"又一台骁龙"）。设备指纹、4 份能力探针、9.1 GB 数据与存档
-  都已备齐（`/data/local/tmp/dm/`），但**还没跑出对照读数**：① MIUI 拒绝 `adb install` / `pm install`
-  （`INSTALL_FAILED_USER_RESTRICTED`，`settings put` 被 `WRITE_SECURE_SETTINGS` 拒）⇒ 要人工开"通过 USB 安装"；
-  ② `dmhost` 冒烟在 `nnosInitialize` 后报 `内存换轨：建载体缓冲失败`（见 E2）⇒ 够不到卡点 B。
+  都已备齐（`/data/local/tmp/dm/`），但**还没跑出对照读数**：① 装机（当时 MIUI 拒绝 `adb install` / `pm install`；
+  **更正：同一天用户已开"通过 USB 安装"，这条应当已解除，待下一轮验证**）；② `dmhost` 冒烟在 `nnosInitialize` 后报
+  `内存换轨：建载体缓冲失败`（见 E2）⇒ 够不到卡点 B（**这一条才是真正的遮挡**）。
   尺子本身已搭好（`.work/ab-clean.conf` + `.work/ab_run.py`，两台共用）。
 - [ ] **E2 把 plan 坑 09 当"换设备"的验收清单** —— plan §7.2 坑 09（不同 SoC 支持的格式 / 扩展 / 性能不同：
   启动时检测实际能力，并为必要功能设计**经验证的回退路径**）。现状：扩展枚举做过（165 个扩展、
