@@ -5504,6 +5504,10 @@ conf `.work/n4o-{tailred,vals,nanflag,movetail,no38,v38,nanflag38,isinf38}{,-bru
   `【黄】描述符集分配失败（… 2 个池都没额度了 ⇒ 这一次绘制被静默跳过）` 每帧约 1011 集之后就开始出现
   ⇒ **游戏路径整段整段的绘制被跳过**。它不改变本轮的对照（两臂都带），但对"画面"是实打实的损失；
   下一轮起按缺省开（`=1`）跑，并把它记进 conf 注释。
+- **题面第三件的处置**（"`vsfull` 上试 `OpFunctionCall` 之类的形状改写 + 把写序对调在**那条路上**重做一次"）：
+  **写序对调那一半已覆盖** —— 候选① 成立后 `vsfull` ≡ `vsfullf`+借（同一批数据、同一条读数），
+  `movetail` + 借就是"在那条路上重做"（**152，3 轮**）；**形状改写那一半本轮没做**，移交 N4-r
+  （它要回答的"体的原始写为什么不落"正是 `OpFunctionCall` 这类改写的判据所在）。
 - **本轮没改新地基的任何模块**（`vk2_*.c` 一行未动）；改的只有 `vk_tri_game.c/.h`（+ `DM_TRI_BORROW` 与
   `vk_tri_fs_borrow_from`）与 `nvn_vk.c`（+ 一段只读自证 + 一次借表调用）。
 - **回归**：N1/N2/N3/N4-b 四探针各一轮（`…-n4qregress.txt`）+ `.work/regress_diff.py n4pregress n4qregress`
