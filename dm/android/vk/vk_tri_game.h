@@ -29,6 +29,7 @@
 #include <vulkan/vulkan.h>
 #include "nvn_obj.h"        // tex_t / view_t
 #include "vk_shader.h"      // vk_shader（阶梯要把我们自己的三份着色器包成 vk_shader 交给 vk_pipe_graphics）
+#include "vk_pipe.h"        // vk_gfx_state（N4-j 的"逐项接上"要按字段改我们这条管线的状态）
 
 // 开关开没开（读一次环境变量，幂等）。开的时候会打一行【查】自证。
 int vk_tri_game_on(void);
@@ -106,3 +107,35 @@ int vk_tri_decl_ds(void);
 // `DM_TRI_MASK_ALL=1`（缺省关）：阶梯自己的状态把**每个**颜色附件的写掩码都开成 0xf
 // （叠在已知落屏的 `vso` 档上就是单变量：只开附件 0 vs 全开）。设计说明见 vk_tri_game.c。
 int vk_tri_mask_all(void);
+
+// ---------------------------------------------------------------------------
+// N4-j：在**已知落屏**的 `vso` 档上，把"游戏那一刻的状态"**逐项**接过来 —— 一次只接一样。
+// ---------------------------------------------------------------------------
+// 要回答的那句话（写死，与 N4-i 的结尾同一句）：**"游戏那一刻的状态 / 那条管线的声明细节里，哪一项让
+// 片元消失？"** N4-i 已经把着色器、顶点数据、顶点流、索引、计数、描述符、写掩码全开、光栅化侧全放开
+// 逐条排除或修掉，只剩这一格。做法与判据：
+//   · 起点 = `DM_TRI_LADDER=vso`（**游戏的顶点着色器 + 我们自己的状态**，两轮实测**整片 85 = 落屏**）；
+//   · 每个开关只把我们这条管线的**一个字段**换成游戏那一刻的值（形状照 `DM_TRI_MASK_ALL`）；
+//   · 判据：`DM_PASS_PROBE=28` 的已知色底子（152）上**出现非 152 的值 = 这一档仍然落屏**；
+//     **哪一项一接上就从"整片 85"变成"整片 152"，责任就落在那一项上**。
+//   一次接全部（`DM_TRI_GAME_ALL=1`）是**对照**：它应当复现 `vsn` 的"不落屏"；
+//   如果它仍然落屏 ⇒ 我们列的这些字段**不覆盖机制**，得去别处找（这条读数本身就很有用）。
+enum {
+    VK_TRI_F_TOPO = 1u << 0,    // DM_TRI_TOPO_GAME=1    拓扑
+    VK_TRI_F_CULL = 1u << 1,    // DM_TRI_CULL_GAME=1    剔除面 + 前向面（两者只有一起才起作用）
+    VK_TRI_F_FRONT = 1u << 2,   // DM_TRI_FRONT=<0|1>    只换前向面（值 = VkFrontFace）
+    VK_TRI_F_BLEND = 1u << 3,   // DM_TRI_BLEND_GAME=1   混合那一组（en + src/dst rgb/a + eq rgb/a，逐目标）
+    VK_TRI_F_DEPTH = 1u << 4,   // DM_TRI_DEPTH_GAME=1   深度/模板测试那一组（**不含**格式声明，那一条是 DM_TRI_DECL_DS）
+    VK_TRI_F_A2C = 1u << 5,     // DM_TRI_A2C_GAME=1     alpha-to-coverage
+    VK_TRI_F_BIAS = 1u << 6,    // DM_TRI_BIAS_GAME=1    深度偏置（en + 三个系数）
+    VK_TRI_F_POLY = 1u << 7,    // DM_TRI_POLY_GAME=1    多边形模式
+    VK_TRI_F_MASK = 1u << 8,    // DM_TRI_MASK_GAME=1    每个目标的写掩码（游戏那一刻的）
+};
+// 这一轮接了哪几样（位掩码；惰性解析一次，缺省 0 = 一样都不接）
+uint32_t vk_tri_field_mask(void);
+// `DM_TRI_FRONT=<vk 值>` 显式给的前向面（返回 1 = 给了，*out 是 VkFrontFace 的值）
+int vk_tri_field_front(int *out);
+// 自证：这一轮逐项接上了什么（写给插入明细/心跳用；开关关着返回 0）
+int vk_tri_fields_desc(char *buf, size_t cap);
+// 把我们这条管线的状态 `ours` 里**被开关选中**的字段换成游戏那一刻的值 `game`
+void vk_tri_apply_fields(vk_gfx_state *ours, const vk_gfx_state *game);

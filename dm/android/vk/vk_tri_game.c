@@ -104,6 +104,14 @@ int vk_tri_game_desc(char *buf, size_t cap) {
                              (unsigned long long)atomic_load(&g_n4i_nopipe));
             if (m > 0) n += m;
         }
+        // N4-j：逐项接上的开关那一格 —— **只在真的接了东西时出现**（缺省关时这一行与上一轮逐字节相同，第 ㉓ 条）
+        if (n > 0 && (size_t)n < cap) {
+            char fb[160];
+            if (vk_tri_fields_desc(fb, sizeof fb) > 0) {
+                int m = snprintf(buf + n, cap - (size_t)n, " / 逐项接上 %s", fb);
+                if (m > 0) n += m;
+            }
+        }
     }
     return n > 0 ? n : 0;
 }
@@ -471,4 +479,129 @@ int vk_tri_decl_ds(void) {
                    "（叠在 `vb` 档上就是单变量：声明 vs 不声明）");
     }
     return v;
+}
+
+// ============================================================================
+// N4-j：**把"游戏那一刻的状态"逐项接上**（`DM_TRI_*_GAME=1` / `DM_TRI_FRONT=<vk 值>`；缺省关）
+// ============================================================================
+// 要回答的那句话写死在 vk_tri_game.h 里那张表的上方：**"游戏那一刻的状态 / 那条管线的声明细节里，
+// 哪一项让片元消失？"** N4-i 的四档阶梯已经把着色器、顶点数据、顶点流、索引、计数、描述符、
+// 写掩码全开、光栅化侧全放开逐条排除或修掉，剩下的就只有这一格。做法与纪律（照 N4-i 的形状）：
+//   · 起点 = **已知落屏**的 `vso` 档（游戏的顶点着色器 + 我们自己的状态；两轮实测整片 85）；
+//   · 每个开关只改**一个字段**（形状照 `DM_TRI_MASK_ALL`）；
+//   · 判据写死：`DM_PASS_PROBE=28` 的已知色底子（152）上**出现非 152 的值 = 这一档仍然落屏**；
+//     **哪一项一接上就从"整片 85"变成"整片 152"，责任就落在那一项上**；
+//   · `DM_TRI_GAME_ALL=1` = 一次接全部，做**对照**：它应当复现 `vsn` 的"不落屏"；若它仍然落屏 ⇒
+//     这张字段表**不覆盖机制**（这本身是读数，不是失败），得去别处找。
+// 为什么方向是"从落屏那一档往上加"而不是"从不落屏那一档往下减"：加法的每一步都以一条**能落屏**的
+// 管线为基准，答案直接是"这一项"，而减法只能知道"少了它也不够"（坑 ⑨：判据要能回答题目）。
+static uint32_t g_field_mask;
+static int g_field_parsed;
+static int g_field_front = -1;      // -1 = 没给（`DM_TRI_FRONT` 没设）
+
+static int env_flag(const char *name) {
+    const char *e = getenv(name);
+    return (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+}
+
+static int field_names(uint32_t m, char *buf, size_t cap) {
+    if (!buf || cap < 8) return 0;
+    int n = 0;
+    static const struct { uint32_t bit; const char *name; } tab[] = {
+        { VK_TRI_F_TOPO, "拓扑" }, { VK_TRI_F_CULL, "剔除+前向面" }, { VK_TRI_F_FRONT, "前向面" },
+        { VK_TRI_F_BLEND, "混合" }, { VK_TRI_F_DEPTH, "深度/模板" }, { VK_TRI_F_A2C, "a2c" },
+        { VK_TRI_F_BIAS, "偏置" }, { VK_TRI_F_POLY, "多边形" }, { VK_TRI_F_MASK, "掩码" },
+    };
+    for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++) {
+        if (!(m & tab[i].bit)) continue;
+        int w = snprintf(buf + n, cap - (size_t)n, "%s%s", n ? "+" : "", tab[i].name);
+        if (w <= 0 || (size_t)(n + w) >= cap) break;
+        n += w;
+    }
+    if ((m & VK_TRI_F_FRONT) && g_field_front >= 0) {
+        int w = snprintf(buf + n, cap - (size_t)n, "(=%d)", g_field_front);
+        if (w > 0 && (size_t)(n + w) < cap) n += w;
+    }
+    return n;
+}
+
+uint32_t vk_tri_field_mask(void) {
+    if (g_field_parsed) return g_field_mask;
+    g_field_parsed = 1;
+    if (env_flag("DM_TRI_GAME_ALL")) g_field_mask = 0x1ffu;
+    if (env_flag("DM_TRI_TOPO_GAME")) g_field_mask |= VK_TRI_F_TOPO;
+    if (env_flag("DM_TRI_CULL_GAME")) g_field_mask |= VK_TRI_F_CULL;
+    if (env_flag("DM_TRI_BLEND_GAME")) g_field_mask |= VK_TRI_F_BLEND;
+    if (env_flag("DM_TRI_DEPTH_GAME")) g_field_mask |= VK_TRI_F_DEPTH;
+    if (env_flag("DM_TRI_A2C_GAME")) g_field_mask |= VK_TRI_F_A2C;
+    if (env_flag("DM_TRI_BIAS_GAME")) g_field_mask |= VK_TRI_F_BIAS;
+    if (env_flag("DM_TRI_POLY_GAME")) g_field_mask |= VK_TRI_F_POLY;
+    if (env_flag("DM_TRI_MASK_GAME")) g_field_mask |= VK_TRI_F_MASK;
+    {
+        const char *e = getenv("DM_TRI_FRONT");
+        if (e && *e) { g_field_front = (int)strtol(e, NULL, 0) ? 1 : 0; g_field_mask |= VK_TRI_F_FRONT; }
+    }
+    if (g_field_mask) {
+        char b[256]; int n = field_names(g_field_mask, b, sizeof b);
+        LOG("【查】DM_TRI_ 逐项接上：%s —— 叠在**已知落屏**的 `vso` 档上，一次只改一样；"
+            "判据：`DM_PASS_PROBE=28` 的已知色底子（152）上**出现非 152 的值 = 这一档仍然落屏**",
+            n ? b : "（空）");
+        if (g_field_mask == 0x1ffu)
+            LOG("【查】DM_TRI_GAME_ALL=1：**一次接全部**（对照）—— 它应当复现 `vsn` 的「不落屏」；"
+                "若它仍然落屏，说明这张字段表不覆盖机制（读数，不是失败）");
+    }
+    return g_field_mask;
+}
+
+int vk_tri_field_front(int *out) {
+    vk_tri_field_mask();                 // 保证解析过
+    if (g_field_front < 0) return 0;
+    if (out) *out = g_field_front;
+    return 1;
+}
+
+int vk_tri_fields_desc(char *buf, size_t cap) {
+    uint32_t m = vk_tri_field_mask();
+    if (!m) return 0;
+    return field_names(m, buf, cap);
+}
+
+void vk_tri_apply_fields(vk_gfx_state *o, const vk_gfx_state *g) {
+    if (!o || !g) return;
+    uint32_t m = vk_tri_field_mask();
+    if (!m) return;
+    if (m & VK_TRI_F_TOPO) o->topo = g->topo;
+    // 剔除面与前向面是一对：剔除关着时前向面无意义，只看剔除面会得出"不是它"的假结论
+    if (m & VK_TRI_F_CULL) { o->cull = g->cull; o->front = g->front; }
+    {
+        int fv = -1;
+        if ((m & VK_TRI_F_FRONT) && vk_tri_field_front(&fv)) o->front = (VkFrontFace)fv;
+    }
+    if (m & VK_TRI_F_BLEND) {
+        for (int i = 0; i < 8; i++) {
+            o->blend_en[i] = g->blend_en[i];
+            o->src_rgb[i] = g->src_rgb[i]; o->dst_rgb[i] = g->dst_rgb[i];
+            o->src_a[i] = g->src_a[i]; o->dst_a[i] = g->dst_a[i];
+            o->eq_rgb[i] = g->eq_rgb[i]; o->eq_a[i] = g->eq_a[i];
+        }
+    }
+    if (m & VK_TRI_F_DEPTH) {
+        o->depth_test = g->depth_test; o->depth_write = g->depth_write; o->depth_op = g->depth_op;
+        o->stencil_en = g->stencil_en;
+        for (int i = 0; i < 2; i++) {
+            o->stencil_func[i] = g->stencil_func[i];
+            o->stencil_vmask[i] = g->stencil_vmask[i]; o->stencil_wmask[i] = g->stencil_wmask[i];
+            o->stencil_fail[i] = g->stencil_fail[i];
+            o->stencil_zfail[i] = g->stencil_zfail[i];
+            o->stencil_zpass[i] = g->stencil_zpass[i];
+        }
+        // 格式声明**不在这里**（那是 `DM_TRI_DECL_DS` 的一条独立单变量，N4-i 已在 `vb` 档上量过）
+    }
+    if (m & VK_TRI_F_A2C) o->a2c = g->a2c;
+    if (m & VK_TRI_F_BIAS) {
+        o->bias_en = g->bias_en;
+        o->bias_factor = g->bias_factor; o->bias_units = g->bias_units; o->bias_clamp = g->bias_clamp;
+    }
+    if (m & VK_TRI_F_POLY) o->poly = g->poly;
+    if (m & VK_TRI_F_MASK) for (int i = 0; i < 8; i++) o->write_mask[i] = g->write_mask[i];
 }

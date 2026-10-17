@@ -3006,6 +3006,32 @@ static void vk_ds_fmt(VkFormat f, VkFormat *df, VkFormat *sf) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// N4-j：`DM_POLY_MODE_NVN=1`（**缺省关**）—— 多边形模式按 **NVN 的枚举**映射到 Vulkan。
+// 这是一条**真 bug 的修法**（旧路新路共有），不是新功能：NVN 的取值是 **POINT=0 / LINE=1 / FILL=2**
+// （`dm/gfx/nvn/include/nvn.h:1059-1065` 是权威枚举），而 Vulkan 是 **FILL=0 / LINE=1 / POINT=2**。
+// 改前那一行是 `out->poly = (VkPolygonMode)(po.mode <= 2 ? po.mode : 2)` —— **把 NVN 的值直接当
+// VkPolygonMode 用** ⇒ 游戏那句 `nvnPolygonStateSetPolygonMode(s, NVN_POLYGON_MODE_FILL)`（= 2）落成
+// **VK_POLYGON_MODE_POINT**：**每个三角形只光栅化成顶点那几个像素** ⇒ 整片目标一个非底色像素都没有。
+// 这条与全部旧读数相容：校验层**不报**（POINT 是合法模式、设备也支持非实心填充）、`DM_RASTER_BRUTE`
+// 不碰它（所以"光栅化侧全放开仍全零"）、顶点/常量/着色器都是好的、我们自己的三角形用 FILL 所以能落屏。
+// 口径照苹果侧（`nvn_mtl.m:4400`：`mode == NVN_POLYGON_MODE_LINE ? Lines : Fill`）：**只有 LINE 映射成
+// LINE、其余一律 FILL**（Metal 没有点填充；Vulkan 有，但游戏那句 FILL 不该变成 POINT）。
+// 缺省关 ⇒ 旧行为一字不变，可做"只差一行"的单变量对照。
+static int poly_mode_nvn_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_POLY_MODE_NVN");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_POLY_MODE_NVN=1：多边形模式按 NVN 的枚举映射到 Vulkan —— NVN 是 "
+                   "POINT=0 / LINE=1 / **FILL=2**（nvn.h:1059-1065）、Vulkan 是 FILL=0 / LINE=1 / POINT=2；"
+                   "改前是直接把 NVN 的值当 VkPolygonMode 用 ⇒ 游戏的 `SetPolygonMode(FILL)`=2 落成 "
+                   "**VK_POLYGON_MODE_POINT**。本开关照苹果侧 nvn_mtl.m:4400 的口径：只有 LINE → LINE、"
+                   "其余一律 FILL");
+    }
+    return v;
+}
+
 static void gfx_state_fill(vk_gfx_state *out, int topo_prim) {
     memset(out, 0, sizeof *out);
     out->topo = vk_topo_of(topo_prim);
@@ -3067,7 +3093,24 @@ static void gfx_state_fill(vk_gfx_state *out, int topo_prim) {
     memcpy(&po, g_rs.st_bytes[4], sizeof po);
     out->cull = (VkCullModeFlags)(po.cull & 3);
     out->front = po.front ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-    out->poly = (VkPolygonMode)(po.mode <= 2 ? po.mode : 2);
+    // ★ N4-j：**这条是"整片目标一个像素都没有"的成因**（见上面 poly_mode_nvn_on 那段）。
+    // 缺省（关）= 原样直搬（旧行为）；`DM_POLY_MODE_NVN=1` 才按 NVN 的枚举正确映射。
+    if (poly_mode_nvn_on()) {
+        static _Atomic uint64_t cnt[4];
+        uint32_t m2 = (uint32_t)(po.mode & 3);
+        uint64_t c = atomic_fetch_add(&cnt[m2], 1) + 1;
+        // 自证：**每一种取值的前两次** + 之后每 4096 次各一条 —— 第一版只在"不是 FILL"时才打，
+        // 于是"游戏一直在用 FILL"这件事在日志里**看不见**（坑 ㉒ 的同一类：只把自己以为稀罕的那一种打出来）。
+        if (c <= 2 || (c & 4095) == 0)
+            LOG("【查】DM_POLY_MODE_NVN：游戏这一次的多边形模式 = NVN %u（%s）⇒ 落成 VkPolygonMode %s"
+                "（这一类累计 %llu 次）",
+                m2, m2 == NVN_POLYGON_MODE_POINT ? "POINT" : m2 == NVN_POLYGON_MODE_LINE ? "LINE"
+                     : m2 == NVN_POLYGON_MODE_FILL ? "FILL" : "（越界）",
+                m2 == NVN_POLYGON_MODE_LINE ? "LINE" : "FILL", (unsigned long long)c);
+        out->poly = (m2 == (uint32_t)NVN_POLYGON_MODE_LINE) ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+    } else {
+        out->poly = (VkPolygonMode)(po.mode <= 2 ? po.mode : 2);
+    }
     out->bias_en = po.offset_en ? 1 : 0;
     out->bias_factor = g_rs.po_factor; out->bias_units = g_rs.po_units; out->bias_clamp = g_rs.po_clamp;
 
@@ -3086,6 +3129,40 @@ static void gfx_state_fill(vk_gfx_state *out, int topo_prim) {
         out->stream[k].stride = g_rs.stream[k].stride;
         out->stream[k].divisor = g_rs.stream[k].divisor;
     }
+}
+
+// N4-j：把一个 `vk_gfx_state` 的**全部**字段摊成一行（自证用）。为什么要它：N4-i 的自证行只打了
+// 拓扑 / 写掩码[0] / 混合[0] 的 en 与 rgb 系数 / 深度 test,write / 剔除 —— 而 `frontFace`、三个偏置系数、
+// `a2c`、`src_a`/`dst_a`/`eq_*` 那一组、`poly`、**每个目标的**掩码与混合、模板那一整组**都没打**；
+// 本轮要的正是"逐字段对照两边（游戏那一刻 vs 我们这条管线）"，漏打一格就可能把答案漏掉（坑 ㉒：
+// "只看第一条 / 第一个"的读数会直接改变结论）。所以这里按**全部字段**摊平，两边各打一行。
+static int gfx_state_desc(char *b, size_t cap, const vk_gfx_state *s) {
+    if (!b || !cap || !s) return 0;
+    uint32_t ben = 0, bm = 0;
+    for (int i = 0; i < 8; i++) {
+        if (s->blend_en[i]) ben |= 1u << i;
+        bm |= (uint32_t)(s->write_mask[i] & 0xf) << (4 * i);
+    }
+    return snprintf(b, cap,
+        "拓扑 %d；写掩码 0x%x（逐目标 %#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x）；采样 %u；a2c %u；"
+        "混合 en 0x%x —— 目标0：%d→%d 颜色 op %d、%d→%d alpha op %d；"
+        "深度 test %u write %u op %d、格式 %d/%d；"
+        "模板 en %u func %d/%d 读掩码 %#x/%#x 写掩码 %#x/%#x 失败 %d/%d 深度失败 %d/%d 通过 %d/%d；"
+        "剔除 %d 前向面 %d 多边形 %d；偏置 en %u 系数 %.3f/%.3f/%.3f",
+        (int)s->topo, bm,
+        s->write_mask[0], s->write_mask[1], s->write_mask[2], s->write_mask[3],
+        s->write_mask[4], s->write_mask[5], s->write_mask[6], s->write_mask[7],
+        s->samples, s->a2c, ben,
+        (int)s->src_rgb[0], (int)s->dst_rgb[0], (int)s->eq_rgb[0],
+        (int)s->src_a[0], (int)s->dst_a[0], (int)s->eq_a[0],
+        s->depth_test, s->depth_write, (int)s->depth_op, (int)s->depth_fmt, (int)s->stencil_fmt,
+        s->stencil_en, (int)s->stencil_func[0], (int)s->stencil_func[1],
+        s->stencil_vmask[0], s->stencil_vmask[1], s->stencil_wmask[0], s->stencil_wmask[1],
+        (int)s->stencil_fail[0], (int)s->stencil_fail[1],
+        (int)s->stencil_zfail[0], (int)s->stencil_zfail[1],
+        (int)s->stencil_zpass[0], (int)s->stencil_zpass[1],
+        (int)s->cull, (int)s->front, (int)s->poly,
+        s->bias_en, (double)s->bias_factor, (double)s->bias_units, (double)s->bias_clamp);
 }
 
 // ============================================================================
@@ -3187,6 +3264,9 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
     if (vk_tri_mask_all()) for (uint32_t i2 = 0; i2 < ours.color_count && i2 < 8; i2++) ours.write_mask[i2] = 0xf;
     memcpy(ours.attr, st->attr, sizeof ours.attr);       // `vb` 档要用（我们的 VS 只声明 Location 0）
     memcpy(ours.stream, st->stream, sizeof ours.stream);
+    // N4-j：把"游戏那一刻的状态"**逐项**接过来（缺省关，一样都不接；形状照 DM_TRI_MASK_ALL）。
+    // 每个开关只改我们这条管线的一个字段 ⇒ "整片 85 变成整片 152"就把责任钉在那一项上。
+    vk_tri_apply_fields(&ours, st);
 
     // ---- 这一档用哪一对着色器 / 哪份状态 / 要不要描述符与顶点缓冲 ----
     const vk_shader *use_vs = NULL, *use_ps = NULL;
@@ -3406,6 +3486,19 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
             ours.write_mask[0],
             draw3 ? "vkCmdDraw(3)（全屏三角形）" : (indexed && ib_ok ? "vkCmdDrawIndexed（照游戏的计数）" : "vkCmdDraw（照游戏的计数）"),
             (unsigned long long)atomic_load(&g_n4i_logs));
+        // N4-j：两边状态的**全字段**摊平（**游戏那一刻** vs **我们这条管线**）—— 本轮要的是"逐字段对照"，
+        // 上面那条汇总行只打了其中一小部分（frontFace / 偏置 / a2c / alpha 侧混合 / 模板 / poly 都没打）。
+        {
+            static char gd[560], od[560];
+            gfx_state_desc(gd, sizeof gd, st);
+            gfx_state_desc(od, sizeof od, &ours);
+            LOG("【查】DM_TRI_LADDER=%s：状态全表（**游戏那一刻**）—— %s", sname, gd);
+            LOG("【查】DM_TRI_LADDER=%s：状态全表（**我们这条管线**）—— %s", sname, od);
+            char fb[160];
+            if (vk_tri_fields_desc(fb, sizeof fb) > 0)
+                LOG("【查】DM_TRI_LADDER=%s：**逐项接上的开关** = %s（叠在 `vso` 档上、一次一样；"
+                    "判据：`DM_PASS_PROBE=28` 的底盘 152 上出现非 152 = 这一档仍然落屏）", sname, fb);
+        }
         if (k == 1)
             LOG("【查】DM_TRI_LADDER：跳过计数（形状不合适 %llu / 管线没建出来 %llu / 目标或附件尺寸不适用 %llu / "
                 "描述符写不出 %llu / 顶点流绑不上 %llu）——每一档的「没插」都能归到一条上",
