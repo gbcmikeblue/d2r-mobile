@@ -2285,12 +2285,19 @@ static int desc_pool_big_on(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DM_DESC_POOL_BIG");
-        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
-        if (v) LOG("【查】DM_DESC_POOL_BIG=1：描述符池放大到 %d 集/池 × 每类型 %u 个（两个池 ⇒ %d 集/槽/帧）——"
-                   "原来 %d 集/池，而游戏路径那一刻的布局有 6 个动态描述符 ⇒ 一个池只够开 %d 个集，"
-                   "一帧几百次绘制就是几百次「静默跳过」",
-                   DESC_POOL_BIG_SETS, DESC_POOL_BIG_QUOTA, DESC_POOL_BIG_SETS * DESC_POOLS,
-                   DESC_POOL_SETS, DESC_POOL_SETS / 6);
+        // N4-m：**改成缺省开**（`DM_DESC_POOL_BIG=0` 退回旧行为）。
+        // 理由与 `dyn_fix_on()` 同形：N4-l 把这条量成读数（106 帧 27756 次分配失败、≈262/帧被**静默**跳过），
+        // 并且回答了"它不是画面全零的成因"（放大后仍 152）⇒ 按规范修掉（`maxSets` 与 `poolSize` 不是一回事），
+        // 留 `=0` 让"修前 / 修后"仍能互切。
+        v = (e && !strcmp(e, "0")) ? 0 : 1;
+        LOG("【查】DM_DESC_POOL_BIG：**%s**（N4-m 起**缺省开**，`DM_DESC_POOL_BIG=0` 退回旧行为）—— "
+            "描述符池 %s：%d 集/池 × 每类型 %u 个（两个池 ⇒ %d 集/槽/帧）；旧行为是 %d 集/池 × 每类型 %d 个，"
+            "而游戏路径那一刻的布局有 6 个动态描述符 ⇒ 一个池只够开 %d 个集，一帧几百次绘制就是几百次「静默跳过」",
+            v ? "开" : "关（旧行为）", v ? "放大" : "原样",
+            v ? DESC_POOL_BIG_SETS : DESC_POOL_SETS,
+            v ? DESC_POOL_BIG_QUOTA : (unsigned)DESC_POOL_SETS,
+            v ? DESC_POOL_BIG_SETS * DESC_POOLS : DESC_POOL_SETS * DESC_POOLS,
+            DESC_POOL_SETS, DESC_POOL_SETS, DESC_POOL_SETS / 6);
     }
     return v;
 }
@@ -2671,9 +2678,15 @@ static int dyn_fix_on(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DM_DYN_OFFSET_FIX");
-        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
-        if (v) LOG("【查】DM_DYN_OFFSET_FIX=1：**布局里是 dynamic 的每一条绑定**都消费一个动态偏移"
-                   "（宿主常量段与空白回退那两支原来不 push ⇒ dynamicOffsetCount 比布局要求的少，是一次非法绑定）");
+        // N4-m：**改成缺省开**（`DM_DYN_OFFSET_FIX=0` 退回旧行为）。
+        // 为什么从"缺省关的 A/B 开关"变成"缺省修的规范问题"：N4-l 已经把它量成读数（游戏路径 `push 3 / 布局要 6`、
+        // 每轮 14~596 次），并且把"它是不是画面全零的成因"答成**否**（打开后仍 152，而阶梯在同一情形下照样落屏）
+        // ⇒ 它是一条**确定的非法绑定**（VUID-vkCmdBindDescriptorSets-dynamicOffsetCount-00359），按规范修掉；
+        // 留 `=0` 只是为了让"修前 / 修后"仍能互切（§11.5 第 1 条）。
+        v = (e && !strcmp(e, "0")) ? 0 : 1;
+        LOG("【查】DM_DYN_OFFSET_FIX：**%s**（N4-m 起**缺省开**，`DM_DYN_OFFSET_FIX=0` 退回旧行为）—— "
+            "布局里是 dynamic 的每一条绑定都消费一个动态偏移（宿主常量段与空白回退那两支原来不 push ⇒ "
+            "dynamicOffsetCount 比布局要求的少，是一次非法绑定）", v ? "开" : "关（旧行为）");
     }
     return v;
 }

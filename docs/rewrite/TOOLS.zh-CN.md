@@ -319,6 +319,21 @@
 | **`n4l_cap_variants.py`：capability 清单怎么"只加不用"地注入** | 用 `glslc` 编底 → `spirv-dis` 反汇编 → 在**最后一条 `OpCapability` 之后**插入那几行 → **`spirv-as` 汇编回二进制**（不手写 capability 数值，避开坑 ㊱ 的 `wc` 写错）→ 每份都跑 `spirv-val` + `spirv-dis` 自证（读数 `.work/logs/n4l-cap-variants.txt`：五份全部 `spirv-val` 退出码 0、指令一条没变） |
 | **`.work/` 本轮新增脚本** | `n4l_scan_old.py`（翻旧日志的分项计数）、`n4l_audit_insert.py`（**审变体上没上场**）、`n4l_fs_variants.py`（四份"只留一条绑定"的 FS + `decl`，生成 `vk_tri_fs_n4l_spv.h`）、`n4l_cap_variants.py`（capability 逐组注入，生成 `vk_tri_fs_n4l_cap_spv.h`）、`n4l_confs.py`（一处生成全部 conf）、`n4l_driver.py`（`<格>:<轮数>` 分批连跑 + 总表）、`n4l_report.py`（抽判据 / **插入明细里的"实际用的 FS"** / 布局 / 池账 / 红行） |
 
+## B¹⁸. N4-m 期间量出来的仪器事实（2026-10-17，下次开工直接用）
+
+| 事实 | 读数 / 怎么用 |
+|---|---|
+| **★ 判"这份 SPIR-V 模块有没有毛病"，先按六类逐段对齐**（`.work/n4m_fs_diff.py`） | 六类 = ① `OpCapability`+`OpExtension` ② `OpExecutionMode` ③ `OpDecorate`/**`OpMemberDecorate`** ④ 常量通道（`OpConstant*`）⑤ **`OpEntryPoint` 的接口表（每个 id 解析到变量 → 存储类 + 装饰）** ⑥ **函数体 opcode 直方图**。把"游戏那份"与"我们自己已经落屏的那份"并排打出来，差集直接给"只有游戏那份有 / 只有我们有"。**别只看 capability 与代码**——本轮真正的差只有两处（`NoContraction` 1 条 + 未优化的函数体形状） |
+| **★ 译文器产物是"未优化"的，glslc 产物是全 SSA —— 这个形状差在 GLSL 里复现不出来** | 游戏那份 `8e80084d3c30340a`：**222 条指令 / 18 种 opcode，其中 38 个 `OpVariable`(Function) + 50 次 `OpStore` + 66 次 `OpLoad`**；我们那份 `blit`：103 条 / 13 种、**0 个 Function 局部变量**。**`glslc -O0` 与 `-O3` 产出逐条相同**（103 条、同样 10 个 `OpVariable`）⇒ 要复现"未优化的形状"只能**手写/机械改写 SPIR-V**（`spirv-as`），这一步属于"从游戏产物派生文本"，**先拿到允许** |
+| **★ 判据锚点（本轮新增，往后直接引）** | `vsfullf` + `DM_TRI_FS_VARIANT=blit`（同接口 + 照游戏那份反汇编逐条复刻的算术，glslc 编出来）⇒ **3 轮全部落屏**（第 0/1 级读到 0.0、第 2 级仍 152）；`blitn`（再补 `OpIsNan`/`OpSelect` + `precise`）⇒ **3 轮也全部落屏**。⚠ **N4-k 的 `blit`=152 是作废样本**（跑在 `vsfull` 档、变体没上场，见 B¹⁷ 第一条）⇒ "复刻算术也不落屏"这句话**从来没有成立过** |
+| **★ 校验层对"着色器模块"只会说两句（本轮第一次按名字钉住）** | `VUID-VkShaderModuleCreateInfo-pCode-08740` = `SPIR-V Capability Float64 was declared, but … (VkPhysicalDeviceFeatures::shaderFloat64)`；`pCode-08742` = `SPIR-V Extension SPV_EXT_fragment_shader_interlock was declared, but … (VK_EXT_fragment_shader_interlock)`。两条都被 `capall` 单变量排掉（85，2 轮）。**"层没报"不能证明模块没问题**，反过来"层报这两条"也不构成成因 —— 要按 capability 名逐项对比（`.work/vklayer_cap_diff.py`），别看总条数 |
+| **★ 带层的轮次会改掉时序与资源注册 ⇒ 常拿不到判据读数** | 本轮带层那一轮：出图 **1190**（常态 ~100）、绘制 **61 万**（常态 2 万上下）、**阶梯一次没插**、扫描只认到 **93 张已知贴图（≥256 的 2 张；常态 139 / 26）**。⇒ 带层只用来问"层说了什么"，**不要**同时指望它给阶梯判据；要判据就另跑一轮不带层的同 conf |
+| **★ 驱动侧 logcat 的正确读法**（`.work/n4m_logcat_scan.py`） | 别用宽正则捞 `fail|error`（会捞进一堆 MIUI/系统噪音）。做法：**先按 tag 出直方图**，再只看 tag 像驱动的那些（`AdrenoVK-*` / `qdgralloc` / `vulkan` / `kgsl` / `DMABUFHEAPS`…），然后在这些行里找 `fail/error/invalid/limit`。本轮：驱动 tag 里带 error 的只有 4 条 `qdgralloc: Unsupported format - 59`（与我们无关）⇒ **驱动对"这次绘制被丢掉"一句话都没说** |
+| **★ 两条修法已改成"缺省开 + `=0` 退回"**（`nvn_vk.c`） | ① **`DM_DYN_OFFSET_FIX`**（布局里是 dynamic 的每条绑定都消费一个偏移）：缺省开；`=0` 切回旧行为。复验：`vso` **85 不变**、不符 **0 条**（旧行为 69~164 条）；游戏绘制 **152 不变**、不符 0 条。② **`DM_DESC_POOL_BIG`**（1024 集/池 × 每类型 3072）：缺省开；`=0` 切回旧行为。复验：`vso` **85 不变**、池失败 **3854 → 327（末帧 841 → 0）**；游戏绘制 **152 不变**、**22579 → 328（末帧 846 → 0）**。**做 A/B 时把 `=0` 写进 conf**（否则前几轮的"旧行为"读数不可比） |
+| **★ 回归基准：`n4lregress` 在盘上不存在** | `.work/logs/` 里只有 `n2/n3/n4b/n4c/n4g/n4h/n4i/n4j/n4k` 那几套（提示词里写的 `…-n4lregress.txt` **没有文件**）⇒ 本轮以 **`n4kregress`** 为基准：`.work/regress_diff.py n4kregress n4mregress` ⇒ **0 项不一致**（41/48/89/59 个共同键）。下一轮请用 `n4mregress` 作基准 |
+| **★ 看画面：内容区那块颜色要单独量** | 本轮两轮（`DM_WIN_SRC=28` + `DM_POLY_MODE_NVN` + 两条修法缺省开）的截图：**查看器亮度 0.0/0/0**、**纯红 0.00%**，但**内容区是整片 `RGB(48,32,48)`（25.27% 屏幕像素）**，而 N4-f / N4-j 同一份 `DM_WIN_SRC=28` 的截图是 **99.63% 纯黑**。⇒ 判"画面"时用 `.work/n4h_png_stats.py` 打**颜色直方图**（"整片一个值"也是一种读数），别只看"纯红占比" |
+| **`.work/` 本轮新增脚本** | `n4m_fs_diff.py`（六类逐段对齐，生成 `n4m-fs-diff.txt`）、`n4m_fs_variants.py`（`blitn`，生成 `vk_tri_fs_n4m_spv.h` + 自证 `n4m-fs-variants.txt`）、`n4m_build.py`（**只出包/装机、不带跑轮**，`--layer` 决定要不要把层打进包）、`n4m_confs.py`（一处生成 11 份 conf）、`n4m_driver.py`（任意 conf + 任意 tag + 可选 `--layer/--build/--install`）、`n4m_regress.py`（四探针，尾巴 `-n4mregress`）、`n4m_logcat_scan.py`（驱动侧读法） |
+
 ## C. 建议补（都不难，但能省好几轮）
 
 | 建议 | 为什么值得 |

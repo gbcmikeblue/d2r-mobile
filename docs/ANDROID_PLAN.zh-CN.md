@@ -1006,6 +1006,32 @@ SetHeapSize：首次设堆成功 3728 MB      ← 换轨后照旧
   分配失败（≈262/帧、末帧 850）**= 被静默跳过的绘制，`DM_DESC_POOL_BIG=1` 后 **331/轮、末帧 0**、画面仍 152 ⇒ 不是成因。
   结论见「八、N4-l」，仪器事实见 `TOOLS` B¹⁷。**下一个 = N4-m**：给"游戏那份 FS 模块"上**带校验层**的一轮
   （`vsfull` + A1 配方），并用"壳 + 我自己的 body"做一格（**要先说清、拿到允许**）。
+  ▶ **回勾（2026-10-17，本轮）：N4-m 做完 —— 游戏那份 FS 的每一层可静态比较的差别都排掉了，只剩"这份确切的指令序列"。**
+  **离线**（`.work/n4m_fs_diff.py` → `n4m-fs-diff.txt`，按六类摊开）：capability（10 条）/ execution mode（都是
+  `OriginUpperLeft`）/ 常量（14 条，与 `blit` 语义逐条对上）/ `OpEntryPoint` 接口表（4 条 = `gl_FragCoord` + 3 个
+  Output，与 `iface`/`blit` **逐条相同**）四项**没有一项是游戏那份独有的**；唯一多出来的是 **`NoContraction`（1 条，
+  落在一条 `OpFAdd` 上）**，以及**函数体的形状**（游戏那份 **38 个 Function 局部变量 + 50 次 store + 66 次 load**
+  的未优化形态，我们那份是全 SSA）。
+  **设备上两刀**（判据：`DM_PASS_PROBE=28` 底盘 152 上出现非 152 = 落屏）：**`blit`（同接口 + 照它反汇编逐条复刻的
+  算术，glslc 编出来）3 轮全部落屏（第 0/1 级读到 0.0）**、**`blitn`（再补 `OpIsNan`/`OpSelect` + `precise`
+  ⇒ 2 条 `NoContraction`）3 轮也全部落屏** ⇒ **函数体语义 / 那 4 种 opcode / 那条装饰都不是原因**
+  （⚠ 顺便更正：N4-k 的 `blit`=152 是作废样本，"复刻算术也不落屏"从来没成立过）。
+  **带层一轮**（A1 配方）：16 种 VUID 与 A1 同形，**层对这份模块只说了两句** —— `pCode-08740`（`Float64` capability
+  声明了但设备没有 `shaderFloat64`）与 `pCode-08742`（`SPV_EXT_fragment_shader_interlock` 声明了但设备没这个扩展），
+  **两句都已被 `capall` 单变量排掉**；**没有一条落在"管线创建 / 描述符与着色器匹配"上**；**驱动侧 logcat 一句话都没说**
+  ⇒ 按判据记成**负结果**。⚠ 这一轮**没有判据读数**（带层把时序与资源注册整个改了：阶梯一次没插、扫描只认到 93 张
+  已知贴图，常态是 139）⇒ 按"无效判据样本"记。
+  **两条真 bug 按规范修掉**（改成**缺省开** + `=0` 退回，`nvn_vk.c`）：① 动态偏移个数 —— `vso` **85 不变**、
+  不符 **0 条**（旧行为 69~164 条）、游戏绘制 **152 不变**、不符 0 条；② 描述符池配额 —— `vso` **85 不变**、
+  池失败 **3854 → 327（末帧 841 → 0）**、游戏绘制 **152 不变**、池失败 **22579 → 328（末帧 846 → 0）**。
+  **回归**：四探针 `…-n4mregress.txt`，与 **`n4kregress`** 比（⚠ 提示词里写的 `n4lregress` **盘上不存在**）⇒
+  **判据字段 0 项不一致**（41/48/89/59 个共同键）。
+  **画面仍未出**：两轮查看器 0.0/0/0、截图纯红 0.00%；⚠ 一条**新观察（只记不判，2 轮同形）**：这两张截图的内容区是
+  **整片 `RGB(48,32,48)`**，而 N4-f/N4-j 同一份 `DM_WIN_SRC=28` 的截图是 99.63% 纯黑。
+  结论见「八、N4-m」，仪器事实见 `TOOLS` B¹⁸。**下一个 = N4-n**：「壳 + 我自己的 body」那一格 —— 把
+  `8e80084d3c30340a` 反汇编下来、**只替换 `main` 的函数体**（保留全部声明/装饰/接口）用 `spirv-as` 编成**我们自己的**
+  新模块：落屏 ⇒ 问题在函数体；仍 152 ⇒ 在声明/装饰（逐条减）。
+  ⚠ **这一步动的是"从游戏产物派生的文本"：必须先说清"改成什么、为什么、怎么回退"、拿到允许再动**（本轮没做）。
 
 1. ~~**里程碑 B：客体停住**（任务图侧）~~ —— **2026-10-15「M3-2t」结案（任务图这条线）**：三张位图做了时间序列，
    三轮真机读数把「M3-2s」第四节的甲（上膛 0 位）/ 乙（完成后被清）分开了 —— **甲否掉、乙成立**：待派发最大
@@ -4975,6 +5001,122 @@ Binding / DescriptorSet / Location 装饰），**都只声明一条或多条绑�
 器械 `.work/n4l_scan_old.py`（翻旧日志的计数）、`n4l_audit_insert.py`（**审"变体到底上没上场"**）、
 `n4l_fs_variants.py`（四份"只留一条绑定"的 FS）、`n4l_cap_variants.py`（capability 清单逐组注入）、
 `n4l_confs.py`（一处生成全部 conf）、`n4l_driver.py`（分批连跑 + 总表）、`n4l_report.py`（抽判据 / 插入明细 / 布局 / 池账）。
+
+---
+
+### N4-m：给"游戏那份片段着色器模块"上带校验层的一轮，并把它与"我们自己那份壳"逐段分开 —— **每一个可静态比较的层都排掉了，责任收窄到"这一份确切的 SPIR-V 模块"**（2026-10-17，第一台 Adreno 830，离线两刀 + 7 轮判据 + 1 轮带层 + 4 轮修法复验 + 2 轮看画面）
+
+**这一轮的题目**（N4-l 结尾写死的）：`vsfn`（游戏 FS、**一条描述符都不绑**）也是 152 ⇒ 责任收在
+`8e80084d3c30340a` 这份模块本身。要回答的是：**它里面有没有哪一条「声明 / 装饰 / 常量 / 接口 / 函数体形状」
+是我们那份已经落屏的壳里没有的？**（有 ⇒ 下一刀在那里；没有 ⇒ 只能去"这份确切的指令序列"。）
+
+**第 0 步（离线，不花设备时间）：把两份模块逐段对齐** —— `.work/n4m_fs_diff.py` → `.work/logs/n4m-fs-diff.txt`
+（`spirv-dis` 出来的文本按六类摊开：capability+extension / execution mode / decorate+memberdecorate /
+常量 / `OpEntryPoint` 接口表（每个 id 解析到变量与存储类）/ 函数体 opcode 直方图）：
+
+| 比的那一类 | **游戏 `8e80084d3c30340a`** | 我们那份**已经落屏**的壳（`blit` / `iface`） | 差 |
+|---|---|---|---|
+| 头部 | SPIR-V 1.3、Bound 273、29 条类型、14 条常量 | 1.3、Bound 137、26 条类型、14 条常量 | 无（版本同档） |
+| capability | 10 条（含 `Float64` / `FragmentShaderPixelInterlockEXT` / `GroupNonUniform*` / `ImageBuffer` / `SampledBuffer` / `ImageGatherExtended` / `ImageQuery`） | 1 条（`Shader`） | **只有这一类**，已被 N4-l 的 `capall`（85，2 轮）排掉 |
+| execution mode | `OriginUpperLeft` | `OriginUpperLeft` | 无 |
+| 对象装饰 | `ArrayStride`3 / `Block`2 / `DescriptorSet`5 / `Binding`5 / `BuiltIn`1 / `Location`3 / **`NoContraction`1** | 与它**逐项相同**、**只少 `NoContraction`** | **`NoContraction` 一条**（落在一条 `OpFAdd` 上） |
+| 成员装饰 | `Offset`9 | `Offset`9 | 无 |
+| 常量通道 | 14 条（含 `%182 = OpConstantComposite %v2float 0 0`，就是 NaN 守卫的替换值） | `blit` 14 条、语义逐条对得上 | 无 |
+| `OpEntryPoint` 接口表 | 4 条 = `gl_FragCoord`(Input/BuiltIn) + 3 个 Output(Location 0/1/2) | `iface`/`blit` **逐条相同**（4 条、同存储类、同装饰） | 无 |
+| 函数体 | 222 条 / 18 种，**38 个 Function 局部变量 + 50 次 `OpStore` + 66 次 `OpLoad`（显然是未优化的译文器产物）** | 103 条 / 13 种，**全 SSA、无局部变量** | **形状**（未优化）+ 4 种 opcode（`OpCompositeExtract` / `OpFNegate` / `OpIsNan` / `OpSelect`）+ `OpVectorShuffle` |
+
+⇒ 离线这一刀把"声明 / 装饰 / 接口 / 常量"四类**全部收在两条**上：**`NoContraction`（1 条）** 与 **函数体的确切形态**。
+（`capability` 那一类不重复量 —— `capall` 已经把游戏那份的 8 条都加到我们自己能落屏的 FS 上，仍 85。）
+
+**第 0 步（后半）：把这两类差别在"我们自己的壳"里单变量复现**（`.work/n4m_fs_variants.py`，
+自证 `.work/logs/n4m-fs-variants.txt`；**不碰游戏产物**）：
+
+- **`blitn`** = `blit` 的同一段算术 + **`isnan` 守卫**（→ `OpIsNan` + `OpSelect`）+ **`precise`**（→ 2 条 `NoContraction`）
+  —— 一份里把"opcode 集合 + 那条装饰"都补上；
+- 原来还想做 **`blit0`**（同源 GLSL + `glslc -O0`，只差"未优化的形状"）：**这条路在我们自己的 GLSL 里做不出来** ——
+  `glslc -O0` 与 `-O3` 产出**逐条相同**（103 条指令、13 种 opcode、同样 10 个 `OpVariable`）⇒ glslang 一律出 SSA。
+  要复现游戏那份"38 个局部变量 + 50 次 store"只能**手写 SPIR-V**（与「壳 + 我自己的 body」同一类动作，见下面第 2 条）。
+
+**第 1 答（设备，判据同前：`DM_PASS_PROBE=28` 的底盘 152 上出现非 152 = 落屏）**
+
+| 档（全部 `DM_TRI_LADDER=vsfullf`、我们自己的三角形 VS + 我们自己的状态 + 描述符照绑） | 这一档只差什么 | 第 0/1 级 | 判读 |
+|---|---|---|---|
+| 基线纯红（`n4l-base`，N4-l） | — | 85 / 85 | 落屏 |
+| **`blit`**（同接口 + **照游戏那份反汇编逐条复刻的算术**）（`n4m-blita` / `-b` / `-c`） | **函数体的语义** | **0.0 / 0.0**（3 轮；第 2 级仍 152） | **落屏** |
+| **`blitn`**（`blit` + `OpIsNan`/`OpSelect` + `NoContraction`）（`n4m-blitna` / `-b` / `-c`） | opcode 集合 + 那条装饰 | **0.0 / 0.0**（3 轮） | **落屏** |
+
+⇒ **`blit` 的 3 轮是本轮最要紧的一条读数**：**接口逐项相同、算术逐条复刻、由 glslc 从 GLSL 编出来**的模块**落屏**，
+而**同一段算术、同一套接口、由译文器产出的那一份 152** ⇒ **"这段代码算出来的东西"不是原因，`NoContraction` 与
+`OpIsNan`/`OpSelect` 也不是原因**。⚠ 顺便更正一条旧读数：N4-k 的 `blit`（152）是**作废样本**（跑在 `vsfull` 档、
+变体没上场），所以"复刻算术也不落屏"这句话**从来没有成立过**。
+
+**第 2 答：带校验层跑一轮 `vsfull`（A1 的配方，`.work/vklayer_round.py`）**
+
+- **层加载自证在**（logcat `Loaded layer VK_LAYER_KHRONOS_validation`）；一轮 logcat **2.32 MB**、**16 种 VUID**
+  （与 A1 的 A 臂同形：`00710`、`vkBindBufferMemory` 三条、`aspectMask` 两条、`ImageViewCreateInfo-usage/-image`、
+  `pSignalSemaphores`、`ppEnabledExtensionNames`、`compositeAlpha`、`imageCreateMaxMipLevels`、`pCode-08737` …）。
+- **★ 层对这份"着色器模块"只说了两句**（本轮第一次**按名字**把它们钉住）：
+  - `VUID-VkShaderModuleCreateInfo-pCode-08740`：`SPIR-V Capability Float64 was declared, but one of the following
+    requirements must be met (VkPhysicalDeviceFeatures::shaderFloat64)`（40 条）；
+  - `VUID-VkShaderModuleCreateInfo-pCode-08742`：`SPIR-V Extension SPV_EXT_fragment_shader_interlock was declared,
+    but … (VK_EXT_fragment_shader_interlock)`（40 条，设备确实没这个扩展 —— N4-g 的能力探针）。
+  ⇒ **两条都已经被 `capall` 单变量排掉**（把游戏那份的 8 条 capability 全加到我们自己能落屏的 FS 上 ⇒ 85，2 轮）；
+  **没有任何一条落在"管线创建 / 描述符与着色器匹配 / 顶点输入"上** ⇒ 按「本轮目标」第 1 条的判据，这是**负结果**。
+- **驱动侧一句话都没说**（`.work/n4m_logcat_scan.py`：按 tag 直方图 + 驱动 tag 里带 fail/error 的只有 4 条
+  `qdgralloc: Unsupported format - 59`）⇒ 与 N4-k 的常态轮一致。
+- ⚠ **这一轮没有判据读数**（按"无效判据样本"记）：带层把时序与资源注册整个改了 —— **阶梯一次都没插**
+  （`阶梯 vsfull 插入 0`）、扫描只认到 **93 张已知贴图（≥256×256 的 2 张，常态是 139 / 26）**、
+  出图跑到 **1190**（常态 100 上下）。这与 A1 那两轮"带层反而跑得更快、没停顿"同形，**只记不判**。
+
+**第 3 条：两条真 bug 按规范修掉 —— 从"缺省关的 A/B 开关"改成"缺省开 + `=0` 退回"**（`nvn_vk.c`）
+
+两条都**不是**画面全零的成因（N4-l 已量），但都是"每帧几百次非法绑定 / 静默跳过"的量级问题：
+
+| 修法 | 改成 | 复验 1（`vso`，必须仍整片 85） | 复验 2（游戏自己的绘制 + `DM_POLY_MODE_NVN`，必须仍整片 152） |
+|---|---|---|---|
+| ① **动态偏移个数**（`desc_write` 的"宿主常量段 / 空白回退"两支不 push 偏移） | `DM_DYN_OFFSET_FIX` **缺省开** | **85 / 85**、**动态偏移不符 0 条**（旧行为那一侧：69~164 条） | **152 / 152 / 152**、不符 **0 条**（旧行为：84 条） |
+| ② **描述符池配额**（`maxSets` 与 `poolSize` 不是一回事） | `DM_DESC_POOL_BIG` **缺省开** | **85 / 85**、池失败 **3854 → 327**（末帧 **841 → 0**） | **152 / 152 / 152**、池失败 **22579 → 328**（末帧 **846 → 0**） |
+
+⇒ **两条都修好了、且都不动判据**（`vso` 85 / 游戏绘制 152 逐轮不变）；两次复验的 conf **只差一条 `=0`**，
+自证行（`【查】DM_DYN_OFFSET_FIX：**开**…` / `【查】DM_DESC_POOL_BIG：**开**…`）逐轮可核。
+
+**回归**
+
+N1/N2/N3/N4-b 四个探针各一轮（`…-n4mregress.txt`）+ `.work/regress_diff.py n4kregress n4mregress` ⇒
+**判据字段 0 项不一致**（41 / 48 / 89 / 59 个共同键；抖的只有时间/内存与两类已知抖动）。
+⚠ **口径更正**：提示词里写的"基准 = `…-n4lregress.txt`"**在盘上不存在**（`.work/logs/` 只有 n2 ~ n4k 那几套）
+⇒ 本轮以 **`n4kregress`**（盘上最近的一套）为基准，并把这条写进 `TOOLS` B¹⁸。
+本轮改的是**回放层两处**（`nvn_vk.c` 的 `desc_write` / `desc_pool_at`），新地基的搬运与提交侧（`vk2_*.c`）**一行未动**。
+
+**画面（M2 的验收）仍未过**
+
+两轮"查看器打开"（`DM_GFX2=1` + `DM_WIN_SRC=28` + `DM_POLY_MODE_NVN=1` + 两条修法，**不带**探针与扫描）：
+**查看器亮度 0.0 / 0 / 0**（`n4-shot-n4m-shot{a,b}.log`）、截图 `n4b-n4m-shot{a,b}.png` **纯红 0.00%**。
+⚠ **一条新观察（只记不判，2 轮同形）**：这两张截图的**内容区是整片 `RGB(48,32,48)`（25.27% 的屏幕像素）**，
+其余 73.92% 纯黑 —— 而 N4-f / N4-j **同一份 `DM_WIN_SRC=28`** 的截图是 **99.63% 纯黑**。
+这一轮与那两轮之间只多了"两条修法缺省开"，**颜色来源未定**（可能只是上屏那一段的行为变了），
+要判它得先量"内容区那块颜色是谁写的"。
+
+**结论**
+
+- ★ **游戏那份 FS 的"声明 / 装饰 / 接口 / 常量"四类被逐段排掉**（唯一多出来的是 `NoContraction`，而补上它的
+  `blitn` 仍落屏）；**"函数体的语义"也被排掉**（`blit` 逐条复刻的算术，3 轮落屏）。
+- ★ **层对这份模块只说了两句，两句都被 `capall` 排掉**；**驱动侧一句话都没说**。
+- ⇒ **剩下的唯一嫌疑是"这一份确切的 SPIR-V 指令序列"** —— 具体就是它与我们那份壳之间的**形状**差
+  （38 个 Function 局部变量、50 次 store、66 次 load 的未优化形态）。**下一步（N4-n）= 「壳 + 我自己的 body」**：
+  把那份模块反汇编下来、**只替换 `main` 的函数体**（保留全部声明/装饰/接口）编成**我们自己的**新模块
+  （`spirv-as`）——落屏 ⇒ 问题在它的函数体；仍 152 ⇒ 问题在声明/装饰（那就逐条减）。
+  ⚠ **这一步动的是"从游戏产物派生的文本"，必须先说清"改成什么、为什么、怎么回退"、拿到允许再动**（本轮没做）。
+- 顺带：**两条真 bug 已按规范修掉**（缺省开 + `=0` 退回），**两条都不动判据**。
+- **M2 的验收仍未过**（查看器 2 轮 0/0/0、截图纯红 0.00%）。
+
+**本轮的读数清单**（全部 `.work/logs/`）：`n4-n4m-blit{a,b,c}`（`blit` 3 轮）、`n4-n4m-blitn{a,b,c}`（`blitn` 3 轮）、
+`n4-n4m-vsfull-lay`（**带层**那一轮）+ `logcat-n4m-vsfull-lay.txt`、`n4-n4m-vsofix1{,b}` / `-vsofix2` / `-gamefix1` / `-gamefix2`
+（两条修法各一轮复验）、`n4-n4m-gamefix*` 里的池账与动态偏移计数、`n4-shot-n4m-shot{a,b}.log` + `n4b-n4m-shot{a,b}.png`；
+离线 `n4m-fs-diff.txt`（六类逐段对齐）、`n4m-fs-variants.txt`（`blitn` 的 capability/装饰/opcode 自证）、
+`n4m-logcat-scan.txt`（驱动侧读法）；回归 `…-vk2_{pool,xfer,sub,takeover}_probe-n4mregress.txt`；
+器械 `.work/n4m_fs_diff.py` / `n4m_fs_variants.py` / `n4m_confs.py` / `n4m_driver.py` / `n4m_build.py` /
+`n4m_regress.py` / `n4m_logcat_scan.py`（conf 见 `.work/n4m-*.conf`）。
 
 ---
 
