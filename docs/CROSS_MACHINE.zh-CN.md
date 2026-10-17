@@ -223,7 +223,24 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 ## 七、当前进度与下一步（交接：接着跑的人从这里开始）
 
 > **这一节会过期。** 记于 2026-10-15（M3-3c 的内容基线 `ed900fb`；前几轮「M3-3b」/「M3-3a」/「M3-2z」）；
-> **★ 最新提交（2026-10-17）**：`be574a3` —— **N4-l = 先审出 N4-k 的仪器错误，再量出"读描述符无害"** ⇒
+> **★ 最新提交（2026-10-17）**：`f19afb4` —— **N4-m = 把"游戏那份片段着色器模块"与我们那份壳逐段分开** ⇒
+> ① **离线六类对齐**（`.work/n4m_fs_diff.py` → `n4m-fs-diff.txt`）：capability / execution mode / 装饰 /
+> 常量 / **`OpEntryPoint` 接口表（4 条逐条相同）** 都没有一项是游戏那份独有的，唯一多出来的是
+> **`NoContraction`（1 条）**；差别只剩**函数体形状**（它 **38 个 Function 局部变量 + 50 store + 66 load** 的
+> 未优化形态，我们那份全 SSA；`glslc -O0` 与 `-O3` 逐条相同 ⇒ 形状在 GLSL 里做不出来）；
+> ② **设备两刀**（`vsfullf`，判据：底盘 152 上出现非 152 = 落屏）：**`blit`（同接口 + 照它反汇编逐条复刻的
+> 算术）3 轮落屏**、**`blitn`（+`OpIsNan`/`OpSelect` + `precise`）3 轮也落屏** ⇒ 函数体语义 / opcode 集合 /
+> 那条装饰都不是原因（⚠ N4-k 的 `blit`=152 是作废样本）；
+> ③ **带层一轮**：层对这份模块**只说了两句**（`pCode-08740` = `Float64` capability、`pCode-08742` =
+> `SPV_EXT_fragment_shader_interlock`，**两句都被 `capall` 排掉**），**没有一条落在管线创建 / 描述符与着色器
+> 匹配上**、**驱动侧 logcat 0 条** ⇒ 负结果（该轮无判据读数：带层改了时序与资源注册）；
+> ④ **两条真 bug 改成缺省开 + `=0` 退回**并各自复验：动态偏移（`vso` 85 / 游戏 152 都不变、不符 0 条）、
+> 描述符池（`vso` 85 / 游戏 152 不变，池失败 **3854 → 327（末帧 841 → 0）** / **22579 → 328（末帧 846 → 0）**）
+> ⇒ 两条都不动判据；⑤ **回归**四探针与 `n4kregress` 比 **0 项不一致**（⚠ `n4lregress` 盘上不存在）。
+> **M2 的验收仍未过**（两轮查看器 0.0/0/0、截图纯红 0.00%）。下一块 = **N4-n「壳 + 我自己的 body」**
+> （**要先说清、拿到允许**）。
+>
+> （上一轮）`be574a3` —— **N4-l = 先审出 N4-k 的仪器错误，再量出"读描述符无害"** ⇒
 > ① **更正**：N4-k 的 `iface`/`blit`/`if_ubo`/`if_smp` 共 11 轮跑在 `vsfull` 档，而那一档的 `use_ps` 写死是
 > **游戏那份 FS** ⇒ `DM_TRI_FS_VARIANT` **没生效**，那些读数只是"又一次 vsfull"（审法 `.work/n4l_audit_insert.py`）；
 > ② **补两个窟窿**：新档 `vsfullf`（我们的三角形 + **我们那份 FS** + 我们的状态 + 描述符照绑）、
@@ -554,13 +571,31 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 现在停在哪
 
-- **★★ 最新一轮（「N4-l」，2026-10-17，提交 `be574a3`）停在**：**N4-k 那条"读描述符就一个像素不落"是仪器错误**
+- **★★ 最新一轮（「N4-m」，2026-10-17，提交 `f19afb4`）停在**：**游戏那份 FS（`8e80084d3c30340a`）的每一层
+  "可静态比较的差别"都排掉了，只剩"这一份确切的 SPIR-V 指令序列"。** ① **离线六类对齐**
+  （`.work/n4m_fs_diff.py` → `.work/logs/n4m-fs-diff.txt`）：capability / execution mode / 装饰 / 常量 /
+  **`OpEntryPoint` 接口表（4 条逐条相同）** 没有一项是游戏那份独有的，唯一多出来的是 **`NoContraction`（1 条）**；
+  差别只剩**函数体的形状**（它 **38 个 Function 局部变量 + 50 store + 66 load** 的未优化形态，我们那份全 SSA；
+  `glslc -O0` 与 `-O3` 逐条相同 ⇒ 形状在 GLSL 里做不出来）。
+  ② **设备两刀**（`vsfullf`；判据：`DM_PASS_PROBE=28` 的底盘 152 上出现非 152 = 落屏）：**`blit`（同接口 +
+  照它反汇编逐条复刻的算术）3 轮落屏**、**`blitn`（+`OpIsNan`/`OpSelect` + `precise`）3 轮也落屏** ⇒
+  函数体语义 / opcode 集合 / 那条装饰都不是原因（⚠ N4-k 的 `blit`=152 是作废样本）。
+  ③ **带层一轮**：层对这份模块**只说了两句**（`pCode-08740` = `Float64` capability、`pCode-08742` =
+  `SPV_EXT_fragment_shader_interlock`），**两句都被 N4-l 的 `capall` 排掉**、**没有一条落在管线创建 /
+  描述符与着色器匹配上**、**驱动侧 logcat 0 条** ⇒ 负结果（⚠ 该轮没有判据读数：带层改了时序与资源注册）。
+  ④ **两条真 bug 已改成缺省开**（`DM_DYN_OFFSET_FIX` / `DM_DESC_POOL_BIG`，`=0` 退回）并各自复验：
+  `vso` 85 / 游戏绘制 152 都不变，动态偏移不符 **→ 0 条**、池失败 **22579 → 328（末帧 0）**。
+  跑法：`.work/n4m_build.py [--layer]`（只出包/装机，不跑轮）→ `.work/n4m_driver.py --tag <tag> --conf
+  .work/n4m-<格>.conf --rounds N --secs 50`（conf 由 `.work/n4m_confs.py` 生成）；回归 `.work/n4m_regress.py`
+  （尾巴 `-n4mregress`，**下一轮的基准就用这一套**）；驱动侧 logcat 读法 `.work/n4m_logcat_scan.py`。
+  ⚠ 做 A/B 时 conf 里要写 `DM_DYN_OFFSET_FIX=0` / `DM_DESC_POOL_BIG=0` 才与旧轮可比。
+- **上一轮（「N4-l」，2026-10-17，提交 `be574a3`）停在**：**N4-k 那条"读描述符就一个像素不落"是仪器错误**
   （`vsfull` 档的 `use_ps` 写死是游戏那份 FS ⇒ 变体没生效）。补掉"新档 `vsfullf`"与"给我们自己的 FS 补反射"之后：
   **一条 sampler2D / 一条池内 UBO / 一条 support_buffer / 五条只声明不读 / 同接口 / 8 条 capability 全加 —— 六格全 85**，
   而 **`vsfn`（游戏 FS、不绑描述符）152** ⇒ **责任在"游戏那份 FS 模块本身"**。
   跑法：`.work/n4l_driver.py <格>:<轮数> --secs 50`（conf 由 `.work/n4l_confs.py` 生成，抽表 `.work/n4l_report.py`）；
   三条新开关：`DM_DESC_STATS=1`（每帧池账）、`DM_LAYOUT_DUMP=1`（布局逐条 + 动态描述符数 + 三个句柄）、
-  `DM_DYN_OFFSET_FIX=1` / `DM_DESC_POOL_BIG=1`（两条真 bug 的修法，缺省关）。
+  `DM_DYN_OFFSET_FIX=1` / `DM_DESC_POOL_BIG=1`（两条真 bug 的修法，**N4-m 起缺省开**）。
 - **上一轮（「N4-i」，2026-10-16，提交 `ff5670b`）停在**：**拿"已经证明能落屏"的管线当标尺做六档二分**
   （`DM_TRI_LADDER=<档>`，缺省关：`vb` / `state` / `vs` / `vsn` / `vso` / `both`；每档一行自证 + 形状判据）。
   - **答案**：`vb`（我们自己的管线 + **游戏的顶点缓冲**）**落屏**、**`vso`（游戏的顶点着色器 + 我们自己的状态）
