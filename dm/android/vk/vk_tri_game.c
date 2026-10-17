@@ -23,6 +23,7 @@
 #include "vk_tri_fs_n4l_cap_spv.h" // N4-l 第二刀：只加 capability（游戏那份的清单；自证 .work/logs/n4l-cap-variants.txt）
 #include "vk_tri_fs_n4m_spv.h"    // N4-m：`blit` + isnan 守卫 + precise（OpIsNan/OpSelect/NoContraction；自证 .work/logs/n4m-fs-variants.txt）
 #include "vk_tri_fs_n4n_spv.h"    // N4-n：游戏那份的「壳 + 我自己的 body」（自证 .work/logs/n4n-shellbody.txt）
+#include "vk_tri_fs_n4o_spv.h"    // N4-o：体一字不动，只在 OpReturn 前补一小段写 Location 0（自证 .work/logs/n4o-variants.txt）
 #include "dm.h"
 
 #include <stdatomic.h>
@@ -424,9 +425,18 @@ int vk_tri_fs_variant(void) {
     else if (!strcmp(e, "blitn")) g_fsv = 17;    // N4-m：`blit` + isnan 守卫（OpIsNan/OpSelect）+ precise（NoContraction）
     else if (!strcmp(e, "shellbody")) g_fsv = 18; // N4-n：游戏那份的**壳**（声明/装饰/接口/常量逐条保留）+ 我们自己的 3 条 OpStore
     else if (!strcmp(e, "bodyout")) g_fsv = 19;   // N4-n 第二格：它自己的体一字不动 + 末尾同样那 3 条 OpStore（单变量：体在不在）
+    else if (!strcmp(e, "tailred")) g_fsv = 20;   // N4-o ①：按分量写 + 我们的常量（与 bodyout 只差写法）
+    else if (!strcmp(e, "vals")) g_fsv = 21;      // N4-o ②：整向量写 + 它自己的值（与 bodyout 只差值）
+    else if (!strcmp(e, "nanflag")) g_fsv = 22;   // N4-o ③：整向量写 + NaN 标志（每通道 OpIsNan ? 1 : 0）
+    else if (!strcmp(e, "movetail")) g_fsv = 23;  // N4-o ④：同一批指令、只把 %34 那 12 条搬到 OpReturn 之前
+    else if (!strcmp(e, "no38")) g_fsv = 24;      // N4-o ⑤：删掉写 Location 2 的那 11 条（%34 的写留在原位）
+    else if (!strcmp(e, "v38")) g_fsv = 25;       // N4-o ⑥：%38 照写、只把它的值换成常量 (0,0,0,0)
+    else if (!strcmp(e, "nanflag38")) g_fsv = 26; // N4-o ⑦：%38 照写 + 尾部把 isnan(%118/%120/%122) 写进 %34
+    else if (!strcmp(e, "isinf38")) g_fsv = 27;   // N4-o ⑧：%38 照写 + 尾部把 isinf(%118/%120/%122) 写进 %34
     else {
         LOG("【黄】DM_TRI_FS_VARIANT=%s 认不出来（只认识 cap / 3out / 3out_cap / iface / blit / if_ubo / if_smp / "
-            "smp1 / ubo4 / ubo0 / decl / blitn）——按关处理", e);
+            "smp1 / ubo4 / ubo0 / decl / capf64 / capgather / capimg / capgroup / capall / blitn / shellbody / "
+            "bodyout / tailred / vals / nanflag / movetail / no38 / v38 / nanflag38 / isinf38）——按关处理", e);
         return 0;
     }
     LOG("【查】DM_TRI_FS_VARIANT=%s：阶梯用的那份**我们自己的**片段着色器换成变体 %d"
@@ -436,6 +446,14 @@ int vk_tri_fs_variant(void) {
         "5 = 同接口 + **照游戏那份反汇编逐条复刻的算术**；6 = **只声明两个 UBO**；7 = **只声明三张 sampler2D**）"
         "—— 叠在**已知落屏**的 `vso` 档上就是单变量；判据：已知色底盘 152 上出现非 152 = 仍然落屏。"
         "自证见 .work/logs/n4k-fs-variants.txt（`spirv-dis` 的 capability / 输出装饰 / 接口逐项对照）", e, g_fsv);
+    if (g_fsv >= 20)
+        LOG("【查】DM_TRI_FS_VARIANT=%s：N4-o 的诊断变体 —— **游戏那份的体一字不动**、一条指令都不删，"
+            "只在 `OpReturn` 之前补一小段写 Location 0 的 `OpStore`（20 = 按分量写 + 我们的常量 (1,0,0,0)；"
+            "21 = 整向量写 + 它自己的值 %90/%92/%94/%96；22 = 整向量写 + NaN 标志；"
+            "23 = 同一批指令、只把写 %%34 的那 12 条搬到 OpReturn 之前）。"
+            "20/21 与 `bodyout`（整向量写 + 我们的常量，N4-n 3 轮 85）构成 2×2：**写法 × 值**；"
+            "23 只差**位置**。自证 .work/logs/n4o-variants.txt（逐段对比 + 函数体 opcode + spirv-val）",
+            e);
     return g_fsv;
 }
 
@@ -508,6 +526,14 @@ const vk_shader *vk_tri_ladder_shader(int which) {
         else if (fsv == 17) { fsw = VK_TRI_FS_BLITN; fsn = (size_t)VK_TRI_FS_BLITN_WORDS; }
         else if (fsv == 18) { fsw = VK_TRI_FS_SHELLBODY; fsn = (size_t)VK_TRI_FS_SHELLBODY_WORDS; }
         else if (fsv == 19) { fsw = VK_TRI_FS_BODYOUT; fsn = (size_t)VK_TRI_FS_BODYOUT_WORDS; }
+        else if (fsv == 20) { fsw = VK_TRI_FS_TAILRED; fsn = (size_t)VK_TRI_FS_TAILRED_WORDS; }
+        else if (fsv == 21) { fsw = VK_TRI_FS_VALS; fsn = (size_t)VK_TRI_FS_VALS_WORDS; }
+        else if (fsv == 22) { fsw = VK_TRI_FS_NANFLAG; fsn = (size_t)VK_TRI_FS_NANFLAG_WORDS; }
+        else if (fsv == 23) { fsw = VK_TRI_FS_MOVETAIL; fsn = (size_t)VK_TRI_FS_MOVETAIL_WORDS; }
+        else if (fsv == 24) { fsw = VK_TRI_FS_NO38; fsn = (size_t)VK_TRI_FS_NO38_WORDS; }
+        else if (fsv == 25) { fsw = VK_TRI_FS_V38; fsn = (size_t)VK_TRI_FS_V38_WORDS; }
+        else if (fsv == 26) { fsw = VK_TRI_FS_NANFLAG38; fsn = (size_t)VK_TRI_FS_NANFLAG38_WORDS; }
+        else if (fsv == 27) { fsw = VK_TRI_FS_ISINF38; fsn = (size_t)VK_TRI_FS_ISINF38_WORDS; }
         // -------------------------------------------------------------------
         // N4-l：**这一份 FS 也要走"按阶段分空间"与"反射"**（以前没有）。
         // 游戏那几份是在 `vk_shader.c` 的 `load()` 里做的（PS 的绑定整体挪到 set 1，然后把 SPIR-V 声明的绑定
@@ -544,7 +570,10 @@ const vk_shader *vk_tri_ladder_shader(int which) {
                : fsv == 8 ? "-smp1" : fsv == 9 ? "-ubo4" : fsv == 10 ? "-ubo0" : fsv == 11 ? "-decl"
                : fsv == 12 ? "-capf64" : fsv == 13 ? "-capgather" : fsv == 14 ? "-capimg"
                : fsv == 15 ? "-capgroup" : fsv == 16 ? "-capall" : fsv == 17 ? "-blitn"
-               : fsv == 18 ? "-shellbody" : fsv == 19 ? "-bodyout" : "");
+               : fsv == 18 ? "-shellbody" : fsv == 19 ? "-bodyout"
+               : fsv == 20 ? "-tailred" : fsv == 21 ? "-vals" : fsv == 22 ? "-nanflag"
+               : fsv == 23 ? "-movetail" : fsv == 24 ? "-no38"
+               : fsv == 25 ? "-v38" : fsv == 26 ? "-nanflag38" : fsv == 27 ? "-isinf38" : "");
         g_lsh[2].stage = VK_STAGE_PS;
         if (r0 != VK_SUCCESS) g_lsh[0].mod = VK_NULL_HANDLE;
         if (r1 != VK_SUCCESS) g_lsh[1].mod = VK_NULL_HANDLE;
@@ -554,7 +583,8 @@ const vk_shader *vk_tri_ladder_shader(int which) {
             "（与 .work/logs/tri-ladder-spv.txt 的自证逐项对上）；**片段那一份的变体 = %d**"
             "（0 = 纯红缺省 / 1 = +interlock capability / 2 = 3 个输出 / 3 = 两者 / "
             "4 = 游戏的描述符接口 + 极简代码 / 5 = 同接口 + 复刻游戏算术 / 8 = 一条 sampler2D / "
-            "9 = 一条池内 UBO(binding 4) / 10 = 一条 support_buffer(binding 0) / 11 = 五条都声明但一条不读；"
+            "9 = 一条池内 UBO(binding 4) / 10 = 一条 support_buffer(binding 0) / 11 = 五条都声明但一条不读 / "
+            "18 = shellbody / 19 = bodyout / 20 = tailred / 21 = vals / 22 = nanflag；"
             "见 DM_TRI_FS_VARIANT）——⚠ 这一份只在 `use_ps` 取到它的档里生效（`vso` / `vs` / `vb` / `vsfullf`），"
             "而 `vsf` / `vsfull` 写死用**游戏那份** FS（N4-l 量到的仪器错误：N4-k 的 iface/blit/if_ubo/if_smp 就是跑在 vsfull 上）",
             (int)r0, (int)r1, (int)r2, fsv);

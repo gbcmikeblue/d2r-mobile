@@ -117,6 +117,15 @@ enum {
 // `VK_EXT_fragment_shader_interlock`（N4-g 的能力探针）⇒ 这一档量的是"只多那一条声明会不会让绘制消失"。
 // 用法与判据：叠在**已知落屏**的 `vso` 档上（`DM_TRI_LADDER=vso`）⇒ 出现非 152 = 这一档仍然落屏。
 // 返回：0 = 纯红（缺省）/ 1 = cap / 2 = 3out / 3 = 3out_cap（惰性解析一次；开了会打一行【查】自证）。
+//
+// N4-o（**本轮**，见 vk_tri_fs_n4o_spv.h 与 .work/n4o_variants.py）：`tailred` / `vals` / `nanflag` 三格。
+// N4-n 已经答完"壳无关、体也在跑"，而"它自己的体原样"（`vsfull`）= 152 ⇒ 卡点收进
+// **"它写出去的值没落到附件上"**。这两格把这句话劈成"写法"与"值"两半（2×2，另一个角是 N4-n 的 `bodyout`）：
+//   · `tailred`（20）= 体一字不动 + **按分量写** + 我们的常量 (1,0,0,0) ⇒ 与 `bodyout` 只差写法；
+//   · `vals`   （21）= 体一字不动 + **整向量写** + 它自己的值 `%90/%92/%94/%96` ⇒ 与 `bodyout` 只差值；
+//   · `nanflag`（22）= 体一字不动 + **整向量写** + NaN 标志（读 0 = 无 NaN、85/170/255 = 1/2/3 个通道 NaN）。
+// ⚠ `vals`/`nanflag` 还把 `%34` 那条链（`OpImageSampleExplicitLod` + 坐标算术）**留成活的** —— 而
+// `bodyout` 把体里的输出写全盖掉了，驱动可以把三次采样一起消掉 ⇒ **`bodyout` 落屏不能证明"带采样的链在跑"**。
 int vk_tri_fs_variant(void);
 
 // `DM_TRI_LADDER` 是哪一档（0 = 关；**仍要 `DM_TRI_IN_GAME` 定"哪一次绘制 / 哪一段通道"**，否则返回 0）。
