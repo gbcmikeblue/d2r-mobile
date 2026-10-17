@@ -22,6 +22,7 @@
 #include "vk_tri_fs_n4l_spv.h"    // N4-l 的四份（只保留一条绑定的四格 + 声明但不读；自证 .work/logs/n4l-fs-variants.txt）
 #include "vk_tri_fs_n4l_cap_spv.h" // N4-l 第二刀：只加 capability（游戏那份的清单；自证 .work/logs/n4l-cap-variants.txt）
 #include "vk_tri_fs_n4m_spv.h"    // N4-m：`blit` + isnan 守卫 + precise（OpIsNan/OpSelect/NoContraction；自证 .work/logs/n4m-fs-variants.txt）
+#include "vk_tri_fs_n4n_spv.h"    // N4-n：游戏那份的「壳 + 我自己的 body」（自证 .work/logs/n4n-shellbody.txt）
 #include "dm.h"
 
 #include <stdatomic.h>
@@ -421,6 +422,8 @@ int vk_tri_fs_variant(void) {
     else if (!strcmp(e, "capgroup")) g_fsv = 15;
     else if (!strcmp(e, "capall")) g_fsv = 16;   // 以上全加（= 游戏那份的 capability 清单）
     else if (!strcmp(e, "blitn")) g_fsv = 17;    // N4-m：`blit` + isnan 守卫（OpIsNan/OpSelect）+ precise（NoContraction）
+    else if (!strcmp(e, "shellbody")) g_fsv = 18; // N4-n：游戏那份的**壳**（声明/装饰/接口/常量逐条保留）+ 我们自己的 3 条 OpStore
+    else if (!strcmp(e, "bodyout")) g_fsv = 19;   // N4-n 第二格：它自己的体一字不动 + 末尾同样那 3 条 OpStore（单变量：体在不在）
     else {
         LOG("【黄】DM_TRI_FS_VARIANT=%s 认不出来（只认识 cap / 3out / 3out_cap / iface / blit / if_ubo / if_smp / "
             "smp1 / ubo4 / ubo0 / decl / blitn）——按关处理", e);
@@ -503,6 +506,8 @@ const vk_shader *vk_tri_ladder_shader(int which) {
         else if (fsv == 15) { fsw = VK_TRI_FS_CAPGROUP; fsn = (size_t)VK_TRI_FS_CAPGROUP_WORDS; }
         else if (fsv == 16) { fsw = VK_TRI_FS_CAPALL; fsn = (size_t)VK_TRI_FS_CAPALL_WORDS; }
         else if (fsv == 17) { fsw = VK_TRI_FS_BLITN; fsn = (size_t)VK_TRI_FS_BLITN_WORDS; }
+        else if (fsv == 18) { fsw = VK_TRI_FS_SHELLBODY; fsn = (size_t)VK_TRI_FS_SHELLBODY_WORDS; }
+        else if (fsv == 19) { fsw = VK_TRI_FS_BODYOUT; fsn = (size_t)VK_TRI_FS_BODYOUT_WORDS; }
         // -------------------------------------------------------------------
         // N4-l：**这一份 FS 也要走"按阶段分空间"与"反射"**（以前没有）。
         // 游戏那几份是在 `vk_shader.c` 的 `load()` 里做的（PS 的绑定整体挪到 set 1，然后把 SPIR-V 声明的绑定
@@ -538,7 +543,8 @@ const vk_shader *vk_tri_ladder_shader(int which) {
                : fsv == 6 ? "-ifubo" : fsv == 7 ? "-ifsmp"
                : fsv == 8 ? "-smp1" : fsv == 9 ? "-ubo4" : fsv == 10 ? "-ubo0" : fsv == 11 ? "-decl"
                : fsv == 12 ? "-capf64" : fsv == 13 ? "-capgather" : fsv == 14 ? "-capimg"
-               : fsv == 15 ? "-capgroup" : fsv == 16 ? "-capall" : fsv == 17 ? "-blitn" : "");
+               : fsv == 15 ? "-capgroup" : fsv == 16 ? "-capall" : fsv == 17 ? "-blitn"
+               : fsv == 18 ? "-shellbody" : fsv == 19 ? "-bodyout" : "");
         g_lsh[2].stage = VK_STAGE_PS;
         if (r0 != VK_SUCCESS) g_lsh[0].mod = VK_NULL_HANDLE;
         if (r1 != VK_SUCCESS) g_lsh[1].mod = VK_NULL_HANDLE;

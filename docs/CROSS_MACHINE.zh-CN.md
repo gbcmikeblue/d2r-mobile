@@ -571,7 +571,18 @@ tar -xf "$repo\.work\spv.tar" -C "$repo\.work\spv"
 
 ### 现在停在哪
 
-- **★★ 最新一轮（「N4-m」，2026-10-17，提交 `f19afb4`）停在**：**游戏那份 FS（`8e80084d3c30340a`）的每一层
+- **★★ 最新一轮（「N4-n」，2026-10-17，提交见本节开头）停在**：**「壳 + 我自己的 body」落屏，而且「它自己的 body +
+  我的三条 store」也落屏** ⇒ **卡点不在壳、也不在"体让片元消失"，而在"它写出去的值没落到附件上"。**
+  ① **派生两格**（`.work/n4n_shellbody.py`；`.work/spv/` 里那份**只读**、两份产物 `spirv-val` 都干净）：
+  `shellbody`（**只换函数体**，capability / 全部装饰 / `OpEntryPoint` 接口表 / 常量 / 类型链 /
+  38 个 `OpVariable(Function)` **逐条保留**；只删一条悬空装饰 `%237 NoContraction`）与 `bodyout`
+  （**它的体一字不动**，只在 `OpReturn` 前补**同样那 3 条 `OpStore`**）⇒ 两格**写出去的值逐位相同**。
+  ② **判据**（`vsfullf`、两条修法 `=0`）：`shellbody` **85/85（3 轮）**、`bodyout` **85/85（3 轮）**；
+  而 `vsfull`（它的 FS 原样）+ `DM_RASTER_BRUTE=1`（关混合）**整片 152（2 轮）**、`bodyout` + 同一个关混合 **85**。
+  ③ ⇒ **壳无关** + **体在跑**（片元存在）+ **152 = 它的输出没落到附件上**（更正 N4-e 的措辞）+ **不是写黑**。
+  下一刀 = **N4-o**：尾部 9 条 `OpStore` 逐条替换 + 读回值（分"按分量写被写掩码挡掉"与"算出 NaN 被丢"）。
+  ⚠ 教训：`n4n-shella/b/c` 因 conf **漏了 `DM_TRI_IN_GAME=@28`** 白跑三轮。
+- **上一轮（「N4-m」，2026-10-17，提交 `f19afb4`）停在**：**游戏那份 FS（`8e80084d3c30340a`）的每一层
   "可静态比较的差别"都排掉了，只剩"这一份确切的 SPIR-V 指令序列"。** ① **离线六类对齐**
   （`.work/n4m_fs_diff.py` → `.work/logs/n4m-fs-diff.txt`）：capability / execution mode / 装饰 / 常量 /
   **`OpEntryPoint` 接口表（4 条逐条相同）** 没有一项是游戏那份独有的，唯一多出来的是 **`NoContraction`（1 条）**；
