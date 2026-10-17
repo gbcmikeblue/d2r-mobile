@@ -34,6 +34,15 @@
 VkDescriptorSetLayout vk_pipe_set_layout(const vk_shader *const *sh, int n);
 VkPipelineLayout vk_pipe_layout(const vk_shader *const *sh, int n);
 
+// N4-l：布局里**动态描述符的总数** —— 也就是 `vkCmdBindDescriptorSets` 必须收到的 `dynamicOffsetCount`
+// （我们总是绑 set 0 + set 1，所以是两个 set 的和）。少一个就是一次非法绑定（VUID-…-dynamicOffsetCount-00359）。
+// 返回 -1 = 合并绑定表失败（与 `vk_pipe_layout` 同时为 NULL）。
+int vk_pipe_layout_dyn_count(const vk_shader *const *sh, int n);
+
+// N4-l：`DM_LAYOUT_DUMP=1`（缺省关、只读）——把这个键的**两个描述符集布局逐条摊平**（set/绑定号/类型/个数/
+// 阶段位）+ 动态描述符总数 + 三个句柄（set0 / set1 / 管线）。同一个键只打一次。
+void vk_pipe_layout_dump(const vk_shader *const *sh, int n, const char *where);
+
 // 计算管线：先用它独立验证「反射 ↔ SPIR-V ↔ 驱动」这条链——计算管线不需要任何渲染状态，
 // 所以建得成就是"描述符布局的解读是对的"。（图形管线要等影子状态补齐，见 vk_pipe.c 的文件头。）
 // Compute pipeline: used first to verify the chain "reflection <-> SPIR-V <-> driver" on its own -- a compute

@@ -875,6 +875,7 @@ static void rt_use_bump(uint64_t ser) {
 static void pass_begin(void);
 static void pass_end(void);
 static void desc_slot_reset(int slot);   // 定义在描述符那一节（在途槽回收时重置它的池）| defined in the descriptor section (resets a slot's pool when it is reaped)
+static void desc_frame_stats(int slot);  // N4-l：描述符池的每帧读数（`DM_DESC_STATS=1`，缺省关）| N4-l per-frame descriptor-pool readings
 
 // ========== GPU 计时（M2-6d 的收尾指标）==========
 // ========== GPU timing (M2-6d's closing metric) ==========
@@ -1701,6 +1702,8 @@ void mtl_sub_begin(void) {
     g_rs.cc_have = 0; g_rs.cc_mask = 0; g_rs.cd_have = 0; g_rs.cs_have = 0;
     g_rs.open = 0;
     g_cur_slot = i;
+    // N4-l：描述符池的每帧读数（`DM_DESC_STATS=1`；关着时一行都不走 ⇒ 既有判据逐字节不变）
+    desc_frame_stats(i);
     // N4-b：帧开头把 CPU 脏页搬上去（`DM_GFX2=1` 且 GPU 侧已接管时才动；关着时一行都不执行）
     vk2_frame_upload(i, bank);
 }
@@ -2220,6 +2223,44 @@ static VkSampler samp_of_id(uint32_t sid) {
 static VkDescriptorPool g_dpool[MAX_INFLIGHT][DESC_POOLS];
 static uint8_t g_dpool_n[MAX_INFLIGHT];
 static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_skip;
+
+// ===========================================================================
+// N4-l：把"描述符池满 ⇒ 这次绘制被**静默**跳过"变成每帧可读的读数（`DM_DESC_STATS=1`，**缺省关**）。
+//
+// 为什么先做这一件（N4-l 的第 0 条）：`desc_alloc` 拿不到集时只是返回 `VK_NULL_HANDLE`，调用方把那次绘制
+// 跳过、只加一个 `g_desc_skip` —— 而 N4-k 的每一格判据都是"已知色底盘上出现非 152 = 落屏"，**"没画"与"画了
+// 但没落下"在读数是同一个样子**。而且配额账本身就不够宽：`poolSize` 是**按类型**给的（每类型 512 个描述符），
+// 一个集里有两三个同类型描述符时，512 个集的额度只够 floor(512/3) ≈ 170 个集 —— 真机每帧约 350 次绘制、
+// 每次要 2 个集 ⇒ 缺的额度足够吞掉**半个帧**。
+// 三个数：本帧（= 这次提交）分配了多少 / 失败多少（= 被静默跳过的绘制数）/ 这个槽的池里还剩多少额度。
+// ===========================================================================
+static _Atomic uint64_t g_desc_reqs, g_desc_fails, g_desc_poolnew, g_desc_poolkill;
+static _Atomic uint64_t g_desc_used[MAX_INFLIGHT];   // 本槽已分配出去的集数（回收时清零）
+static int desc_stats_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_DESC_STATS");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_DESC_STATS=1：每帧打一行描述符池的账（分配 / **失败 = 被静默跳过的绘制** / 池新建与销毁 / "
+                   "本槽剩余额度）—— `desc_alloc` 失败时调用方直接跳过这次绘制，而在\"已知色底盘上判落屏\"的读数里"
+                   "\"没画\"与\"画了没落下\"长得一模一样");
+    }
+    return v;
+}
+static void desc_frame_stats(int slot) {
+    if (!desc_stats_on()) return;
+    static uint64_t last_reqs, last_fails;
+    uint64_t rq = atomic_load(&g_desc_reqs), fl = atomic_load(&g_desc_fails);
+    uint64_t used = (slot >= 0 && slot < MAX_INFLIGHT) ? atomic_load(&g_desc_used[slot]) : 0;
+    LOG("【查】描述符池（槽 %d）：本帧分配 %llu / **失败 %llu**（失败 ⇒ 那次绘制被静默跳过）；"
+        "累计 %llu / %llu；池 新建 %llu / 销毁 %llu；本槽已用 %llu 集（每池上限 %d 集 × %d 池，"
+        "但额度是**按类型**给的 ⇒ 一个集里有 k 个同类型描述符时实际只够 %d/k 集）",
+        slot, (unsigned long long)(rq - last_reqs), (unsigned long long)(fl - last_fails),
+        (unsigned long long)rq, (unsigned long long)fl,
+        (unsigned long long)atomic_load(&g_desc_poolnew), (unsigned long long)atomic_load(&g_desc_poolkill),
+        (unsigned long long)used, DESC_POOL_SETS, DESC_POOLS, DESC_POOL_SETS);
+    last_reqs = rq; last_fails = fl;
+}
 // 按**阶段**给 BIND_UBO 计数（含"地址为 0"的那些）：问的是"游戏到底往哪个阶段绑过常量"，
 // 因为写空白的现场只能看出"这个槽没有地址"，看不出"是绑到了别的阶段、还是根本没绑"。
 // Count BIND_UBO by **stage** (including the ones whose address is 0): the question is "which stage did the game bind
@@ -2228,39 +2269,70 @@ static _Atomic uint64_t g_desc_sets, g_desc_blank, g_desc_skip;
 static _Atomic uint64_t g_ubo_binds[6], g_ubo_zero[6], g_ubo_out;
 static _Atomic uint64_t g_ssbo_binds[6];   // 同上，按阶段给 BIND_SSBO 计数（存储缓冲写空白的现场要看这个）| same for BIND_SSBO (needed by the storage-buffer blank's situation)
 
+// ===========================================================================
+// N4-l：`DM_DESC_POOL_BIG=1`（**缺省关**）—— 把每个槽的描述符池**按类型**放大。
+//
+// 为什么（N4-l 的第一个读数，`n4l-laya`）：**98 帧里累计 3009 次 `vkAllocateDescriptorSets` 失败、
+// 末帧一次就是 791 次** —— 每一次失败都意味着**那一次绘制被静默跳过**（`desc_alloc` 返回 NULL ⇒ 调用方
+// `nd = -1` ⇒ 不录这次绘制）。机制在配额上：`maxSets` 只决定"能开几个集"，而 `poolSize` 是**每种描述符**
+// 的个数；一个集里有两个 UBO 时，512 个集的额度只够开 256 个集。游戏路径那一刻的布局是 **6 个动态描述符**
+// （set0 2 + set1 4）⇒ 一个池连 128 个集都开不出来，而一帧有几百次绘制、**每次 2 个集**。
+// 放大到 1024 集/池 × 每类型 3072 个（两个池 ⇒ 2048 集/槽/帧）。这是**修法**，所以留开关做 A/B。
+// ===========================================================================
+#define DESC_POOL_BIG_SETS 1024
+#define DESC_POOL_BIG_QUOTA 3072u
+static int desc_pool_big_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_DESC_POOL_BIG");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_DESC_POOL_BIG=1：描述符池放大到 %d 集/池 × 每类型 %u 个（两个池 ⇒ %d 集/槽/帧）——"
+                   "原来 %d 集/池，而游戏路径那一刻的布局有 6 个动态描述符 ⇒ 一个池只够开 %d 个集，"
+                   "一帧几百次绘制就是几百次「静默跳过」",
+                   DESC_POOL_BIG_SETS, DESC_POOL_BIG_QUOTA, DESC_POOL_BIG_SETS * DESC_POOLS,
+                   DESC_POOL_SETS, DESC_POOL_SETS / 6);
+    }
+    return v;
+}
+
 static void desc_slot_reset(int slot) {
     for (int k = 0; k < DESC_POOLS; k++)
-        if (g_dpool[slot][k]) { vkDestroyDescriptorPool(vk_dev(), g_dpool[slot][k], NULL); g_dpool[slot][k] = VK_NULL_HANDLE; }
+        if (g_dpool[slot][k]) { vkDestroyDescriptorPool(vk_dev(), g_dpool[slot][k], NULL); g_dpool[slot][k] = VK_NULL_HANDLE;
+                                atomic_fetch_add(&g_desc_poolkill, 1); }
     g_dpool_n[slot] = 0;
+    if (slot >= 0 && slot < MAX_INFLIGHT) atomic_store(&g_desc_used[slot], 0);
 }
 
 static VkDescriptorPool desc_pool_at(int slot, int idx) {
     if (g_dpool[slot][idx]) return g_dpool[slot][idx];
     if (idx >= DESC_POOLS) return VK_NULL_HANDLE;
+    // N4-l：`DM_DESC_POOL_BIG=1`（缺省关）——**按类型**给的额度放大（见下面 `desc_pool_big_on` 那段说明）
     // UNIFORM_TEXEL_BUFFER 是**缓冲区贴图**那一类绑定要的：描述符集布局里出现了它，池里就必须有对应的额度，
     // 否则 vkAllocateDescriptorSets 会失败（一个 set 也开不出来），而失败是静默的——每帧都从头再来一遍。
     // UNIFORM_TEXEL_BUFFER is for **buffer textures**: once the descriptor set layout contains that type the pool
     // must carry a matching quota, or vkAllocateDescriptorSets fails (not a single set can be opened) and the failure
     // is silent -- every frame would start over from square one.
     VkDescriptorPoolSize ps[5] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, DESC_POOL_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, DESC_POOL_SETS },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DESC_POOL_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, DESC_POOL_SETS },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, desc_pool_big_on() ? DESC_POOL_BIG_QUOTA : DESC_POOL_SETS },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, desc_pool_big_on() ? DESC_POOL_BIG_QUOTA : DESC_POOL_SETS },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, desc_pool_big_on() ? DESC_POOL_BIG_QUOTA : DESC_POOL_SETS },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, desc_pool_big_on() ? 512u : 128u },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, desc_pool_big_on() ? DESC_POOL_BIG_QUOTA : DESC_POOL_SETS },
     };
     VkDescriptorPoolCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = DESC_POOL_SETS, .poolSizeCount = 5, .pPoolSizes = ps };
+        .maxSets = desc_pool_big_on() ? DESC_POOL_BIG_SETS : DESC_POOL_SETS, .poolSizeCount = 5, .pPoolSizes = ps };
     VkDescriptorPool p = VK_NULL_HANDLE;
     dm_waitled_enter("vk：建描述符池");
     VkResult dpres = vkCreateDescriptorPool(vk_dev(), &ci, NULL, &p);
     dm_waitled_leave();
     if (dpres != VK_SUCCESS) return VK_NULL_HANDLE;
+    atomic_fetch_add(&g_desc_poolnew, 1);
     if (g_dpool_n[slot] < idx + 1) g_dpool_n[slot] = (uint8_t)(idx + 1);
     return (g_dpool[slot][idx] = p);
 }
 
 static VkDescriptorSet desc_alloc(int slot, VkDescriptorSetLayout lay) {
+    atomic_fetch_add(&g_desc_reqs, 1);
     for (int idx = 0; idx < DESC_POOLS; idx++) {
         VkDescriptorPool p = desc_pool_at(slot, idx);
         if (!p) break;
@@ -2270,7 +2342,18 @@ static VkDescriptorSet desc_alloc(int slot, VkDescriptorSetLayout lay) {
         dm_waitled_enter("vk：分配描述符集");
         VkResult das = vkAllocateDescriptorSets(vk_dev(), &ai, &s);
         dm_waitled_leave();
-        if (das == VK_SUCCESS) return s;
+        if (das == VK_SUCCESS) {
+            if (slot >= 0 && slot < MAX_INFLIGHT) atomic_fetch_add(&g_desc_used[slot], 1);
+            return s;
+        }
+    }
+    // N4-l：这条失败**以前是静默的**（返回 NULL ⇒ 调用方跳过这次绘制）。现在有读数：总量 + 每次前 8 条明细。
+    uint64_t n = atomic_fetch_add(&g_desc_fails, 1) + 1;
+    if (n <= 8 || (n & 1023) == 0) {
+        uint64_t used = (slot >= 0 && slot < MAX_INFLIGHT) ? atomic_load(&g_desc_used[slot]) : 0;
+        LOG("【黄】描述符集分配失败（第 %llu 次、槽 %d）：%d 个池都没额度了 ⇒ **这一次绘制被静默跳过**"
+            "（本槽累计已用 %llu 集；额度是**按类型**给的，一个集里有 k 个同类型描述符时每池只够 %d/k 集）",
+            (unsigned long long)n, slot, DESC_POOLS, (unsigned long long)used, DESC_POOL_SETS);
     }
     return VK_NULL_HANDLE;
 }
@@ -2566,6 +2649,44 @@ static uint64_t ubo_range_cap(void) {
     return cap;
 }
 
+// ===========================================================================
+// N4-l：`DM_DYN_OFFSET_FIX=1`（**缺省关**）—— 让"布局里是 dynamic 的每一条绑定"**一定**消费一个动态偏移。
+//
+// 要回答的那句话（写死）：**"片段着色器读一条描述符就让这次绘制一个像素都不落，是不是因为
+// `vkCmdBindDescriptorSets` 的 `dynamicOffsetCount` 比布局要求的少？"**
+// 读代码得到的机制（本轮先量、改不改由读数定）：`desc_write` 只有"缓冲地址落在零拷贝池里"那一支才
+// `dyn[nd++] = al`；另两支**不 push**：
+//   · `hb`（support_buffer / c1 / c0 这些**宿主自己的**常量段，`desc_buf_range` 的 `slot <= 2` 那一支）；
+//   · 空白回退（游戏没绑、或地址不在任何池里）。
+// 而这两支的**描述符类型仍然是 `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC`** ⇒ 布局里它们是动态描述符，
+// 规范要求"dynamicOffsetCount = 绑定进来的这些 set 里动态描述符的总数"（VUID-vkCmdBindDescriptorSets-
+// dynamicOffsetCount-00359）。少一个就是一次**非法**绑定；没有校验层时它的后果由驱动决定（Adreno 上完全
+// 可能就是"这次绘制不产片元"）。
+// 这正好与已有读数同形：**我们的纯红 FS 一条描述符都不声明**（布局里 0 个动态描述符、nd 也是 0 ⇒ 合法）
+// ⇒ 落屏 85；**游戏的 FS 声明 binding 0（support_buffer，走 `hb`）与 binding 4** ⇒ 布局要 2 个、实际 push
+// 1 个（甚至 0 个：那份 res.json 的 cbufs 是空的，两条都走 support_buffer）⇒ 非法。
+// 判据：叠在**已知落屏**的档上（`vso` = 85 / `vsfullf` = 85），同一份 conf 只加这一行 ⇒ 出现非 152 = 成立。
+// ===========================================================================
+static int dyn_fix_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_DYN_OFFSET_FIX");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_DYN_OFFSET_FIX=1：**布局里是 dynamic 的每一条绑定**都消费一个动态偏移"
+                   "（宿主常量段与空白回退那两支原来不 push ⇒ dynamicOffsetCount 比布局要求的少，是一次非法绑定）");
+    }
+    return v;
+}
+// 一条动态偏移（带越界保护：`dyn[]` 与绑定表同样大小）
+static void dyn_push(uint32_t *dyn, int *nd, uint32_t v) {
+    if (*nd >= VK_SPV_MAXB) {
+        static _Atomic uint64_t over;
+        if (atomic_fetch_add(&over, 1) < 4) LOG("【红】动态偏移数组满了（>%d 条）：这一条没地方放", VK_SPV_MAXB);
+        return;
+    }
+    dyn[(*nd)++] = v;
+}
+
 static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n,
                       const vk_pipe_bind *b, int nb, uint32_t *dyn) {
     // 一屏最多 64 条绑定，用静态数组（mtl_exec 递归，不能用大栈帧 | see the note on gfx_state_fill）
@@ -2643,10 +2764,13 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 VkBuffer dum = vk_pipe_dummy_buffer();
                 if (!dum) return -1;
                 bi[nw] = (VkDescriptorBufferInfo){ dum, 0, VK_WHOLE_SIZE };
+                // N4-l：类型没变（仍是 *_DYNAMIC）⇒ 布局里它是动态描述符 ⇒ 必须消费一个偏移（见 dyn_fix_on 那段）
+                if (dyn_fix_on()) dyn_push(dyn, &nd, 0);
             } else if (hb) {
-                // 特殊常量段：宿主自己的缓冲，没有动态偏移
-                // A special constant segment: the host's own buffer, with no dynamic offset
+                // 特殊常量段：宿主自己的缓冲（描述符的 offset 就是 0；但它**仍然**是 dynamic 类型）
+                // A special constant segment: the host's own buffer (descriptor offset is 0, but the type is still dynamic)
                 bi[nw] = (VkDescriptorBufferInfo){ hb, 0, VK_WHOLE_SIZE };
+                if (dyn_fix_on()) dyn_push(dyn, &nd, 0);
             } else {
                 // N4-b：这条 UBO / SSBO 要被 GPU 读 ⇒ 保证后备是最新的（标 CPU 脏，帧开头搬它）。
                 // 这是"绑定以 SPIR-V 反射为唯一真源"之外的另一件事：**读写的位置**由绑定决定，而"到没到 GPU
@@ -2681,7 +2805,7 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                     }
                 }
                 bi[nw] = (VkDescriptorBufferInfo){ (VkBuffer)buf, off - al, rng };
-                dyn[nd++] = (uint32_t)al;
+                dyn_push(dyn, &nd, (uint32_t)al);
             }
             w.descriptorType = b[i].type;
             w.pBufferInfo = &bi[nw];
@@ -2843,6 +2967,34 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
     }
     if (nw) { dm_waitled_enter("vk：更新描述符集（每帧）"); vkUpdateDescriptorSets(vk_dev(), (uint32_t)nw, wr, 0, NULL); dm_waitled_leave(); }
     return nd;
+}
+
+// ===========================================================================
+// N4-l：绑定描述符集，**顺手把两个数对一下**：这次 push 了几个动态偏移 vs 布局里有多少个动态描述符。
+// 只读（不改行为）；不相等就把这条读数打出来（前 6 次 + 之后每 1024 次），因为
+//   · 规范要求相等（VUID-vkCmdBindDescriptorSets-dynamicOffsetCount-00359）；
+//   · 没有校验层时后果由驱动定，而"这次绘制不产片元"是这台 Adreno 上已被证明会发生的一种后果形态。
+// `DM_LAYOUT_DUMP=1` 时同时把这一对布局逐条摊平（同一个键只打一次）。
+// ===========================================================================
+static void desc_bind(VkCommandBuffer cb, VkPipelineLayout lay, VkDescriptorSet sets[2],
+                      const vk_shader *const *pair, int npair, int nd, const uint32_t *dyn, const char *where,
+                      int site) {
+    vk_pipe_layout_dump(pair, npair, where);
+    int want = vk_pipe_layout_dyn_count(pair, npair);
+    if (want >= 0 && want != nd) {
+        // 按**站点**分别计数（N4-l 第一版共用一个计数，结果"阶梯"那一处的失败被"游戏路径"的前 6 条吃掉了）
+        static _Atomic uint64_t mism[4];
+        int si = (site >= 0 && site < 4) ? site : 3;
+        uint64_t n = atomic_fetch_add(&mism[si], 1) + 1;
+        if (n <= 6 || (n & 255) == 0)
+            LOG("【红】动态偏移个数与布局不符（%s，第 %llu 次）：这次 push 了 %d 个、布局要求 %d 个"
+                "⇒ `vkCmdBindDescriptorSets` 的 dynamicOffsetCount 不合法（VUID-…-dynamicOffsetCount-00359）；"
+                "没有校验层时后果由驱动定。为什么少：`desc_write` 只有「缓冲地址落在池里」那一支才 push 偏移，"
+                "而 support_buffer / c1 / c0（宿主自己的常量段）与空白回退这两支**不 push**，"
+                "可它们在布局里**仍然是 dynamic** —— 修法是 `DM_DYN_OFFSET_FIX=1`",
+                where, (unsigned long long)n, nd, want);
+    }
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 2, sets, (uint32_t)nd, dyn);
 }
 
 // ========== 渲染区取证：算出多少、附件多大、谁说了算（优化清单第 3 项）==========
@@ -3352,6 +3504,11 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
     // 与 `vsf` 只差几何这一样（VS 换成 N4-h 那份只读 `gl_VertexIndex` 的全屏三角形、`vkCmdDraw(3)`）：
     // 仍然 152 ⇒ **这份片段着色器模块在这台驱动上产不出片元**（与几何无关）；落屏 ⇒ 回到几何链上找。
     else if (step == VK_TRI_LADDER_VSFULL) { use_vs = vs_idx; use_ps = gps; need_desc = 1; draw3 = 1; }
+    // N4-l ⑩ `vsfullf`：**我们自己的全屏三角形 VS + 我们自己的片段着色器**（含 `DM_TRI_FS_VARIANT` 的变体）
+    // + 我们自己的状态 + 描述符照绑。为什么必须有它：⑦/⑨ 的 `use_ps` 都是**游戏那份** FS，在这两档上设
+    // `DM_TRI_FS_VARIANT` 一行都不生效（N4-k 的 iface/blit/if_ubo/if_smp 就是这么跑成"又一次 vsfull"的）。
+    // 与 `vso`（同一份 FS、**不绑**描述符、两轮 85）只差"描述符绑没绑"这一样 ⇒ 单变量。
+    else if (step == VK_TRI_LADDER_VSFULLF) { use_vs = vs_idx; use_ps = fs; need_desc = 1; draw3 = 1; }
     else if (step == VK_TRI_LADDER_BOTH) { use_vs = gvs; use_ps = gps; use_st = st; need_desc = 1; vb_mode = 2; }
     else { use_vs = gvs; use_ps = gps; use_st = st; need_desc = 1; vb_mode = 2; }
     if (!use_vs || use_vs->mod == VK_NULL_HANDLE || (need_desc && (!use_ps || use_ps->mod == VK_NULL_HANDLE))) {
@@ -3470,7 +3627,7 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
     vkCmdSetViewport(cb, 0, 1, &full);
     vkCmdSetScissor(cb, 0, 1, &fullsc);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
-    if (need_desc && nd >= 0) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 2, sets, (uint32_t)nd, dyn);
+    if (need_desc && nd >= 0) desc_bind(cb, lay, sets, pair, 2, nd, dyn, "阶梯", 1);
     if (draw3) {
         vkCmdDraw(cb, 3, 1, 0, 0);
     } else if (indexed && ib_ok) {
@@ -3535,7 +3692,7 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
                 (unsigned long long)vsize, have_idx ? "（按索引）" : "（流的前三个）", vo ? vt : "（空）");
         }
         LOG("【查】DM_TRI_LADDER=%s：第 %llu 次插入 —— 游戏第 %llu 次绘制（%s，%s %u 个、实例 %u、first/base %u）；"
-            "顶点 游戏 %s、我们 %s；片元 游戏 %s；目标 %u 个（VkFormat %d/%d、采样 %u）；"
+            "顶点 游戏 %s、我们 %s；片元 游戏 %s、**这一档实际用的 %s**（描述符 %s）；目标 %u 个（VkFormat %d/%d、采样 %u）；"
             "**游戏那一刻的状态** 拓扑 %d、写掩码[0] %#x、混合%s（%d→%d）、深度%s/%s（格式 %d/%d）、剔除 %d、"
             "游戏视口 %d 个（%.0fx%.0f）、裁剪 %d 个；"
             "**这一档接上的**：%s；我们这条管线 写掩码[0] %#x、深度关、剔除关、混合关；"
@@ -3543,6 +3700,7 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
             sname, (unsigned long long)k, (unsigned long long)draw_index,
             indexed ? "索引绘制" : "非索引绘制", indexed ? "索引数" : "顶点数", count, instances, indexed ? base_vertex : first,
             gvs ? gvs->key : "无", use_vs->key, gps ? gps->key : "无",
+            use_ps ? use_ps->key : "（没有片元阶段）", need_desc ? "绑" : "不绑",
             use_st->color_count, use_st->color_count > 0 ? (int)use_st->color[0] : -1,
             use_st->color_count > 1 ? (int)use_st->color[1] : -1, use_st->samples,
             (int)use_st->topo, use_st->write_mask[0], use_st->blend_en[0] ? "开" : "关",
@@ -3558,6 +3716,7 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
           : (step == VK_TRI_LADDER_VSF) ? "游戏的顶点着色器 + **游戏的片段着色器** + 描述符 + 顶点缓冲，但状态用**我们自己的**（= N4-k：与 `vso` 只差 FS 这一样）"
           : (step == VK_TRI_LADDER_VSFN) ? "同 `vsf`，但**故意不绑描述符集**（把游戏 FS 的绑定表单独摘出来）"
           : (step == VK_TRI_LADDER_VSFULL) ? "**我们自己的全屏三角形 VS** + **游戏的片段着色器** + 我们的状态 + 描述符（= 与 `vsf` 只差几何这一样）"
+          : (step == VK_TRI_LADDER_VSFULLF) ? "**我们自己的全屏三角形 VS + 我们自己的片段着色器（含 DM_TRI_FS_VARIANT 变体）** + 我们的状态 + **描述符照绑**（= 与 `vso` 只差描述符这一样）"
           : "游戏的顶点着色器 + 游戏的片段着色器 + 描述符 + 顶点缓冲（= 原地重放游戏那次绘制）",
             ours.write_mask[0],
             draw3 ? "vkCmdDraw(3)（全屏三角形）" : (indexed && ib_ok ? "vkCmdDrawIndexed（照游戏的计数）" : "vkCmdDraw（照游戏的计数）"),
@@ -3936,7 +4095,8 @@ void mtl_exec(const uint8_t *p) {
                 int nd = nb >= 0 ? desc_write(sets, (const vk_shader *const *)shs, nsh, binds, nb, dyn) : -1;
                 if (nd >= 0) {
                     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
-                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 2, sets, (uint32_t)nd, dyn);
+                    // N4-l：改用 `desc_bind` —— 同一句绑定 + 顺手核对"动态偏移个数 vs 布局要求的个数"（只读）
+                    desc_bind(cb, lay, sets, (const vk_shader *const *)shs, nsh, nd, dyn, "游戏路径", 0);
                     // 顶点流：只绑管线真的用到的那些；其余属性走常量回退，落在 VK_PIPE_DUMMY_BIND 上
                     // Vertex streams: bind only the ones the pipeline really uses; the remaining attributes come
                     // from the constant fallback that lives on VK_PIPE_DUMMY_BIND

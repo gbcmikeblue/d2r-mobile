@@ -15,9 +15,12 @@
 #include "vk_device.h"
 #include "vk_pipe.h"
 #include "vk_tex.h"
+#include "vk_spv.h"               // N4-l：`vk_spv_force_set` / `vk_spv_scan`（片段那一份也要有反射）
 #include "vk_tri_game_spv.h"      // 内联 SPIR-V（由 .work/n4h_tri_spv.py 生成，自证 .work/logs/tri-ingame-spv.txt）
 #include "vk_tri_ladder_spv.h"    // N4-i 的那一份（由 .work/n4i_ladder_spv.py 生成，自证 .work/logs/tri-ladder-spv.txt）
 #include "vk_tri_fs_cap_spv.h"    // N4-k 的三个片段着色器变体（由 .work/n4k_fs_variants.py 生成，自证 .work/logs/n4k-fs-variants.txt）
+#include "vk_tri_fs_n4l_spv.h"    // N4-l 的四份（只保留一条绑定的四格 + 声明但不读；自证 .work/logs/n4l-fs-variants.txt）
+#include "vk_tri_fs_n4l_cap_spv.h" // N4-l 第二刀：只加 capability（游戏那份的清单；自证 .work/logs/n4l-cap-variants.txt）
 #include "dm.h"
 
 #include <stdatomic.h>
@@ -351,6 +354,7 @@ static const char *ladder_name(int m) {
         case VK_TRI_LADDER_VSF: return "vsf";
         case VK_TRI_LADDER_VSFN: return "vsfn";
         case VK_TRI_LADDER_VSFULL: return "vsfull";
+        case VK_TRI_LADDER_VSFULLF: return "vsfullf";
     }
     return "off";
 }
@@ -371,8 +375,9 @@ static void ladder_parse(void) {
     else if (!strcmp(e, "vsf")) g_ladder = VK_TRI_LADDER_VSF;
     else if (!strcmp(e, "vsfn")) g_ladder = VK_TRI_LADDER_VSFN;
     else if (!strcmp(e, "vsfull")) g_ladder = VK_TRI_LADDER_VSFULL;
+    else if (!strcmp(e, "vsfullf")) g_ladder = VK_TRI_LADDER_VSFULLF;
     else {
-        LOG("【黄】DM_TRI_LADDER=%s 认不出来（只认识 vb / state / vs / both / vsn / vso / vsf / vsfn / vsfull）——按关处理", e);
+        LOG("【黄】DM_TRI_LADDER=%s 认不出来（只认识 vb / state / vs / both / vsn / vso / vsf / vsfn / vsfull / vsfullf）——按关处理", e);
         return;
     }
     LOG("【查】DM_TRI_LADDER=%s：拿 N4-h 那条**已经证明能落屏**的管线当标尺，把游戏那一刻的输入"
@@ -405,8 +410,18 @@ int vk_tri_fs_variant(void) {
     else if (!strcmp(e, "blit")) g_fsv = 5;
     else if (!strcmp(e, "if_ubo")) g_fsv = 6;
     else if (!strcmp(e, "if_smp")) g_fsv = 7;
+    else if (!strcmp(e, "smp1")) g_fsv = 8;      // N4-l：只声明一张 sampler2D（binding 1）
+    else if (!strcmp(e, "ubo4")) g_fsv = 9;      // N4-l：只声明池内那一条 UBO（binding 4，有动态偏移）
+    else if (!strcmp(e, "ubo0")) g_fsv = 10;     // N4-l：只声明 support_buffer（binding 0，宿主常量段）
+    else if (!strcmp(e, "decl")) g_fsv = 11;     // N4-l：五条绑定全声明、一条都不读
+    else if (!strcmp(e, "capf64")) g_fsv = 12;   // N4-l 第二刀：只多 OpCapability Float64
+    else if (!strcmp(e, "capgather")) g_fsv = 13;
+    else if (!strcmp(e, "capimg")) g_fsv = 14;
+    else if (!strcmp(e, "capgroup")) g_fsv = 15;
+    else if (!strcmp(e, "capall")) g_fsv = 16;   // 以上全加（= 游戏那份的 capability 清单）
     else {
-        LOG("【黄】DM_TRI_FS_VARIANT=%s 认不出来（只认识 cap / 3out / 3out_cap / iface / blit / if_ubo / if_smp）——按关处理", e);
+        LOG("【黄】DM_TRI_FS_VARIANT=%s 认不出来（只认识 cap / 3out / 3out_cap / iface / blit / if_ubo / if_smp / "
+            "smp1 / ubo4 / ubo0 / decl）——按关处理", e);
         return 0;
     }
     LOG("【查】DM_TRI_FS_VARIANT=%s：阶梯用的那份**我们自己的**片段着色器换成变体 %d"
@@ -468,19 +483,59 @@ const vk_shader *vk_tri_ladder_shader(int which) {
         g_lsh[1].in = g_lsh_in; g_lsh[1].nin = 1;
         // N4-k：片段那一份按 `DM_TRI_FS_VARIANT` 选（缺省 = N4-h 那份纯红，一字不改）
         int fsv = vk_tri_fs_variant();
-        if (fsv == 1) { ci.codeSize = (size_t)VK_TRI_FS_CAP_WORDS * 4; ci.pCode = VK_TRI_FS_CAP; }
-        else if (fsv == 2) { ci.codeSize = (size_t)VK_TRI_FS_3OUT_WORDS * 4; ci.pCode = VK_TRI_FS_3OUT; }
-        else if (fsv == 3) { ci.codeSize = (size_t)VK_TRI_FS_3OUT_CAP_WORDS * 4; ci.pCode = VK_TRI_FS_3OUT_CAP; }
-        else if (fsv == 4) { ci.codeSize = (size_t)VK_TRI_FS_IFACE_WORDS * 4; ci.pCode = VK_TRI_FS_IFACE; }
-        else if (fsv == 5) { ci.codeSize = (size_t)VK_TRI_FS_BLIT_WORDS * 4; ci.pCode = VK_TRI_FS_BLIT; }
-        else if (fsv == 6) { ci.codeSize = (size_t)VK_TRI_FS_IF_UBO_WORDS * 4; ci.pCode = VK_TRI_FS_IF_UBO; }
-        else if (fsv == 7) { ci.codeSize = (size_t)VK_TRI_FS_IF_SMP_WORDS * 4; ci.pCode = VK_TRI_FS_IF_SMP; }
-        else { ci.codeSize = (size_t)VK_TRI_GAME_FS_WORDS * 4; ci.pCode = VK_TRI_GAME_FS; }
-        VkResult r2 = vkCreateShaderModule(dev, &ci, NULL, &g_lsh[2].mod);
+        const uint32_t *fsw = VK_TRI_GAME_FS; size_t fsn = (size_t)VK_TRI_GAME_FS_WORDS;
+        if (fsv == 1) { fsw = VK_TRI_FS_CAP; fsn = (size_t)VK_TRI_FS_CAP_WORDS; }
+        else if (fsv == 2) { fsw = VK_TRI_FS_3OUT; fsn = (size_t)VK_TRI_FS_3OUT_WORDS; }
+        else if (fsv == 3) { fsw = VK_TRI_FS_3OUT_CAP; fsn = (size_t)VK_TRI_FS_3OUT_CAP_WORDS; }
+        else if (fsv == 4) { fsw = VK_TRI_FS_IFACE; fsn = (size_t)VK_TRI_FS_IFACE_WORDS; }
+        else if (fsv == 5) { fsw = VK_TRI_FS_BLIT; fsn = (size_t)VK_TRI_FS_BLIT_WORDS; }
+        else if (fsv == 6) { fsw = VK_TRI_FS_IF_UBO; fsn = (size_t)VK_TRI_FS_IF_UBO_WORDS; }
+        else if (fsv == 7) { fsw = VK_TRI_FS_IF_SMP; fsn = (size_t)VK_TRI_FS_IF_SMP_WORDS; }
+        else if (fsv == 8) { fsw = VK_TRI_FS_SMP1; fsn = (size_t)VK_TRI_FS_SMP1_WORDS; }
+        else if (fsv == 9) { fsw = VK_TRI_FS_UBO4; fsn = (size_t)VK_TRI_FS_UBO4_WORDS; }
+        else if (fsv == 10) { fsw = VK_TRI_FS_UBO0; fsn = (size_t)VK_TRI_FS_UBO0_WORDS; }
+        else if (fsv == 11) { fsw = VK_TRI_FS_DECL; fsn = (size_t)VK_TRI_FS_DECL_WORDS; }
+        else if (fsv == 12) { fsw = VK_TRI_FS_CAPF64; fsn = (size_t)VK_TRI_FS_CAPF64_WORDS; }
+        else if (fsv == 13) { fsw = VK_TRI_FS_CAPGATHER; fsn = (size_t)VK_TRI_FS_CAPGATHER_WORDS; }
+        else if (fsv == 14) { fsw = VK_TRI_FS_CAPIMG; fsn = (size_t)VK_TRI_FS_CAPIMG_WORDS; }
+        else if (fsv == 15) { fsw = VK_TRI_FS_CAPGROUP; fsn = (size_t)VK_TRI_FS_CAPGROUP_WORDS; }
+        else if (fsv == 16) { fsw = VK_TRI_FS_CAPALL; fsn = (size_t)VK_TRI_FS_CAPALL_WORDS; }
+        // -------------------------------------------------------------------
+        // N4-l：**这一份 FS 也要走"按阶段分空间"与"反射"**（以前没有）。
+        // 游戏那几份是在 `vk_shader.c` 的 `load()` 里做的（PS 的绑定整体挪到 set 1，然后把 SPIR-V 声明的绑定
+        // 抄进 `sh->spv`，那是**描述符集布局的唯一权威来源**）。而这三份是我们直接在 `vk_tri_game.c` 里建模块的：
+        // `spv` 一直是空的 ⇒ 布局里一条绑定都没有。以前没有变体声明描述符，所以从来没露出来；N4-l 一开始要
+        // "只声明一条绑定"，这个窟窿就变成主变量：**着色器声明了 set1/binding N，而管线布局里没有这一条**
+        // ⇒ 这次绘制在 API 层面就是错的（Adreno 上同样可能"不产片元"，而且它会把"读描述符"这个题目污染掉）。
+        // 所以这里照 `load()` 的顺序做一遍：copy → `vk_spv_force_set(…, 1)` → 建模块 → `vk_spv_scan`。
+        // -------------------------------------------------------------------
+        uint32_t *fsbuf = malloc(fsn * 4);
+        VkResult r2 = VK_ERROR_OUT_OF_HOST_MEMORY;
+        int nforced = -1, nref = -1, nfin = 0;
+        if (fsbuf) {
+            memcpy(fsbuf, fsw, fsn * 4);
+            nforced = vk_spv_force_set(fsbuf, fsn * 4, 1);
+            if (nforced >= 0) {
+                ci.codeSize = fsn * 4; ci.pCode = fsbuf;
+                r2 = vkCreateShaderModule(dev, &ci, NULL, &g_lsh[2].mod);
+                if (r2 == VK_SUCCESS) {
+                    g_lsh[2].spv = calloc(VK_SPV_MAXB, sizeof *g_lsh[2].spv);
+                    g_lsh[2].in = calloc(VK_SPV_MAXIN, sizeof *g_lsh[2].in);
+                    if (g_lsh[2].spv && g_lsh[2].in) {
+                        nref = vk_spv_scan(fsbuf, fsn * 4, g_lsh[2].spv, VK_SPV_MAXB, g_lsh[2].in, VK_SPV_MAXIN, &nfin);
+                        if (nref >= 0) { g_lsh[2].nspv = (uint32_t)nref; g_lsh[2].nin = (uint32_t)nfin; }
+                    }
+                }
+            }
+            free(fsbuf);
+        }
         snprintf(g_lsh[2].key, sizeof g_lsh[2].key, "n4i-tri-fs%s",
                  fsv == 1 ? "-cap" : fsv == 2 ? "-3out" : fsv == 3 ? "-3outcap"
                : fsv == 4 ? "-iface" : fsv == 5 ? "-blit"
-               : fsv == 6 ? "-ifubo" : fsv == 7 ? "-ifsmp" : "");
+               : fsv == 6 ? "-ifubo" : fsv == 7 ? "-ifsmp"
+               : fsv == 8 ? "-smp1" : fsv == 9 ? "-ubo4" : fsv == 10 ? "-ubo0" : fsv == 11 ? "-decl"
+               : fsv == 12 ? "-capf64" : fsv == 13 ? "-capgather" : fsv == 14 ? "-capimg"
+               : fsv == 15 ? "-capgroup" : fsv == 16 ? "-capall" : "");
         g_lsh[2].stage = VK_STAGE_PS;
         if (r0 != VK_SUCCESS) g_lsh[0].mod = VK_NULL_HANDLE;
         if (r1 != VK_SUCCESS) g_lsh[1].mod = VK_NULL_HANDLE;
@@ -489,8 +544,15 @@ const vk_shader *vk_tri_ladder_shader(int which) {
             " —— VkResult %d / %d / %d（0 = 建出来了）；读顶点缓冲那份声明的输入 = Location 0、4 分量 float"
             "（与 .work/logs/tri-ladder-spv.txt 的自证逐项对上）；**片段那一份的变体 = %d**"
             "（0 = 纯红缺省 / 1 = +interlock capability / 2 = 3 个输出 / 3 = 两者 / "
-            "4 = 游戏的描述符接口 + 极简代码 / 5 = 同接口 + 复刻游戏算术；见 DM_TRI_FS_VARIANT）",
+            "4 = 游戏的描述符接口 + 极简代码 / 5 = 同接口 + 复刻游戏算术 / 8 = 一条 sampler2D / "
+            "9 = 一条池内 UBO(binding 4) / 10 = 一条 support_buffer(binding 0) / 11 = 五条都声明但一条不读；"
+            "见 DM_TRI_FS_VARIANT）——⚠ 这一份只在 `use_ps` 取到它的档里生效（`vso` / `vs` / `vb` / `vsfullf`），"
+            "而 `vsf` / `vsfull` 写死用**游戏那份** FS（N4-l 量到的仪器错误：N4-k 的 iface/blit/if_ubo/if_smp 就是跑在 vsfull 上）",
             (int)r0, (int)r1, (int)r2, fsv);
+        LOG("【查】DM_TRI_LADDER：片段那一份的**反射**（N4-l 新增）—— 挪到 set 1 的绑定 %d 条、`vk_spv_scan` 读到 %d 条"
+            "（读不到 = -1）、声明了 %d 个顶点输入；**布局里能看到的绑定就是这几条**"
+            "（以前这里一条都没有 ⇒ 变体明明声明了描述符、布局却是空的）",
+            nforced, nref, nfin);
     }
     return g_lsh[which].mod ? &g_lsh[which] : NULL;
 }

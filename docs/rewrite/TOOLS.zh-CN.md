@@ -305,6 +305,20 @@
 | **`adb logcat -c` 之后再起 App** | `n4k_logcat_round.py` 的顺序：推 conf → `am force-stop` → **`logcat -c`** → `am start` → 起 `adb logcat -v time` 子进程 → 等 N 秒 → `terminate` → 拉 `latest.log`。**不要**先起 App 再清日志（会丢掉启动那几秒里的驱动消息） |
 | **`.work/` 本轮新增脚本** | `n4k_cap_scan.py`（全库 capability / extension / 5300~5400 段 opcode）、`n4k_fs_variants.py`（六份自写 FS + 注入 + 自证 + 生成 `vk_tri_fs_cap_spv.h`）、`n4k_confs.py` / `n4k_confs2.py`（conf 生成）、`n4k_report.py`（抽"序号 28 三级 + 开关自证 + 最终结构体 + 插入 + 红行 + 心跳"）、`n4k_logcat_round.py`（一轮 + logcat）、`n4k_regress.py`（四探针回归，尾巴 `-n4kregress`；**别再用 `n4h_regress.py`**，它会把 N4-h 的读数覆盖掉） |
 
+## B¹⁷. N4-l 期间量出来的仪器事实（2026-10-17，下次开工直接用）
+
+| 事实 | 读数 / 怎么用 |
+|---|---|
+| **★ 先审"这个变体/开关到底有没有上场"—— 本轮最贵的一条** | N4-k 的 `iface`/`blit`/`if_ubo`/`if_smp` 共 11 轮 conf 是 `DM_TRI_LADDER=vsfull` + `DM_TRI_FS_VARIANT=…`，而 **`vsfull` 档的 `use_ps` 写死是游戏那份 FS** ⇒ 变体**一行都没生效**。离线审表 `.work/n4l_audit_insert.py`（抽"启动头的档 / 变体 + 插入行里的着色器键 + 判据亮度"）逐轮复核；**插入明细现在多打一格 `**这一档实际用的 <键>**（描述符 绑/不绑）`** ⇒ 这类错误以后在日志里直接看得见 |
+| **★ 我们自己的手搓着色器以前**没有反射**（`spv` 为空 ⇒ 布局里一条绑定都没有）** | `vk_tri_ladder_shader()` 直接 `vkCreateShaderModule`，没走 `vk_shader.c` 的 `load()`（那里才做 `vk_spv_force_set(…,1)` + `vk_spv_scan`）。后果：只要变体声明了描述符，**着色器与管线布局就对不上**（静默）。现在照 `load()` 的顺序补上，并打自证 `挪到 set 1 的绑定 N 条 → vk_spv_scan 读到 N 条`（`decl`=5/5、`ubo0`=1/1、基线=0/0）。**任何"手搓模块 + 描述符"的实验，先看这一行** |
+| **★ 新档 `vsfullf`（`DM_TRI_LADDER=vsfullf`）** | **我们的全屏三角形 VS + 我们那份 FS（含 `DM_TRI_FS_VARIANT` 变体）+ 我们的状态 + 描述符照绑** —— 与 `vso`（同一份 FS、不绑描述符、85）只差"描述符绑没绑"这一样。**`vsf`/`vsfull` 上设 `DM_TRI_FS_VARIANT` 是空实验**（`use_ps` 是游戏那份），要测"我们那份 FS"就用这一档 |
+| **★ 判据读数矩阵（本轮，底盘 152 / 落屏 = 非 152）** | `vsfullf` 基线 **85**、`smp1`（一条 sampler2D）**85**、`ubo4`（一条池内 UBO）**85**、`ubo0`（一条 support_buffer）**85**、`decl`（五条都声明、一条不读）**85**、`iface` **85**、`capall`（游戏那份的 8 条 capability 全加）**85（2 轮）** ⇒ **读描述符无害、capability 声明无害**。而 `vsfn`（**游戏 FS、不绑描述符**）**152（2 轮）**、`vsf` **152**、`vsfull` **152（2 轮）** ⇒ 责任在**游戏那份 FS 模块本身** |
+| **★ `DM_LAYOUT_DUMP=1`（本轮新增，只读）** | 把这一对着色器建出来的**两个描述符集布局逐条摊平**：`set/绑定号:类型×个数:阶段位`、**动态描述符总数（set0/set1 分开）**、三个句柄（set0 / set1 / 管线）。同一键只打一次。真机现场：游戏路径那一刻的布局 = `6 个动态描述符（set0 2 + set1 4）`、另一份 = `4 个` / `10 个` / `3 个`（四种形状） |
+| **★ 动态偏移个数必须**等于**布局里的动态描述符个数**（`desc_bind` 现在顺手核对）** | `desc_write` 只有"地址落在池里"那一支 `dyn_push`；**宿主常量段（support_buffer / c1 / c0）与空白回退两支不 push**，可类型仍是 `*_DYNAMIC` ⇒ 少 push 就是非法绑定（VUID-…-dynamicOffsetCount-00359）。真机：**游戏路径 `push 3 / 布局要 6`，一轮 14~596 次**。修法 **`DM_DYN_OFFSET_FIX=1`**（缺省关）⇒ **0 条不符**，但**画面仍 152**（阶梯在同一情形下也照样落屏）⇒ 非法但不是成因。**按站点分别计数**（第一版共用一个计数，"阶梯"那处的失败被"游戏路径"的前 6 条吃掉） |
+| **★ 描述符池：`maxSets` 与 `poolSize` 不是一回事（本轮把它量成读数并修掉）** | 新开关 **`DM_DESC_STATS=1`**（每帧一行：本帧分配 / **失败 = 被静默跳过的绘制** / 池新建与销毁 / 本槽已用）。真机：基线 **106 帧 27756 次失败（≈262/帧、末帧 850）** —— 因为 `poolSize` **按类型**给（512），而那一刻的布局有 **6 个动态描述符** ⇒ 一池只够开 85 个集，而每帧几百次绘制 × 每次 2 个集。修法 **`DM_DESC_POOL_BIG=1`**（1024 集/池 × 每类型 3072）⇒ **331/轮、末帧 0**（2 轮），**画面仍 152** ⇒ 不是成因，但每帧少画几百次的量级必须修 |
+| **`n4l_cap_variants.py`：capability 清单怎么"只加不用"地注入** | 用 `glslc` 编底 → `spirv-dis` 反汇编 → 在**最后一条 `OpCapability` 之后**插入那几行 → **`spirv-as` 汇编回二进制**（不手写 capability 数值，避开坑 ㊱ 的 `wc` 写错）→ 每份都跑 `spirv-val` + `spirv-dis` 自证（读数 `.work/logs/n4l-cap-variants.txt`：五份全部 `spirv-val` 退出码 0、指令一条没变） |
+| **`.work/` 本轮新增脚本** | `n4l_scan_old.py`（翻旧日志的分项计数）、`n4l_audit_insert.py`（**审变体上没上场**）、`n4l_fs_variants.py`（四份"只留一条绑定"的 FS + `decl`，生成 `vk_tri_fs_n4l_spv.h`）、`n4l_cap_variants.py`（capability 逐组注入，生成 `vk_tri_fs_n4l_cap_spv.h`）、`n4l_confs.py`（一处生成全部 conf）、`n4l_driver.py`（`<格>:<轮数>` 分批连跑 + 总表）、`n4l_report.py`（抽判据 / **插入明细里的"实际用的 FS"** / 布局 / 池账 / 红行） |
+
 ## C. 建议补（都不难，但能省好几轮）
 
 | 建议 | 为什么值得 |

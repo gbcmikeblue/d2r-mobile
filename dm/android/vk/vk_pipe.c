@@ -19,6 +19,7 @@
 #include "vk_device.h"
 #include "dm.h"
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -324,6 +325,87 @@ VkDescriptorSetLayout vk_pipe_set_layout_set(const vk_shader *const *sh, int n, 
 VkPipelineLayout vk_pipe_layout(const vk_shader *const *sh, int n) {
     lay_e *e = lay_get_or_make(sh, n);
     return e ? e->lay : VK_NULL_HANDLE;
+}
+
+// ===========================================================================
+// N4-l：`DM_LAYOUT_DUMP=1`（**缺省关**）—— 把"这一对着色器"建出来的**两个描述符集布局**逐条摊平，
+// 并把三个句柄（set0 布局 / set1 布局 / 管线布局）一起打出来。
+//
+// 为什么要它：N4-k 的结论被收在"我们这条描述符路"上，而那条路上游有三处会**静默漂**：
+//   ① 布局缓存按"合并后的绑定表"作键（`key_of_binds`），所以"同样的键"必然同一个句柄 —— 这一条要能当场核；
+//   ② 布局里每条绑定的 **类型 / count / stage 位** 决定 `desc_write` 该怎么写；写歪了没有校验层就不说话；
+//   ③ **动态描述符的个数**决定 `vkCmdBindDescriptorSets` 必须收到几个动态偏移（少一个就是非法绑定）。
+// 所以这一行同时给出：逐条绑定（set/binding/类型/count/阶段位）+ 动态描述符总数 + 三个句柄。
+// ===========================================================================
+static int layout_dump_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_LAYOUT_DUMP");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_LAYOUT_DUMP=1：把这一对着色器建出来的**两个描述符集布局**逐条摊平"
+                   "（set/绑定号/类型/个数/阶段位）+ **动态描述符总数** + 三个句柄 —— 只读，不改行为");
+    }
+    return v;
+}
+
+static const char *dt_name(VkDescriptorType t) {
+    switch (t) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return "UBO_dyn";
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return "SSBO_dyn";
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return "image+samp";
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return "storage_image";
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: return "texel_buffer";
+        case VK_DESCRIPTOR_TYPE_SAMPLER: return "sampler";
+        default: return "其他";
+    }
+}
+
+// 布局里**动态描述符的总数** = `vkCmdBindDescriptorSets` 必须收到的 dynamicOffsetCount（我们总是绑 set 0+1）。
+int vk_pipe_layout_dyn_count(const vk_shader *const *sh, int n) {
+    bind_t b[MAX_B];
+    int nb = merge_binds(sh, n, b, MAX_B);
+    if (nb < 0) return -1;
+    int k = 0;
+    for (int i = 0; i < nb; i++)
+        if (b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+            b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+            k += b[i].count ? (int)b[i].count : 1;
+    return k;
+}
+
+void vk_pipe_layout_dump(const vk_shader *const *sh, int n, const char *where) {
+    if (!layout_dump_on()) return;
+    bind_t b[MAX_B];
+    int nb = merge_binds(sh, n, b, MAX_B);
+    if (nb < 0) { LOG("【黄】DM_LAYOUT_DUMP：合并绑定表失败（%s）", where); return; }
+    char key[1024];
+    key_of_binds(b, nb, key, sizeof key);
+    // 同一个键只打一次（键就是布局的身份）
+    static char *seen[24];
+    static int nseen;
+    for (int i = 0; i < nseen; i++) if (!strcmp(seen[i], key)) return;
+    if (nseen < 24) seen[nseen++] = strdup(key);
+    lay_e *e = lay_get_or_make(sh, n);
+    char body[900]; int o = 0; body[0] = 0;
+    for (int i = 0; i < nb && o < (int)sizeof body - 48; i++)
+        o += snprintf(body + o, sizeof body - (size_t)o, "%sset%u/%u:%s×%u:阶段%#x",
+                      i ? "；" : "", b[i].set, b[i].binding, dt_name(b[i].type), b[i].count, (unsigned)b[i].stage);
+    int nd = 0, nd0 = 0, nd1 = 0;
+    for (int i = 0; i < nb; i++) {
+        if (b[i].type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+            b[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) continue;
+        int c = b[i].count ? (int)b[i].count : 1;
+        nd += c;
+        if (b[i].set == 0) nd0 += c; else nd1 += c;
+    }
+    LOG("【查】DM_LAYOUT_DUMP（%s）：顶点 %s / 片元 %s；**动态描述符 %d 个**（set0 %d / set1 %d）；"
+        "句柄 set0 %#llx / set1 %#llx / 管线 %#llx；绑定：%s",
+        where, sh[0] ? sh[0]->key : "无", (n > 1 && sh[1]) ? sh[1]->key : "无",
+        nd, nd0, nd1,
+        (unsigned long long)(uintptr_t)(e ? e->dsl[0] : VK_NULL_HANDLE),
+        (unsigned long long)(uintptr_t)(e ? e->dsl[1] : VK_NULL_HANDLE),
+        (unsigned long long)(uintptr_t)(e ? e->lay : VK_NULL_HANDLE),
+        body[0] ? body : "（空表）");
 }
 
 // 计算管线缓存：按键（着色器的键）索引 | compute pipeline cache, keyed by the shader key
