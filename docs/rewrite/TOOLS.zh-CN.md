@@ -664,8 +664,10 @@
 读数 **≈3.1 s** 就到齐，`出图` 到最终值的中位时刻 **16.4 s**，而每轮固定等 **49.4 s** ⇒ **平均 27.8 s/轮纯等**；
 更糟的是 App 已经退出（日志只有 1.1 s）**照样睡满 50 s**（`tailreda` / `isinf38b`）。
 
-**器械**：`.work/wait_until.py`（公共触发器）+ 四个跑轮脚本已接上
-（`n4_apk_round.py` / `n4d_shot2.py` / `vklayer_round.py` / `n4k_logcat_round.py`，`n4m_driver.py` 直通参数）。
+**器械**：**`dm/tools/wait_until.py`**（公共触发器，**已进仓库**，换机器直接可用；索引见 `dm/tools/README*.md`）
++ 四个跑轮脚本已接上（`.work/n4_apk_round.py` / `n4d_shot2.py` / `vklayer_round.py` / `n4k_logcat_round.py`，
+`n4m_driver.py` 直通参数）。换机器时**不必改代码**：`DM_ADB`（adb 路径）/ `DM_SERIAL`（串号）/ `DM_PKG`（包名，
+设备日志路径由它拼出；也可用 `DM_LOG` 直接给）三个环境变量覆盖缺省值。
 
 | 参数 | 缺省 | 含义 |
 |---|---|---|
@@ -698,8 +700,9 @@
 3. **别用 `=== 本次启动 pid` 判"日志是新的"**：它在 11 行配置回显之后（实测 ≈2.2 KB），`head -c 2048` 会漏；
    改用「**文件变短** 或 **第一行换了**」（第一行带启动时刻，每次不同）。
 
-**在哪**：`.work/wait_until.py`（约 160 行，**按仓库约定 `.work` 是 gitignored**）—— 换机器 / 被清掉时照本节
-重写即可（三个原语 + 三条坑 + 参数表都在这儿）；四个跑轮脚本也是同一约定（`.work/n4*.py`）。
+**在哪**：**`dm/tools/wait_until.py`（正本，进仓库、跨机器可用，约 330 行含注释）**；四个跑轮脚本仍在 `.work/`
+（gitignored 的实验脚手架，按仓库约定），它们 `sys.path.insert(ROOT/"dm"/"tools")` 之后 `import wait_until as W`。
+自证脚本同目录：`.work/wait_selftest.py`（打印三个原语在真机上的耗时与读数）。
 
 **口径（不许乱用）**：**只有判据类**（亮度 / 插入明细 / 变体键）可以早停；
 **累计型与统计型**（帧率、`最大空隙`、G1~G4 的字节账、停顿窗口、`绘制 有目标` 累计）**必须 `--no-until` 跑满**，

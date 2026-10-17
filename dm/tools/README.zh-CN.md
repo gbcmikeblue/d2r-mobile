@@ -36,6 +36,7 @@ English: [README.md](README.md)
 | `blackcols.py` | 截图里有没有整列纯黑（画面铺没铺满的检查） |
 | `guirun.sh` | 在图形会话里起一个程序并收集它的输出 |
 | `mini_sync.sh` | 把工作区同步到第二台 Mac 上跑重活（目标机在本机配置里填） |
+| `wait_until.py` | 跑轮时**等"读数出现"**而不是睡固定秒数：读设备上 `latest.log` 的长度/头部/增量，按正则命中即收口，顺带判"App 已退"与"日志没重开"；判据类一轮 50 s ⇒ ≈7 s。见 [docs/rewrite/TOOLS.zh-CN.md](../../docs/rewrite/TOOLS.zh-CN.md) §I |
 
 ## 早期分析用的一次性探针
 

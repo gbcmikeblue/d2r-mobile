@@ -507,7 +507,7 @@ mach-o 段查找一律返回找不到；安卓 SIGSEGV 拿不到 ESR 读写位�
   仪器事实 `TOOLS` B²⁰。
 - **㉒ 工具（2026-10-17 同日落地）：跑轮从"睡固定秒数"改成"等事件"** —— 量出的浪费：N4-o 的 24 轮里首条判据行
   **≈2.1 s**、扫描亮度 **≈3.1 s** 就有，`出图` 到最终值中位 **16.4 s**，而每轮固定等 **49.4 s** ⇒ 平均 **27.8 s/轮纯等**，
-  且 App 已退出（日志 1.1 s）也睡满 50 s。新增 `.work/wait_until.py`（原语：`dev_size` / `dev_head` / `dev_tail` /
+  且 App 已退出（日志 1.1 s）也睡满 50 s。新增 **`dm/tools/wait_until.py`（已进仓库、跨机器可用）**（原语：`dev_size` / `dev_head` / `dev_tail` /
   `dev_since` / `pid_alive` / `snapshot` / `wait_gone` / `wait_run`）+ 四个跑轮脚本接上 `--until / --also /
   --min-secs / --min-frames / --no-until`（`--secs` 变**上限**）。真机自证：同 conf `until@7.0s`（2/2 轮，
   **判据行与 50 s 基线逐字相同**）、废样本 `dead@3.0s`、退路 `--no-until` `timeout@13s`、App 没跑时 `nostart`

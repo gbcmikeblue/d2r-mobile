@@ -36,6 +36,7 @@ Three kinds of things live here. The first you will use when following the front
 | `blackcols.py` | Checks a screenshot for fully black columns (whether the picture fills the screen) |
 | `guirun.sh` | Starts a program inside the graphical session and collects its output |
 | `mini_sync.sh` | Syncs the workspace to a second Mac for heavy runs (the target is set in the local config) |
+| `wait_until.py` | While running a test round, **wait for the reading to appear** instead of sleeping a fixed number of seconds: it polls the device's `latest.log` (size / head / incremental bytes), stops as soon as a regex matches, and also detects "the app already exited" and "the log was not reopened"; a criteria round drops from 50 s to ≈7 s. See [docs/rewrite/TOOLS.zh-CN.md](../../docs/rewrite/TOOLS.zh-CN.md) §I |
 
 ## One-off probes from the early analysis
 

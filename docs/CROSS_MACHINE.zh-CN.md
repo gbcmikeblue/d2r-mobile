@@ -1062,7 +1062,8 @@ PC 侧的路径与工具见第二、三节；这里只说**跑一次并拿到读
 | `.work/vk2_pool_rounds.py` | **N1 起**：把某个探针跑 N 轮（第 1~N−1 轮带 tag 留档、**最后一轮不带 tag = 正式读数**）并打一张"字段 × 轮次"的对照表 ⇒ 一眼看出哪个字段轮间不一致（N1 四轮 29 个字段全一致；N2 判据字段全一致、只有六个时间字段抖动）。**N2 起带 `--probe` 参数**：`--probe vk2_xfer_probe` |
 | `.work/push_dev2.py` | 把设备侧数据推齐（逐文件 + 跳过已存在 + 重试；`spv` 走 tar） |
 | `.work/bg.py` | 把长任务放后台并把输出落盘（前台一条命令会堵住整个回合） |
-| `.work/n4_apk_round.py` | **N4 起**：一轮真机跑法的固定闭环（出包 → 设备端装机 → 推 conf → `force-stop` → `am start` → 等 N 秒 → 拉 `latest.log` → 抽账），读数落 `.work/logs/n4-<tag>.log`（不覆盖） |
+| `.work/n4_apk_round.py` | **N4 起**：一轮真机跑法的固定闭环（出包 → 设备端装机 → 推 conf → `force-stop` → `am start` → **等读数出现**（触发式；`--no-until` 才是跑满 `--secs`）→ 拉 `latest.log` → 抽账），读数落 `.work/logs/n4-<tag>.log`（不覆盖）；页脚有 `停止原因` |
+| **`dm/tools/wait_until.py`** | **2026-10-17 起，★ 进仓库（换机器直接可用，`DM_ADB` / `DM_SERIAL` / `DM_PKG` 三个环境变量覆盖缺省）**：跑轮的公共触发器 —— 轮询设备上 `latest.log`（长度 / 第一行 / 增量字节），正则命中即收口；顺带判"App 已退"（废样本 3 s 收口）与"日志没重开"（不拿上一轮凑结论）。判据类一轮 50 s ⇒ ≈7 s。口径与三条实现坑见 `docs/rewrite/TOOLS.zh-CN.md` §I |
 | `.work/n4d_rounds.py` | **N4-d 起**：顺序跑一批轮（第一轮带 `--build --install`），末尾打跨轮小结（出图峰值 / 最大心跳空隙 / 停住 / 判据行 / 等待站点 / 红行） |
 | `.work/n4d_shot2.py` | **N4-d 第二部分起**：一轮 = 推 conf → 重启 → 等 N 秒 → **截屏** + 完整日志，并把三件自证一起打出来（①启动头 `DM_WIN_SRC` ②**查看器亮度读数** ③心跳）—— **判"屏幕上是不是游戏画面"的专用工具**（`DM_WIN_SRC=0` 时屏幕上是 `paint()` 测试图） |
 | `.work/n4d_view_rounds.py` / `.work/n4d_view0_rounds.py` | 把"查看器打开"的 A′/B′ 各两轮（第 1 级）/ 各一轮（第 0 级）跑完并打跨轮小结 |
