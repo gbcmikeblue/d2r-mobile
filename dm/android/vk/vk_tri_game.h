@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <vulkan/vulkan.h>
 #include "nvn_obj.h"        // tex_t / view_t
+#include "vk_shader.h"      // vk_shader（阶梯要把我们自己的三份着色器包成 vk_shader 交给 vk_pipe_graphics）
 
 // 开关开没开（读一次环境变量，幂等）。开的时候会打一行【查】自证。
 int vk_tri_game_on(void);
@@ -50,3 +51,58 @@ void vk_tri_game_stats(uint64_t *inserts, uint64_t *pipes);
 
 // 开关的文字自证（启动头 / 心跳用）。返回写进 buf 的字节数；返回 0 = 开关关着。
 int vk_tri_game_desc(char *buf, size_t cap);
+
+// ---------------------------------------------------------------------------
+// N4-i：**二分阶梯**（`DM_TRI_LADDER=<档>`；缺省关）——拿 N4-h 这条"已经证明能落屏"的管线当标尺，
+// 把游戏那一刻的输入**一次只接一样**地接上来，看**哪一项让它消失**。设计说明见 vk_tri_game.c。
+// ---------------------------------------------------------------------------
+enum {
+    VK_TRI_LADDER_OFF = 0,
+    VK_TRI_LADDER_VB = 1,      // ① 我们自己的管线 + **游戏的顶点缓冲**（位置取 Location 0）
+    VK_TRI_LADDER_STATE = 2,   // ④ 我们自己的管线 + **游戏那一刻的状态**（拓扑/掩码/混合/剔除/深度）
+    VK_TRI_LADDER_VS = 3,      // ③ **游戏的顶点着色器** + 我们自己的片段着色器（其余全是游戏的）
+    VK_TRI_LADDER_BOTH = 4,    // 对照：**游戏的顶点着色器 + 游戏的片段着色器**（= 原地重放游戏那次绘制）
+    // ⑤ `vsn`：与 ③ 只差一样 —— **不绑描述符集**（把"游戏的描述符/管线布局那一层"单独摘出来）。
+    // 为什么要有它：`vb`（不绑描述符）**落屏**、`vs`（绑描述符）**不落屏**，两档之间差着两样东西
+    // （游戏的顶点着色器模块 vs 描述符/布局），这一档把后一样隔离掉。
+    VK_TRI_LADDER_VSN = 5,
+    // ⑥ `vso`：**游戏的顶点着色器 + 我们自己的状态**（掩码只开附件 0、剔除关、混合关、深度关、不声明深度格式）
+    // —— 与 ③/⑤ 只差"状态与那条管线的声明细节"。三档连起来读：`vb`（我们的 VS + 我们的状态）落屏、
+    // `vso`（游戏的 VS + 我们的状态）、`vsn`（游戏的 VS + 游戏的状态，brute 放开）：
+    //   · `vso` 落屏、`vsn` 不落屏 ⇒ 责任在**状态/声明细节**；
+    //   · 两档都不落屏 ⇒ 责任在**游戏的顶点着色器模块**（配合 `vb` 落屏：顶点数据与流是通的）。
+    VK_TRI_LADDER_VSO = 6,
+};
+
+// `DM_TRI_LADDER` 是哪一档（0 = 关；**仍要 `DM_TRI_IN_GAME` 定"哪一次绘制 / 哪一段通道"**，否则返回 0）。
+int vk_tri_ladder_mode(void);
+
+// 档名的文字（日志用）。
+const char *vk_tri_ladder_name(int mode);
+
+// 这一次（绘制序号 draw_index、这一刻 color0 = color0_ser）该不该插：1 = 可以插。
+// 门与 N4-h 那条路**共用** `DM_TRI_IN_GAME` 的字段与"每段通道只插一次"的标志；但**置标志**要等
+// `vk_tri_ladder_done()`（回放层在"这一档真的画了"之后调）—— 因为还有一道形状判据（三角形族 + 数量 ≥ 3）。
+int vk_tri_ladder_arm(uint64_t draw_index, uint64_t color0_ser);
+
+// 这一档真的画了（回放层调；把"这一段通道已插过"置上）。
+void vk_tri_ladder_done(void);
+
+// 我们自己的三份着色器（包成 `vk_shader` 交给 `vk_pipe_graphics`）：
+//   0 = 全屏三角形 VS（只读 `gl_VertexIndex`，与 N4-h 同一份）、1 = 读顶点缓冲 VS（Location 0）、2 = 纯红 FS。
+// 三份都按需建模块（缺省关时一次都不建）；建不出来返回 NULL（调用方按"这一档没法跑"记一笔）。
+const vk_shader *vk_tri_ladder_shader(int which);
+
+// 阶梯自己的账（插了几次 / 骨架没搭起来几次），心跳那一格用（只在开关打开时出现）。
+void vk_tri_ladder_stats(uint64_t *inserts, uint64_t *nopipe);
+
+// 阶梯这一档**真的画了一次**（由回放层在录完之后调；只计数）。
+void vk_tri_ladder_note(void);
+
+// `DM_TRI_DECL_DS=1`（缺省关）：阶梯自己的状态也**声明游戏那份深度/模板附件格式**
+// （叠在 `vb` 档上就是单变量：声明 vs 不声明）。设计说明见 vk_tri_game.c。
+int vk_tri_decl_ds(void);
+
+// `DM_TRI_MASK_ALL=1`（缺省关）：阶梯自己的状态把**每个**颜色附件的写掩码都开成 0xf
+// （叠在已知落屏的 `vso` 档上就是单变量：只开附件 0 vs 全开）。设计说明见 vk_tri_game.c。
+int vk_tri_mask_all(void);

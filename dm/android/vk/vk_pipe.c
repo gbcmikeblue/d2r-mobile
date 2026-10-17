@@ -460,7 +460,8 @@ static void poly_warn_once(int mode) {
 }
 
 #define GPSO_TAB 192
-typedef struct { vk_gfx_state st; VkPipeline p; int used; } gpso_e;
+// N4-i：条目里多存一份"这个条目当初是按**哪一对着色器**建的"——**只用于只读诊断**（见下面的命中分支）。
+typedef struct { vk_gfx_state st; VkPipeline p; int used; char kvs[VK_SHADER_KEY_LEN + 1], kps[VK_SHADER_KEY_LEN + 1]; } gpso_e;
 static gpso_e g_gpso[GPSO_TAB];
 static uint32_t bytes_hash(const void *p, size_t n) {
     const uint8_t *b = p;
@@ -468,6 +469,25 @@ static uint32_t bytes_hash(const void *p, size_t n) {
     for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
     return h;
 }
+
+// N4-i：**只读**诊断（`DM_PIPEKEY_PROBE=1`，缺省关）——"管线缓存键里没有着色器"这件事有多少次真的发生了。
+// 背景（读代码得到，不是推断）：`vk_gfx_state` 头两个字段是 `vs_key` / `ps_key`，而回放路径里唯一的填表处
+// `gfx_state_fill()` 是 `memset(out, 0, ...)` 之后**只填状态字段**，**从不填这两个键**（全库只有
+// `vk_pipe_probe.c` 填过）⇒ 下面那个 `memcmp(&e->st, st, sizeof *st)` 实际上**不区分子着色器对**：
+// 同一批状态字节上，谁先建管线谁赢，后来那些"状态一样、着色器不同"的绘制会拿到**别人那一对的管线**。
+// 命中时把"条目当初的着色器对"与"这一次要的着色器对"比一下 ⇒ 这个计数就是那件事的发生次数。
+static _Atomic uint64_t g_n_keymiss;
+static int pipekey_probe_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_PIPEKEY_PROBE");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_PIPEKEY_PROBE=1：**只读**——统计「管线缓存命中、但条目当初是按另一对着色器建的」有多少次"
+                   "（缓存键 vk_gfx_state 里 vs_key/ps_key 在回放路径上从没被填过 ⇒ 键里不含着色器）");
+    }
+    return v;
+}
+uint64_t vk_pipe_keymiss(void) { return atomic_load(&g_n_keymiss); }
 
 // DM_NO_DEPTH_TEST：把深度测试**一律关掉**（诊断用）。
 // 为什么值得一试：真机上 34 万次绘制都下发了、目标却读出来全零 —— 而"每个片元都被深度测试挡掉"是最经典的成因之一
@@ -521,7 +541,19 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
     for (uint32_t k = 0; k < GPSO_TAB; k++) {
         gpso_e *e = &g_gpso[(h + k) & (GPSO_TAB - 1)];
         if (!e->used) break;
-        if (!memcmp(&e->st, st, sizeof *st)) return e->p;
+        if (!memcmp(&e->st, st, sizeof *st)) {
+            // N4-i：命中。**只读**地看一眼"这个条目当初是按哪一对着色器建的"（缺省关时一行都不走）
+            if (pipekey_probe_on() && (strcmp(e->kvs, vs->key) || (ps && strcmp(e->kps, ps->key)))) {
+                uint64_t n = atomic_fetch_add(&g_n_keymiss, 1) + 1;
+                if (n <= 8 || (n & 1023) == 0)
+                    LOG("【查】DM_PIPEKEY_PROBE：**管线缓存命中、但着色器不是这一对**（第 %llu 次）—— 条目当初是"
+                        "顶点 %s / 片元 %s，这一次要的是 顶点 %s / 片元 %s（状态：目标 %u 个、拓扑 %d、写掩码[0] %#x）"
+                        "⇒ 这次绘制拿到的是**别人那一对的管线**（校验层不会报：管线与通道是兼容的，只是着色器不是它要的）",
+                        (unsigned long long)n, e->kvs[0] ? e->kvs : "（空）", e->kps[0] ? e->kps : "（空）",
+                        vs->key, ps ? ps->key : "无", st->color_count, (int)st->topo, st->write_mask[0]);
+            }
+            return e->p;
+        }
     }
 
     const vk_shader *one[2] = { vs, ps };
@@ -719,6 +751,10 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         vkDestroyPipeline(vk_dev(), g_gpso[slot].p, NULL);
     }
     g_gpso[slot].st = *st; g_gpso[slot].p = p; g_gpso[slot].used = 1;
+    // N4-i：把"这一条是按哪一对着色器建的"记下来（只读诊断用；不影响任何行为）
+    memcpy(g_gpso[slot].kvs, vs->key, VK_SHADER_KEY_LEN + 1);
+    g_gpso[slot].kps[0] = 0;
+    if (ps) memcpy(g_gpso[slot].kps, ps->key, VK_SHADER_KEY_LEN + 1);
     g_n_gpso++;
     return p;
 }

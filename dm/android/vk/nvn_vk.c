@@ -1366,6 +1366,16 @@ int vk_diag_line(char *buf, size_t cap) {
             if (m > 0) n += m;
             if ((size_t)n > cap) n = (int)cap;
         }
+        // N4-i：**管线缓存键里没有着色器**这件事发生过多少次（只读；`DM_PIPEKEY_PROBE=1` 才增长 ⇒
+        // 缺省关时恒 0 ⇒ 这一行与上一轮**逐字节相同**，第 ㉓ 条）。判读：> 0 ⇒ 有绘制拿到的是
+        // **别人那一对的管线**（那种绘制的顶点着色器不是它要的 ⇒ 几何整片塌掉、零报错 —— 正是
+        // "39k 次绘制一个像素不落、且校验层在 draw 层面一条都不报"的形状）。
+        uint64_t km = vk_pipe_keymiss();
+        if (km && (size_t)n < cap) {
+            int m = snprintf(buf + n, cap - (size_t)n, "；**管线键** 命中但着色器不同 %llu 次", (unsigned long long)km);
+            if (m > 0) n += m;
+            if ((size_t)n > cap) n = (int)cap;
+        }
     }
     return n;
 }
@@ -3078,6 +3088,334 @@ static void gfx_state_fill(vk_gfx_state *out, int topo_prim) {
     }
 }
 
+// ============================================================================
+// N4-i：二分阶梯的"插入"这一半（开关与门在 vk_tri_game.c；这里把某一档真的画出来）
+// ============================================================================
+// 要回答的那句话、四档的定义与判据都写在 vk_tri_game.c 的文件头（那里是"设计"），这里只做"用游戏那一刻的
+// 上下文把这一档画出来"：**我们那条已经证明能落屏的管线当标尺**，一次只多接一样游戏的东西。
+// 为什么这一半必须放这儿：游戏的上下文（影子状态 `g_rs`、描述符分配/写入、`mtl_addr` 反查、当前槽）全在
+// 这个编译单元里，而 `desc_alloc` / `desc_write` 是它的静态函数 —— 与游戏那条路径**用同一段代码**才算单变量。
+static _Atomic uint64_t g_n4i_skipfmt, g_n4i_skipnodraw, g_n4i_skipdesc, g_n4i_skipvb, g_n4i_logs, g_n4i_skipshape;
+
+// ---------------------------------------------------------------------------
+// N4-i：`DM_PIPEKEY=1`（**缺省关**）——把"这一对着色器"写进图形管线状态的键里。
+// 为什么它是一条**修法**而不是新功能：`vk_gfx_state` 头两个字段就是 `vs_key` / `ps_key`（`vk_pipe.h:85`），
+// 而缓存是"整块状态做哈希 + memcmp"（`vk_pipe.c:520-525`）—— 可是回放路径上唯一的填表处
+// `gfx_state_fill()` 是 `memset(out,0,...)` 之后**只填状态**、**从不填这两个键**（全库只有 `vk_pipe_probe.c`
+// 填过）⇒ 那个 `memcmp` 实际上**不区分子着色器对**：同一批状态字节上谁先建管线谁赢，后来"状态一样、
+// 着色器不同"的绘制会拿到**别人那一对的管线**。
+// 这一点与已有读数全都相容：A1 的校验层**不报**（管线与通道是兼容的，只是着色器不是它要的）、
+// N4-e 把光栅化侧全放开也没用（错的着色器算出来的位置在裁剪体之外，跟状态无关）、
+// N4-f 的顶点数据与常量都正常（输入是对的，**管线**是错的）、N4-h 我们自己那条管线（不走这个缓存）能落屏。
+// 判据（本轮写死）：`DM_PIPEKEY_PROBE=1` 的计数 > 0（先量）；打开本开关后 `DM_PASS_PROBE=28` 的已知色
+// 底子上**出现非 152 的值**（后改）。
+static int pipekey_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_PIPEKEY");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_PIPEKEY=1：把这一对着色器**写进图形管线状态的键**（`vs_key`/`ps_key`）——"
+                   "改前这两个字段在回放路径上从没被填过，缓存因此不区分子着色器（只读的计数见 "
+                   "`DM_PIPEKEY_PROBE=1`；打开本开关后**图形管线条数会明显变多**，那是这条修法的直接代价）");
+    }
+    return v;
+}
+
+
+static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gfx_state *st,
+                            const vk_shader *gvs, const vk_shader *gps,
+                            const void *payload, int op, uint32_t att_w, uint32_t att_h,
+                            const VkViewport *gvp, int nvp, const VkRect2D *gsc, int nsc) {
+    int step = vk_tri_ladder_mode();
+    if (!step || !st) return;
+    const char *sname = vk_tri_ladder_name(step);
+    const vk_shader *vs_idx = vk_tri_ladder_shader(0);   // 全屏三角形（只读 gl_VertexIndex）
+    const vk_shader *vs_vb = vk_tri_ladder_shader(1);    // 读游戏顶点缓冲（Location 0）
+    const vk_shader *fs = vk_tri_ladder_shader(2);       // 纯红
+    if (!vs_idx || !vs_vb || !fs) { atomic_fetch_add(&g_n4i_skipnodraw, 1); return; }
+    if (!st->color_count || !att_w || !att_h) { atomic_fetch_add(&g_n4i_skipfmt, 1); return; }
+
+    // ---- 这一次绘制的计数：与游戏路径**同一份载荷、同一套读法** ----
+    uint32_t count = 0, instances = 1, first = 0, base_vertex = 0, base_instance = 0;
+    int indexed = (op == OP_DRAW_IDX);
+    uint64_t ibuf = 0;
+    int itype = -1;
+    if (indexed) {
+        const p_draw_idx *di = (const p_draw_idx *)payload;
+        count = (uint32_t)di->count;
+        instances = di->instances ? (uint32_t)di->instances : 1;
+        base_vertex = (uint32_t)di->base_vertex;
+        base_instance = di->base_instance > 0 ? (uint32_t)di->base_instance : 0;
+        ibuf = di->ibuf; itype = di->itype;
+    } else {
+        const p_draw *d = (const p_draw *)payload;
+        count = (uint32_t)d->count; first = (uint32_t)d->first;
+    }
+
+    // ---- 形状判据：这一次绘制**适不适合当采样点**（三角形族 + 数量 ≥ 3）----
+    // 为什么必须有它：N4-i 第一轮 `@28` 打到的第一次绘制是「**3 个索引的线带**」（拓扑 3 = LINE_STRIP；
+    // 与苹果侧 nvn_mtl.m:4419-4423 的映射同一套：0=点 1=线 3=线带 4/7=三角形 5=三角带 6=三角扇）——
+    // 那种形状就算落下来也只是几个像素，**回答不了"哪一项让它消失"**（坑 ⑨：判据本身要能回答题目）。
+    // 不满足就**不消费**"这一段通道已插过"的标记，继续往这一段通道里的下一次绘制走。
+    int tri_family = (st->topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+                      st->topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                      st->topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN);
+    if (!tri_family || count < 3) {
+        uint64_t sn = atomic_fetch_add(&g_n4i_skipshape, 1) + 1;
+        if (sn <= 16 || (sn & 1023) == 0)
+            LOG("【查】DM_TRI_LADDER=%s：第 %llu 个候选**形状不合适**（游戏第 %llu 次绘制、拓扑 %d、%s %u）"
+                "⇒ 这一档这次不插、继续找这一段通道里的下一次绘制（三角形族且数量 ≥ 3 才当采样点）",
+                sname, (unsigned long long)sn, (unsigned long long)draw_index, (int)st->topo,
+                indexed ? "索引数" : "顶点数", count);
+        return;
+    }
+
+    // ---- 我们自己的状态基（与 N4-h 那条最简管线同一口径：只写附件 0、深度/剔除/混合全关）----
+    static vk_gfx_state ours;
+    memset(&ours, 0, sizeof ours);
+    ours.topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ours.color_count = st->color_count > 8 ? 8 : st->color_count;
+    memcpy(ours.color, st->color, sizeof(VkFormat) * ours.color_count);
+    ours.write_mask[0] = 0xf;
+    ours.samples = st->samples ? st->samples : (uint32_t)VK_SAMPLE_COUNT_1_BIT;
+    ours.cull = VK_CULL_MODE_NONE;
+    ours.front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    ours.poly = VK_POLYGON_MODE_FILL;
+    // `DM_TRI_DECL_DS=1`：也声明游戏那份深度/模板附件格式（单变量，见 vk_tri_game.c 里那段说明）
+    if (vk_tri_decl_ds()) { ours.depth_fmt = st->depth_fmt; ours.stencil_fmt = st->stencil_fmt; }
+    // `DM_TRI_MASK_ALL=1`：把**每个**颜色附件的写掩码都开成 0xf（单变量，见 vk_tri_game.c 里那段说明）
+    if (vk_tri_mask_all()) for (uint32_t i2 = 0; i2 < ours.color_count && i2 < 8; i2++) ours.write_mask[i2] = 0xf;
+    memcpy(ours.attr, st->attr, sizeof ours.attr);       // `vb` 档要用（我们的 VS 只声明 Location 0）
+    memcpy(ours.stream, st->stream, sizeof ours.stream);
+
+    // ---- 这一档用哪一对着色器 / 哪份状态 / 要不要描述符与顶点缓冲 ----
+    const vk_shader *use_vs = NULL, *use_ps = NULL;
+    const vk_gfx_state *use_st = &ours;
+    const vk_shader *pair[2] = { NULL, NULL };
+    int need_desc = 0, vb_mode = 0, draw3 = 0;
+    if (step == VK_TRI_LADDER_VB) { use_vs = vs_vb; use_ps = fs; vb_mode = 1; }
+    else if (step == VK_TRI_LADDER_STATE) { use_vs = vs_idx; use_ps = fs; use_st = st; draw3 = 1; }
+    else if (step == VK_TRI_LADDER_VS) { use_vs = gvs; use_ps = fs; use_st = st; need_desc = 1; vb_mode = 2; }
+    // `vsn`：与 `vs` **只差一样** —— 不绑描述符集（描述符/布局这一层单独摘出来）
+    else if (step == VK_TRI_LADDER_VSN) { use_vs = gvs; use_ps = fs; use_st = st; need_desc = 0; vb_mode = 2; }
+    // `vso`：**游戏的顶点着色器 + 我们自己的状态**（不绑描述符）—— 与 `vs`/`vsn` 只差"状态与声明细节"
+    else if (step == VK_TRI_LADDER_VSO) { use_vs = gvs; use_ps = fs; need_desc = 0; vb_mode = 2; }   // use_st 保持 &ours
+    else { use_vs = gvs; use_ps = gps; use_st = st; need_desc = 1; vb_mode = 2; }
+    if (!use_vs || use_vs->mod == VK_NULL_HANDLE || (need_desc && (!use_ps || use_ps->mod == VK_NULL_HANDLE))) {
+        atomic_fetch_add(&g_n4i_skipnodraw, 1);
+        return;
+    }
+    // ---- 阶梯自己的状态副本：**键里显式带上"我们这一对"** ----
+    // 为什么必须有它（本轮真机现场）：图形管线缓存是**按整块状态字节**命中的（`vk_pipe.c:520-525`），
+    // 而 `vk_gfx_state` 的 `vs_key`/`ps_key` 在回放路径上**从没被填过**（`gfx_state_fill` 只 memset）
+    // ⇒ `vs`/`both` 档传的是**游戏那一刻的状态**，"游戏那一对"与"我们这一对"会撞进同一条条目：
+    // 第一次跑 `vs` 档时拿到的其实是**游戏自己那条管线**（读数是"整片 152"，但那是一次空实验）。
+    // 这里把键写成我们这一对 ⇒ 与游戏那一条**必然不同** ⇒ 这一档真的用我们这条管线。
+    // （`DM_PIPEKEY=1` 打开后游戏的键也被填上，这一层保护依然成立。）
+    static vk_gfx_state kst;
+    kst = *st;
+    snprintf(kst.vs_key, sizeof kst.vs_key, "%s", use_vs->key);
+    if (use_ps) snprintf(kst.ps_key, sizeof kst.ps_key, "%s", use_ps->key);
+    else kst.ps_key[0] = 0;
+    snprintf(ours.vs_key, sizeof ours.vs_key, "%s", use_vs->key);
+    if (use_ps) snprintf(ours.ps_key, sizeof ours.ps_key, "%s", use_ps->key);
+    if (use_st == st) use_st = &kst;
+    if (step == VK_TRI_LADDER_VB && !ours.attr[0].valid) {
+        atomic_fetch_add(&g_n4i_skipvb, 1);
+        LOG("【黄】DM_TRI_LADDER=vb：游戏那一刻**没有绑 Location 0 的属性**（这一档的顶点位置就取它）"
+            "——这一档这次没插（游戏第 %llu 次绘制）", (unsigned long long)draw_index);
+        return;
+    }
+
+    VkPipeline pl = vk_pipe_graphics(use_vs, use_ps, use_st);
+    if (!pl) {
+        atomic_fetch_add(&g_n4i_skipnodraw, 1);
+        LOG("【黄】DM_TRI_LADDER=%s：这一档的图形管线**没建出来**（游戏第 %llu 次绘制、顶点 %s、"
+            "目标 %u 个、拓扑 %d）——这一档这次没插",
+            sname, (unsigned long long)draw_index, use_vs->key, use_st->color_count, (int)use_st->topo);
+        return;
+    }
+
+    // ---- 描述符（只有 `vs` / `both` 档要：用的就是游戏那条路径的 desc_alloc/desc_write 与绑定表）----
+    static vk_pipe_bind binds[VK_SPV_MAXB];
+    static uint32_t dyn[VK_SPV_MAXB];
+    VkDescriptorSet sets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkPipelineLayout lay = VK_NULL_HANDLE;
+    int nd = -1;
+    if (need_desc) {
+        pair[0] = use_vs; pair[1] = use_ps;
+        VkDescriptorSetLayout dsl0 = vk_pipe_set_layout_set(pair, 2, 0);
+        VkDescriptorSetLayout dsl1 = vk_pipe_set_layout_set(pair, 2, 1);
+        lay = vk_pipe_layout(pair, 2);
+        if (dsl0) sets[0] = desc_alloc(g_cur_slot, dsl0);
+        if (dsl1) sets[1] = desc_alloc(g_cur_slot, dsl1);
+        int nb = (sets[0] && sets[1]) ? vk_pipe_binds(pair, 2, binds, VK_SPV_MAXB) : -1;
+        nd = nb >= 0 ? desc_write(sets, pair, 2, binds, nb, dyn) : -1;
+        if (nd < 0 || !lay) {
+            atomic_fetch_add(&g_n4i_skipdesc, 1);
+            LOG("【黄】DM_TRI_LADDER=%s：描述符集/布局写不出来（游戏第 %llu 次绘制、顶点 %s）"
+                "——这一档这次没插（游戏路径同一处也会跳过）", sname, (unsigned long long)draw_index, use_vs->key);
+            return;
+        }
+    }
+
+    // ---- 顶点缓冲：`vb` 档绑"我们的状态里那一条属性所在的流"；`vs`/`both` 档照游戏路径绑"用到的每一条流" ----
+    uint32_t vb_bound = 0, vb_first_stream = 0;
+    uint64_t vb_first_addr = 0;
+    if (vb_mode == 1) {
+        uint32_t s2 = ours.attr[0].stream & 15;
+        void *bb = NULL; uint64_t bo = 0;
+        vb_first_stream = s2; vb_first_addr = g_rs.vbuf[s2].address;
+        if (!g_rs.vbuf[s2].address || !mtl_addr(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size, &bb, &bo)) {
+            atomic_fetch_add(&g_n4i_skipvb, 1);
+            LOG("【黄】DM_TRI_LADDER=vb：游戏的顶点流 %u（Location 0 所在）**绑不上**（address %#llx）"
+                "——这一档这次没插", s2, (unsigned long long)g_rs.vbuf[s2].address);
+            return;
+        }
+        vk2_touch_cpu_(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size);
+        VkBuffer vb = (VkBuffer)bb; VkDeviceSize vo = (VkDeviceSize)bo;
+        vkCmdBindVertexBuffers(cb, s2, 1, &vb, &vo);
+        vb_bound = 1;
+    } else if (vb_mode == 2) {
+        uint8_t used[16] = { 0 };
+        for (int i2 = 0; i2 < 16; i2++) if (st->attr[i2].valid) used[st->attr[i2].stream & 15] = 1;
+        for (int s2 = 0; s2 < 16; s2++) if (used[s2]) {
+            void *bb = NULL; uint64_t bo = 0;
+            if (mtl_addr(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size, &bb, &bo)) {
+                vk2_touch_cpu_(g_rs.vbuf[s2].address, g_rs.vbuf[s2].size);
+                VkBuffer vb = (VkBuffer)bb; VkDeviceSize vo = (VkDeviceSize)bo;
+                vkCmdBindVertexBuffers(cb, (uint32_t)s2, 1, &vb, &vo);
+                if (!vb_bound) { vb_bound = 1; vb_first_stream = (uint32_t)s2; vb_first_addr = g_rs.vbuf[s2].address; }
+            }
+        }
+    }
+    // 索引缓冲：与游戏路径同一套（8 位索引在 Vulkan 核心不支持 ⇒ 那一档按跳过记）
+    int ib_ok = 0;
+    if (indexed) {
+        VkIndexType it = VK_INDEX_TYPE_UINT16;
+        if (itype == 2) it = VK_INDEX_TYPE_UINT32;
+        else if (itype != 1) it = VK_INDEX_TYPE_UINT16;
+        if (itype != 1 && itype != 2) {
+            atomic_fetch_add(&g_n4i_skipdesc, 1);
+            LOG("【黄】DM_TRI_LADDER=%s：这一次是**索引绘制**而索引类型 %d 这里不支持（只支持 16/32 位）"
+                "——这一档这次没插", sname, itype);
+            return;
+        }
+        void *ib = NULL; uint64_t io = 0;
+        if (mtl_addr(ibuf, 4, &ib, &io)) {
+            vk2_touch_cpu_(ibuf, (uint64_t)(count > 0 ? count : 1) * 4);
+            vkCmdBindIndexBuffer(cb, (VkBuffer)ib, (VkDeviceSize)io, it);
+            ib_ok = 1;
+        }
+    }
+    VkBuffer dum = vk_pipe_dummy_buffer();
+    if (dum) { VkDeviceSize z = 0; vkCmdBindVertexBuffers(cb, VK_PIPE_DUMMY_BIND, 1, &dum, &z); }
+
+    // ---- 视口/裁剪：铺满附件（游戏那一刻的已经是这个值；插完按游戏原值恢复，与 N4-h 同口径）----
+    VkViewport full = { 0.0f, 0.0f, (float)att_w, (float)att_h, 0.0f, 1.0f };
+    VkRect2D fullsc = { { 0, 0 }, { att_w, att_h } };
+    vkCmdSetViewport(cb, 0, 1, &full);
+    vkCmdSetScissor(cb, 0, 1, &fullsc);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    if (need_desc && nd >= 0) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, 2, sets, (uint32_t)nd, dyn);
+    if (draw3) {
+        vkCmdDraw(cb, 3, 1, 0, 0);
+    } else if (indexed && ib_ok) {
+        vkCmdDrawIndexed(cb, count, instances, 0, base_vertex, base_instance);
+    } else if (indexed) {
+        LOG("【黄】DM_TRI_LADDER=%s：索引缓冲绑不上（%#llx）——这一档这次没插", sname, (unsigned long long)ibuf);
+        vkCmdSetViewport(cb, 0, (uint32_t)(nvp > 0 ? nvp : 1), gvp);
+        vkCmdSetScissor(cb, 0, 1, gsc);
+        return;
+    } else {
+        vkCmdDraw(cb, count, 1, first, 0);
+    }
+    if (nvp > 0) vkCmdSetViewport(cb, 0, (uint32_t)nvp, gvp);
+    if (nsc > 0) vkCmdSetScissor(cb, 0, 1, gsc);
+    vk_tri_ladder_note();
+    vk_tri_ladder_done();   // "这一段通道已插过"只在**真的画了**之后才置上
+
+    uint64_t k = atomic_fetch_add(&g_n4i_logs, 1) + 1;
+    if (k == 1 || (k & 255) == 0) {
+        // 自证：① 这一档接上了什么（绑定号/格式/步长/偏移/地址）② 游戏那一刻的状态 ③ 这一档真的画了
+        char vt[300]; int vo = 0; vt[0] = 0;
+        if (vb_mode == 1) {
+            uint32_t f = ours.attr[0].nvn_fmt, off = ours.attr[0].offset;
+            uint32_t stride = ours.stream[vb_first_stream].stride ? ours.stream[vb_first_stream].stride : 1;
+            uint64_t vsize = g_rs.vbuf[vb_first_stream].size;
+            const uint8_t *base = (const uint8_t *)(uintptr_t)vk2_ptr_mask((uintptr_t)vb_first_addr);
+            void *bb = NULL; uint64_t bo = 0;
+            // 索引绘制要**按索引**取"真正被画的那几个顶点"：直接读流的前三个可能一个都不在那个三角形上
+            uint32_t vidx[3] = { 0, 1, 2 };
+            int have_idx = 0;
+            if (indexed && ibuf) {
+                void *ib = NULL; uint64_t io = 0;
+                uint64_t nb = (itype == 2) ? 12u : 6u;
+                if (mtl_addr(ibuf, nb, &ib, &io)) {
+                    const uint8_t *ip = (const uint8_t *)(uintptr_t)vk2_ptr_mask((uintptr_t)ibuf);
+                    for (int i2 = 0; i2 < 3; i2++) {
+                        uint32_t v = 0;
+                        if (itype == 2) memcpy(&v, ip + (uint64_t)i2 * 4, 4);
+                        else { uint16_t h; memcpy(&h, ip + (uint64_t)i2 * 2, 2); v = h; }
+                        vidx[i2] = v + base_vertex;
+                    }
+                    have_idx = 1;
+                }
+            }
+            if (vb_first_addr && mtl_addr(vb_first_addr, vsize, &bb, &bo)) {
+                for (int i2 = 0; i2 < 3; i2++) {
+                    uint64_t voff = (uint64_t)off + (uint64_t)vidx[i2] * stride;
+                    float c[4]; int nc = 0;
+                    if (voff + 16 > vsize) { vtx_cat(vt, sizeof vt, &vo, "%s顶点%u（越出流范围 %llu 字节）", i2 ? " " : "", vidx[i2], (unsigned long long)vsize); continue; }
+                    if (!vtx_decode(base + voff, f, c, &nc)) {
+                        vtx_cat(vt, sizeof vt, &vo, "%s（格式 %#x 不是浮点/归一化类）", i2 ? " " : "", f);
+                        break;
+                    }
+                    vtx_cat(vt, sizeof vt, &vo, "%s顶点%u=(%g,%g,%g,%g)", i2 ? " " : "", vidx[i2],
+                            (double)c[0], (double)c[1], (double)c[2], (double)c[3]);
+                }
+            } else vtx_cat(vt, sizeof vt, &vo, "（读不了）");
+            LOG("【查】DM_TRI_LADDER=vb：顶点流 %u 格式 %#x 步长 %u 偏移 %u 地址 %#llx（流 %llu 字节）；"
+                "解码 %s前 3 个顶点：%s（clamp 是量尺：只要取到非零数据就一定看得见；"
+                "但直通型的顶点着色器把属性直接当裁剪坐标 ⇒ w 与取值范围才决定它在不在裁剪体里）",
+                vb_first_stream, f, ours.stream[vb_first_stream].stride, off, (unsigned long long)vb_first_addr,
+                (unsigned long long)vsize, have_idx ? "（按索引）" : "（流的前三个）", vo ? vt : "（空）");
+        }
+        LOG("【查】DM_TRI_LADDER=%s：第 %llu 次插入 —— 游戏第 %llu 次绘制（%s，%s %u 个、实例 %u、first/base %u）；"
+            "顶点 游戏 %s、我们 %s；片元 游戏 %s；目标 %u 个（VkFormat %d/%d、采样 %u）；"
+            "**游戏那一刻的状态** 拓扑 %d、写掩码[0] %#x、混合%s（%d→%d）、深度%s/%s（格式 %d/%d）、剔除 %d、"
+            "游戏视口 %d 个（%.0fx%.0f）、裁剪 %d 个；"
+            "**这一档接上的**：%s；我们这条管线 写掩码[0] %#x、深度关、剔除关、混合关；"
+            "**真的画了**：%s（累计 %llu 次）",
+            sname, (unsigned long long)k, (unsigned long long)draw_index,
+            indexed ? "索引绘制" : "非索引绘制", indexed ? "索引数" : "顶点数", count, instances, indexed ? base_vertex : first,
+            gvs ? gvs->key : "无", use_vs->key, gps ? gps->key : "无",
+            use_st->color_count, use_st->color_count > 0 ? (int)use_st->color[0] : -1,
+            use_st->color_count > 1 ? (int)use_st->color[1] : -1, use_st->samples,
+            (int)use_st->topo, use_st->write_mask[0], use_st->blend_en[0] ? "开" : "关",
+            (int)use_st->src_rgb[0], (int)use_st->dst_rgb[0],
+            use_st->depth_test ? "开" : "关", use_st->depth_write ? "写" : "不写",
+            (int)use_st->depth_fmt, (int)use_st->stencil_fmt, (int)use_st->cull,
+            nvp, nvp > 0 ? (double)gvp[0].width : 0.0, nvp > 0 ? (double)gvp[0].height : 0.0, nsc,
+            (step == VK_TRI_LADDER_VB) ? "游戏的顶点缓冲（Location 0）"
+          : (step == VK_TRI_LADDER_STATE) ? "游戏那一刻的状态（拓扑/掩码/混合/剔除/深度）"
+          : (step == VK_TRI_LADDER_VS) ? "游戏的描述符 + 顶点缓冲（与游戏路径同一段代码）"
+          : (step == VK_TRI_LADDER_VSN) ? "游戏的顶点着色器 + 顶点缓冲（**故意不绑描述符集**：把描述符/布局这一层单独摘出来）"
+          : (step == VK_TRI_LADDER_VSO) ? "游戏的顶点着色器 + 顶点缓冲，但状态用**我们自己的**（掩码只开附件 0、剔除/混合/深度全关、不声明深度格式）"
+          : "游戏的顶点着色器 + 游戏的片段着色器 + 描述符 + 顶点缓冲（= 原地重放游戏那次绘制）",
+            ours.write_mask[0],
+            draw3 ? "vkCmdDraw(3)（全屏三角形）" : (indexed && ib_ok ? "vkCmdDrawIndexed（照游戏的计数）" : "vkCmdDraw（照游戏的计数）"),
+            (unsigned long long)atomic_load(&g_n4i_logs));
+        if (k == 1)
+            LOG("【查】DM_TRI_LADDER：跳过计数（形状不合适 %llu / 管线没建出来 %llu / 目标或附件尺寸不适用 %llu / "
+                "描述符写不出 %llu / 顶点流绑不上 %llu）——每一档的「没插」都能归到一条上",
+                (unsigned long long)atomic_load(&g_n4i_skipshape), (unsigned long long)atomic_load(&g_n4i_skipnodraw),
+                (unsigned long long)atomic_load(&g_n4i_skipfmt), (unsigned long long)atomic_load(&g_n4i_skipdesc),
+                (unsigned long long)atomic_load(&g_n4i_skipvb));
+    }
+}
+
+
 // 命令流解释器：与 Metal 侧同形（OP_JUMP / OP_CALL 构成的小程序）。CPU 可见副作用按语义执行，
 // 渲染类 op 目前只计数——每次提交报一次分布，按实测的频次决定实现次序。
 // The command stream interpreter, shaped like the Metal one (a small program of OP_JUMP / OP_CALL). CPU-visible
@@ -3353,6 +3691,13 @@ void mtl_exec(const uint8_t *p) {
                 break;
             }
             gfx_state_fill(&stv, d->prim);
+            // N4-i：`DM_PIPEKEY=1`（缺省关）——把这一对着色器写进状态的键（见上面 pipekey_on 的说明）。
+            // 必须在 `vk_pipe_graphics` 之前、且**只改这两个字段**（它们只参与缓存键，不参与任何状态解释）。
+            if (pipekey_on() && shs[0]) {
+                snprintf(stv.vs_key, sizeof stv.vs_key, "%s", shs[0]->key);
+                stv.ps_key[0] = 0;
+                if (shs[1]) snprintf(stv.ps_key, sizeof stv.ps_key, "%s", shs[1]->key);
+            }
             // 没有渲染目标的绘制：把"前面发生了什么"打出来（只打前三次，够看清形态；打多了会把日志淹掉）
             // A draw with no render targets: print "what came before" (only the first three, enough to see the shape;
             // more would drown the log)
@@ -3483,10 +3828,20 @@ void mtl_exec(const uint8_t *p) {
                     // the same attachments (off by default; see vk_tri_game.h). It goes *after* the game's draw
                     // because our pipeline has culling/blending/depth off, so it lands on top of whatever the game
                     // wrote -- which is the cleanest thing to read "did it land at all" from.
-                    if (wrote)
-                        vk_tri_game_try_draw(cb, k + 1, (const tex_t *const *)g_rs.color, g_rs.cview,
-                                             g_rs.has_cview, g_rs.ncolor, g_att_w0, g_att_h0, stv.samples,
-                                             g_rs.vp, g_rs.nvp, g_rs.sc, g_rs.nsc);
+                    if (wrote) {
+                        // N4-i：阶梯（`DM_TRI_LADDER`）开着时走阶梯、**不**走 N4-h 那条路（一次只多接一样地二分）；
+                        // 阶梯关着时 N4-h 那条路**一字未改**。两条路共用 `DM_TRI_IN_GAME` 的门与"每段通道插一次"。
+                        int lstep = vk_tri_ladder_mode();
+                        if (lstep) {
+                            uint64_t c0 = g_rs.color[0] ? g_rs.color[0]->serial : 0;
+                            if (vk_tri_ladder_arm(k + 1, c0))
+                                n4i_ladder_draw(cb, k + 1, &stv, shs[0], shs[1], (const void *)a, (int)h.op,
+                                                g_att_w0, g_att_h0, g_rs.vp, g_rs.nvp, g_rs.sc, g_rs.nsc);
+                        } else
+                            vk_tri_game_try_draw(cb, k + 1, (const tex_t *const *)g_rs.color, g_rs.cview,
+                                                 g_rs.has_cview, g_rs.ncolor, g_att_w0, g_att_h0, stv.samples,
+                                                 g_rs.vp, g_rs.nvp, g_rs.sc, g_rs.nsc);
+                    }
                 } else atomic_fetch_add(&g_desc_skip, 1);
             } else if (pl) atomic_fetch_add(&g_desc_skip, 1);
             if (wrote) atomic_fetch_add(&g_desc_draws, 1);

@@ -64,6 +64,12 @@ void vk_pipe_stats(uint64_t *set_layouts, uint64_t *layouts, uint64_t *cpso, uin
 // meaning is stated in the log and the docs.
 void vk_pipe_note_external_gfx(void);
 
+// N4-i（**只读**诊断）：图形管线缓存里"**命中、但条目当初是按另一对着色器建的**"发生过多少次。
+// 只在 `DM_PIPEKEY_PROBE=1` 时增长（缺省关 ⇒ 恒 0 ⇒ 心跳那一行与上一轮逐字节相同，第 ㉓ 条）。
+// 背景见 vk_pipe.c 里 `pipekey_probe_on()` 上方那段：`vk_gfx_state` 的 `vs_key`/`ps_key` 在回放路径上
+// **从没被填过**，所以那个按整块状态做的 `memcmp` 实际上不区分子着色器。
+uint64_t vk_pipe_keymiss(void);
+
 // DM_RASTER_BRUTE（诊断，缺省关）：光栅化侧那几个开关的总闸。nvn_vk.c 用它决定"要不要在绘制前把
 // 动态视口/裁剪铺满附件"（另一半在 vk_pipe.c 里打开深度/模板/剔除/混合/写掩码）。
 // DM_RASTER_BRUTE (a diagnostic, off by default): the master switch for the raster-side ones. nvn_vk.c uses

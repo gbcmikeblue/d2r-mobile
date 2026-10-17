@@ -15,7 +15,8 @@
 #include "vk_device.h"
 #include "vk_pipe.h"
 #include "vk_tex.h"
-#include "vk_tri_game_spv.h"   // 内联 SPIR-V（由 .work/n4h_tri_spv.py 生成，自证 .work/logs/tri-ingame-spv.txt）
+#include "vk_tri_game_spv.h"      // 内联 SPIR-V（由 .work/n4h_tri_spv.py 生成，自证 .work/logs/tri-ingame-spv.txt）
+#include "vk_tri_ladder_spv.h"    // N4-i 的那一份（由 .work/n4i_ladder_spv.py 生成，自证 .work/logs/tri-ladder-spv.txt）
 #include "dm.h"
 
 #include <stdatomic.h>
@@ -31,6 +32,12 @@ static int g_use_game_vp;        // 1 = 用游戏那一刻的动态视口/裁剪
 static int g_in_pass;            // 这一段通道里已经插过（每段通道只插一次）
 
 static _Atomic uint64_t g_inserts, g_pipes, g_nofmt, g_nopipe;
+
+// N4-i 的阶梯（定义在文件末尾；这里先声明，因为心跳那一格与开关自证都要用）
+static void ladder_parse(void);
+static const char *ladder_name(int m);
+static int g_ladder_parsed, g_ladder;
+static _Atomic uint64_t g_n4i_ins, g_n4i_nopipe;
 
 // 管线按「颜色附件格式序列 + 采样数」缓存（游戏一帧里格式通常只有一两种）
 #define TRI_PIPE_MAX 8
@@ -87,6 +94,17 @@ int vk_tri_game_desc(char *buf, size_t cap) {
     int n = snprintf(buf, cap, "自绘 插入 %llu 次 / 管线 %llu 条 / 没有对应格式 %llu / 建管线失败 %llu",
                      (unsigned long long)atomic_load(&g_inserts), (unsigned long long)atomic_load(&g_pipes),
                      (unsigned long long)atomic_load(&g_nofmt), (unsigned long long)atomic_load(&g_nopipe));
+    // N4-i：阶梯开着时，心跳那一行**多一格**（只在开关打开时出现 ⇒ 缺省关时这一行与上一轮逐字节相同，第 ㉓ 条）
+    if (n > 0 && (size_t)n < cap) {
+        ladder_parse();
+        if (g_ladder) {
+            int m = snprintf(buf + n, cap - (size_t)n, " / 阶梯 %s 插入 %llu / 骨架没搭起来 %llu",
+                             ladder_name(g_ladder),
+                             (unsigned long long)atomic_load(&g_n4i_ins),
+                             (unsigned long long)atomic_load(&g_n4i_nopipe));
+            if (m > 0) n += m;
+        }
+    }
     return n > 0 ? n : 0;
 }
 
@@ -281,4 +299,176 @@ int vk_tri_game_try_draw(VkCommandBuffer cb, uint64_t draw_index,
             (unsigned long long)gpso, (unsigned long long)nfail, (unsigned long long)atomic_load(&g_pipes));
     }
     return 1;
+}
+
+// ============================================================================
+// N4-i：**二分阶梯**（`DM_TRI_LADDER=<档>`；缺省关）
+// ============================================================================
+// 要回答的那句话（写死）：**"游戏那些绘制自己的哪一项输入，让它产不出片元？"**
+//
+// 为什么这样问（证据链，全部是前几轮的真机读数）：
+//   · N4-h：**通道 / 附件 / 布局 / 清 / 视口裁剪**那一层是好的 —— 我们自己的最简管线（全屏三角形 + 纯红）
+//     画进游戏的通道里就**落屏**（序号 28 第 0/1 级从整片 152 变成整片 85）；
+//   · N4-g：声明 9 个裁剪/剔除距离却从不写**不足以致命**（我们自己的三角形两个变体都落屏）；
+//   · N4-e：光栅化侧逐条排除（`DM_RASTER_BRUTE` 全放开仍是整片已知色）；N4-f：顶点数据与常量缓冲都正常；
+//   · A1（真机校验层）：16 种 VUID 里**没有一条是 draw 层面的用法错误**。
+//   ⇒ 剩下的问题只能是：**游戏自己那一刻的着色器 / 顶点输入那一层**。
+//
+// 做法：每档只比上一档**多接一样**，其余照旧用我们那条已经证明能落屏的管线：
+//   ① `vb`    ：我们自己的管线 + **游戏的顶点缓冲**（顶点位置取 `Location 0`）；
+//   ② `state` ：我们自己的管线 + **游戏那一刻的状态**（拓扑 / 写掩码 / 混合 / 剔除 / 深度，全从 `gfx_state_fill` 来）；
+//   ③ `vs`    ：**游戏的顶点着色器** + 我们自己的片段着色器，其余（状态 / 描述符 / 顶点缓冲 / 绘制调用）全是游戏的；
+//   ④ `both`  ：**游戏的顶点着色器 + 游戏的片段着色器**（= 把游戏那一次绘制原地重放一遍）——
+//               它是 ③ 的**对照**：④ 与 ③ 之间**只差"片段着色器模块"这一样东西**。
+//               离线那一刀已经给出线索：全库 4556 份片段着色器里 **4189 份带 `OpKill`**（"杀片元"这条路在游戏里是
+//               常态），而 `OpKill` 发生在光栅化**之后** —— N4-e 那些"把光栅化侧放开"的开关**碰不到它**。
+//
+// 判据（与 N4-h 逐字相同，写死）：`DM_PASS_PROBE=28` 的已知色底子上**出现非 152 的值 = 落屏**；
+// **哪一档开始不落屏，责任就落在那一项上**。每档都打一行自证：**这一档到底接上了什么**（绑定号 / 格式 /
+// 步长 / 偏移 / 地址）+ **游戏那一刻的状态**（掩码 / 混合 / 深度 / 剔除 / 拓扑）+ **这一档真的画了** ——
+// 没有这一行，"没落屏"就分不清是"没接上"还是"被状态吃掉"。
+//
+// 副作用纪律（照 N4-h）：只改**通道内的动态视口 / 裁剪**，插完立刻按游戏原值恢复；不动游戏的静态状态、
+// 不碰附件、不改布局、不提交；缺省关时一行都不走（N4-h 那条路径一字未改）。
+
+static const char *ladder_name(int m) {
+    switch (m) {
+        case VK_TRI_LADDER_VB: return "vb";
+        case VK_TRI_LADDER_STATE: return "state";
+        case VK_TRI_LADDER_VS: return "vs";
+        case VK_TRI_LADDER_BOTH: return "both";
+        case VK_TRI_LADDER_VSN: return "vsn";
+        case VK_TRI_LADDER_VSO: return "vso";
+    }
+    return "off";
+}
+
+const char *vk_tri_ladder_name(int mode) { return ladder_name(mode); }
+
+static void ladder_parse(void) {
+    if (g_ladder_parsed) return;
+    g_ladder_parsed = 1;
+    const char *e = getenv("DM_TRI_LADDER");
+    if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off")) return;
+    if (!strcmp(e, "vb")) g_ladder = VK_TRI_LADDER_VB;
+    else if (!strcmp(e, "state")) g_ladder = VK_TRI_LADDER_STATE;
+    else if (!strcmp(e, "vs")) g_ladder = VK_TRI_LADDER_VS;
+    else if (!strcmp(e, "both")) g_ladder = VK_TRI_LADDER_BOTH;
+    else if (!strcmp(e, "vsn")) g_ladder = VK_TRI_LADDER_VSN;
+    else if (!strcmp(e, "vso")) g_ladder = VK_TRI_LADDER_VSO;
+    else {
+        LOG("【黄】DM_TRI_LADDER=%s 认不出来（只认识 vb / state / vs / both / vsn / vso）——按关处理", e);
+        return;
+    }
+    LOG("【查】DM_TRI_LADDER=%s：拿 N4-h 那条**已经证明能落屏**的管线当标尺，把游戏那一刻的输入"
+        "**一次只接一样**地接上来（① `vb` = 我们自己的管线 + 游戏的顶点缓冲；② `state` = 我们自己的管线 + "
+        "游戏那一刻的状态；③ `vs` = 游戏的顶点着色器 + 我们自己的片段着色器；④ `both` = 游戏的顶点着色器 + "
+        "游戏的片段着色器 = 对照组）。判据：`DM_PASS_PROBE=28` 的已知色底子上**出现非 152 的值 = 这一档仍然落屏**；"
+        "**哪一档开始不落屏，责任就落在那一项上**。四档都用 `DM_TRI_IN_GAME` 定「哪一次绘制 / 哪一段通道」",
+        e);
+}
+
+int vk_tri_ladder_mode(void) {
+    if (!vk_tri_game_on()) return VK_TRI_LADDER_OFF;   // 仍由 DM_TRI_IN_GAME 定"哪一次绘制 / 哪一段通道"
+    ladder_parse();
+    return g_ladder;
+}
+
+int vk_tri_ladder_arm(uint64_t draw_index, uint64_t color0_ser) {
+    if (!vk_tri_game_on()) return 0;
+    ladder_parse();
+    if (!g_ladder) return 0;
+    if (g_in_pass) return 0;                            // 这一段通道里已经插过一次（与 N4-h 共用同一个标志）
+    if (g_draw_no && g_draw_no != draw_index) return 0;
+    if (g_color0_ser && color0_ser != g_color0_ser) return 0;
+    // **这一档这次真的画了**才把"这一段通道已插过"置上（由回放层在录完之后调 `vk_tri_ladder_done`）：
+    // 因为还有一道"这一次绘制适不适合当采样点"的形状判据（三角形族 + 索引/顶点数 ≥ 3）——形状不合适时
+    // 要能继续往这一段通道里的**下一次**绘制走，否则一次 3 个索引的线带就把整段通道的采样点占掉
+    // （N4-i 第一轮的真机现场：`@28` 打到的正是"索引数 3 的线带"，那一次读数回答不了题目）。
+    return 1;
+}
+
+void vk_tri_ladder_done(void) { g_in_pass = 1; }
+
+// 我们自己的三份着色器（包成 vk_shader 交给 vk_pipe_graphics；缺省关时一次都不建）
+static vk_shader g_lsh[3];
+static vk_spv_in g_lsh_in[1];
+static int g_lsh_made;
+
+const vk_shader *vk_tri_ladder_shader(int which) {
+    if (which < 0 || which > 2) return NULL;
+    if (!g_lsh_made) {
+        g_lsh_made = 1;
+        VkDevice dev = vk_dev();
+        if (dev == VK_NULL_HANDLE) return NULL;
+        VkShaderModuleCreateInfo ci;
+        memset(&ci, 0, sizeof ci);
+        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        ci.codeSize = (size_t)VK_TRI_GAME_VS_WORDS * 4; ci.pCode = VK_TRI_GAME_VS;
+        VkResult r0 = vkCreateShaderModule(dev, &ci, NULL, &g_lsh[0].mod);
+        snprintf(g_lsh[0].key, sizeof g_lsh[0].key, "n4i-tri-vs");
+        g_lsh[0].stage = VK_STAGE_VS;
+        ci.codeSize = (size_t)VK_TRI_LADDER_VB_VS_WORDS * 4; ci.pCode = VK_TRI_LADDER_VB_VS;
+        VkResult r1 = vkCreateShaderModule(dev, &ci, NULL, &g_lsh[1].mod);
+        snprintf(g_lsh[1].key, sizeof g_lsh[1].key, "n4i-tri-vbvs");
+        g_lsh[1].stage = VK_STAGE_VS;
+        // 与 ladder.vert.spv 的 `layout(location = 0) in vec4 a_p` 逐项对上（自证见 .work/logs/tri-ladder-spv.txt 第二节）
+        g_lsh_in[0].loc = 0; g_lsh_in[0].comps = 4; g_lsh_in[0].ctype = VK_SPV_F32;
+        g_lsh[1].in = g_lsh_in; g_lsh[1].nin = 1;
+        ci.codeSize = (size_t)VK_TRI_GAME_FS_WORDS * 4; ci.pCode = VK_TRI_GAME_FS;
+        VkResult r2 = vkCreateShaderModule(dev, &ci, NULL, &g_lsh[2].mod);
+        snprintf(g_lsh[2].key, sizeof g_lsh[2].key, "n4i-tri-fs");
+        g_lsh[2].stage = VK_STAGE_PS;
+        if (r0 != VK_SUCCESS) g_lsh[0].mod = VK_NULL_HANDLE;
+        if (r1 != VK_SUCCESS) g_lsh[1].mod = VK_NULL_HANDLE;
+        if (r2 != VK_SUCCESS) g_lsh[2].mod = VK_NULL_HANDLE;
+        LOG("【查】DM_TRI_LADDER：我们自己的三份着色器模块（全屏三角形 VS / 读顶点缓冲 VS / 纯红 FS）建出来了没"
+            " —— VkResult %d / %d / %d（0 = 建出来了）；读顶点缓冲那份声明的输入 = Location 0、4 分量 float"
+            "（与 .work/logs/tri-ladder-spv.txt 的自证逐项对上）", (int)r0, (int)r1, (int)r2);
+    }
+    return g_lsh[which].mod ? &g_lsh[which] : NULL;
+}
+
+void vk_tri_ladder_stats(uint64_t *inserts, uint64_t *nopipe) {
+    if (inserts) *inserts = atomic_load(&g_n4i_ins);
+    if (nopipe) *nopipe = atomic_load(&g_n4i_nopipe);
+}
+
+void vk_tri_ladder_note(void) { atomic_fetch_add(&g_n4i_ins, 1); }
+
+// `DM_TRI_DECL_DS=1`（**缺省关**）：阶梯自己的状态也**声明游戏那份深度/模板附件格式**。
+// 为什么要这一档：`vb`（我们的状态，**不声明**深度格式）**两轮落屏**，而 `vs`/`vsn`（游戏的状态，
+// `vk_pipe_graphics` 会把 `prc.depthAttachmentFormat = st->depth_fmt` 声明上）**三轮不落屏** ——
+// 两者之间还差着"**深度/模板附件格式声明**"这一样（Vulkan 的规矩：管线如果不做深度/模板测试，
+// 声明成 UNDEFINED 是合法的；一旦声明了就必须与当前通道的附件格式一致，否则这条绘制是未定义的）。
+// 用法：把它叠在**已知落屏**的 `vb` 档上 ⇒ 单变量（声明/不声明）。
+// `DM_TRI_MASK_ALL=1`（**缺省关**）：阶梯自己的状态把**每个颜色附件**的写掩码都开成 0xf。
+// 为什么要这一档（本轮最重要的一条待证）：`vso`（游戏的顶点着色器 + 我们自己的状态、掩码**只开附件 0**）
+// **落屏**（整片 85），而 `vsn`（同一对管线，但状态用游戏那一刻的 + `DM_RASTER_BRUTE=1`）
+// **不落屏** —— 两者在我方管线上的差别只剩"**没被片段着色器写的附件 1/2 也声明了 `0xf`**"（brute 强制的）、
+// 以及 `frontFace`（剔除关时不起作用）。这一档就是把它变成单变量：
+//   · `vso` + 本开关**不落屏** ⇒ **"对没有片段输出的附件声明非 0 写掩码"这条绘制会整个丢掉**（这台驱动上的行为）；
+//   · 落屏 ⇒ 那个差别不是它，得回到 `frontFace` / 其它声明逐一排（`vs`/`vsn` 那两档另找解释）。
+// 这条如果成立，**对 N4-e 的 `DM_RASTER_BRUTE` 也是个大前提**：brute 把**每个**附件的掩码都开成 0xf ⇒
+// 对"片段着色器只写一部分附件"的管线，brute 会把能落屏的绘制**弄丢**（那种轮里的"仍无内容"因此不能全算数）。
+int vk_tri_mask_all(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_TRI_MASK_ALL");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_TRI_MASK_ALL=1：阶梯自己的管线把**每个**颜色附件的写掩码都开成 0xf"
+                   "（叠在 `vso` 档上就是单变量：只开附件 0 vs 全开）");
+    }
+    return v;
+}
+
+int vk_tri_decl_ds(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_TRI_DECL_DS");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_TRI_DECL_DS=1：阶梯自己的管线也**声明游戏那份深度/模板附件格式**"
+                   "（叠在 `vb` 档上就是单变量：声明 vs 不声明）");
+    }
+    return v;
 }
