@@ -17,6 +17,7 @@
 #include "vk_tex.h"
 #include "vk_tri_game_spv.h"      // 内联 SPIR-V（由 .work/n4h_tri_spv.py 生成，自证 .work/logs/tri-ingame-spv.txt）
 #include "vk_tri_ladder_spv.h"    // N4-i 的那一份（由 .work/n4i_ladder_spv.py 生成，自证 .work/logs/tri-ladder-spv.txt）
+#include "vk_tri_fs_cap_spv.h"    // N4-k 的三个片段着色器变体（由 .work/n4k_fs_variants.py 生成，自证 .work/logs/n4k-fs-variants.txt）
 #include "dm.h"
 
 #include <stdatomic.h>
@@ -347,6 +348,9 @@ static const char *ladder_name(int m) {
         case VK_TRI_LADDER_BOTH: return "both";
         case VK_TRI_LADDER_VSN: return "vsn";
         case VK_TRI_LADDER_VSO: return "vso";
+        case VK_TRI_LADDER_VSF: return "vsf";
+        case VK_TRI_LADDER_VSFN: return "vsfn";
+        case VK_TRI_LADDER_VSFULL: return "vsfull";
     }
     return "off";
 }
@@ -364,16 +368,55 @@ static void ladder_parse(void) {
     else if (!strcmp(e, "both")) g_ladder = VK_TRI_LADDER_BOTH;
     else if (!strcmp(e, "vsn")) g_ladder = VK_TRI_LADDER_VSN;
     else if (!strcmp(e, "vso")) g_ladder = VK_TRI_LADDER_VSO;
+    else if (!strcmp(e, "vsf")) g_ladder = VK_TRI_LADDER_VSF;
+    else if (!strcmp(e, "vsfn")) g_ladder = VK_TRI_LADDER_VSFN;
+    else if (!strcmp(e, "vsfull")) g_ladder = VK_TRI_LADDER_VSFULL;
     else {
-        LOG("【黄】DM_TRI_LADDER=%s 认不出来（只认识 vb / state / vs / both / vsn / vso）——按关处理", e);
+        LOG("【黄】DM_TRI_LADDER=%s 认不出来（只认识 vb / state / vs / both / vsn / vso / vsf / vsfn / vsfull）——按关处理", e);
         return;
     }
     LOG("【查】DM_TRI_LADDER=%s：拿 N4-h 那条**已经证明能落屏**的管线当标尺，把游戏那一刻的输入"
         "**一次只接一样**地接上来（① `vb` = 我们自己的管线 + 游戏的顶点缓冲；② `state` = 我们自己的管线 + "
         "游戏那一刻的状态；③ `vs` = 游戏的顶点着色器 + 我们自己的片段着色器；④ `both` = 游戏的顶点着色器 + "
-        "游戏的片段着色器 = 对照组）。判据：`DM_PASS_PROBE=28` 的已知色底子上**出现非 152 的值 = 这一档仍然落屏**；"
-        "**哪一档开始不落屏，责任就落在那一项上**。四档都用 `DM_TRI_IN_GAME` 定「哪一次绘制 / 哪一段通道」",
+        "游戏的片段着色器 = 对照组；⑤ `vsn` = ③ 但不绑描述符；⑥ `vso` = 游戏的顶点着色器 + 我们自己的状态；"
+        "⑦ `vsf` = 游戏的顶点着色器 + **游戏的片段着色器** + 我们自己的状态（N4-k）；⑧ `vsfn` = ⑦ 但不绑描述符；"
+        "⑨ `vsfull` = **我们自己的全屏三角形 VS** + 游戏的片段着色器 + 我们自己的状态（与 ⑦ 只差几何））。"
+        "判据：`DM_PASS_PROBE=28` 的已知色底子上**出现非 152 的值 = 这一档仍然落屏**；"
+        "**哪一档开始不落屏，责任就落在那一项上**。各档都用 `DM_TRI_IN_GAME` 定「哪一次绘制 / 哪一段通道」",
         e);
+}
+
+// N4-k：`DM_TRI_FS_VARIANT=<cap|3out|3out_cap>`（缺省关）——把阶梯用的那份**我们自己的**纯红 FS 换成变体。
+// 要回答的那句话写死在 vk_tri_game.h 上：**"只多一条 capability 声明会不会让绘制消失？"**
+// 全库 4556 份游戏片段着色器**全部**声明 `FragmentShaderPixelInterlockEXT`，而设备上没有
+// `VK_EXT_fragment_shader_interlock`（N4-g 的能力探针：165 个扩展里没有它）⇒ 这个 capability 永远无法被满足。
+// 这一档就是"我们自己那份能落屏的纯红 FS" + 那一条声明（指令一条没多）⇒ 单变量。
+static int g_fsv_parsed, g_fsv;
+
+int vk_tri_fs_variant(void) {
+    if (g_fsv_parsed) return g_fsv;
+    g_fsv_parsed = 1;
+    const char *e = getenv("DM_TRI_FS_VARIANT");
+    if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off")) return 0;
+    if (!strcmp(e, "cap")) g_fsv = 1;
+    else if (!strcmp(e, "3out")) g_fsv = 2;
+    else if (!strcmp(e, "3out_cap")) g_fsv = 3;
+    else if (!strcmp(e, "iface")) g_fsv = 4;
+    else if (!strcmp(e, "blit")) g_fsv = 5;
+    else if (!strcmp(e, "if_ubo")) g_fsv = 6;
+    else if (!strcmp(e, "if_smp")) g_fsv = 7;
+    else {
+        LOG("【黄】DM_TRI_FS_VARIANT=%s 认不出来（只认识 cap / 3out / 3out_cap / iface / blit / if_ubo / if_smp）——按关处理", e);
+        return 0;
+    }
+    LOG("【查】DM_TRI_FS_VARIANT=%s：阶梯用的那份**我们自己的**片段着色器换成变体 %d"
+        "（1 = 纯红 + `OpCapability FragmentShaderPixelInterlockEXT` + `OpExtension \"SPV_EXT_fragment_shader_interlock\"`、"
+        "指令一条没多；2 = 纯红但写 3 个输出 Location 0/1/2；3 = 两者合起来；"
+        "4 = **与游戏那份逐项相同的描述符接口**（2 个 UBO + 3 张 sampler2D）+ 极简代码（输出恒纯红）；"
+        "5 = 同接口 + **照游戏那份反汇编逐条复刻的算术**；6 = **只声明两个 UBO**；7 = **只声明三张 sampler2D**）"
+        "—— 叠在**已知落屏**的 `vso` 档上就是单变量；判据：已知色底盘 152 上出现非 152 = 仍然落屏。"
+        "自证见 .work/logs/n4k-fs-variants.txt（`spirv-dis` 的 capability / 输出装饰 / 接口逐项对照）", e, g_fsv);
+    return g_fsv;
 }
 
 int vk_tri_ladder_mode(void) {
@@ -423,16 +466,31 @@ const vk_shader *vk_tri_ladder_shader(int which) {
         // 与 ladder.vert.spv 的 `layout(location = 0) in vec4 a_p` 逐项对上（自证见 .work/logs/tri-ladder-spv.txt 第二节）
         g_lsh_in[0].loc = 0; g_lsh_in[0].comps = 4; g_lsh_in[0].ctype = VK_SPV_F32;
         g_lsh[1].in = g_lsh_in; g_lsh[1].nin = 1;
-        ci.codeSize = (size_t)VK_TRI_GAME_FS_WORDS * 4; ci.pCode = VK_TRI_GAME_FS;
+        // N4-k：片段那一份按 `DM_TRI_FS_VARIANT` 选（缺省 = N4-h 那份纯红，一字不改）
+        int fsv = vk_tri_fs_variant();
+        if (fsv == 1) { ci.codeSize = (size_t)VK_TRI_FS_CAP_WORDS * 4; ci.pCode = VK_TRI_FS_CAP; }
+        else if (fsv == 2) { ci.codeSize = (size_t)VK_TRI_FS_3OUT_WORDS * 4; ci.pCode = VK_TRI_FS_3OUT; }
+        else if (fsv == 3) { ci.codeSize = (size_t)VK_TRI_FS_3OUT_CAP_WORDS * 4; ci.pCode = VK_TRI_FS_3OUT_CAP; }
+        else if (fsv == 4) { ci.codeSize = (size_t)VK_TRI_FS_IFACE_WORDS * 4; ci.pCode = VK_TRI_FS_IFACE; }
+        else if (fsv == 5) { ci.codeSize = (size_t)VK_TRI_FS_BLIT_WORDS * 4; ci.pCode = VK_TRI_FS_BLIT; }
+        else if (fsv == 6) { ci.codeSize = (size_t)VK_TRI_FS_IF_UBO_WORDS * 4; ci.pCode = VK_TRI_FS_IF_UBO; }
+        else if (fsv == 7) { ci.codeSize = (size_t)VK_TRI_FS_IF_SMP_WORDS * 4; ci.pCode = VK_TRI_FS_IF_SMP; }
+        else { ci.codeSize = (size_t)VK_TRI_GAME_FS_WORDS * 4; ci.pCode = VK_TRI_GAME_FS; }
         VkResult r2 = vkCreateShaderModule(dev, &ci, NULL, &g_lsh[2].mod);
-        snprintf(g_lsh[2].key, sizeof g_lsh[2].key, "n4i-tri-fs");
+        snprintf(g_lsh[2].key, sizeof g_lsh[2].key, "n4i-tri-fs%s",
+                 fsv == 1 ? "-cap" : fsv == 2 ? "-3out" : fsv == 3 ? "-3outcap"
+               : fsv == 4 ? "-iface" : fsv == 5 ? "-blit"
+               : fsv == 6 ? "-ifubo" : fsv == 7 ? "-ifsmp" : "");
         g_lsh[2].stage = VK_STAGE_PS;
         if (r0 != VK_SUCCESS) g_lsh[0].mod = VK_NULL_HANDLE;
         if (r1 != VK_SUCCESS) g_lsh[1].mod = VK_NULL_HANDLE;
         if (r2 != VK_SUCCESS) g_lsh[2].mod = VK_NULL_HANDLE;
         LOG("【查】DM_TRI_LADDER：我们自己的三份着色器模块（全屏三角形 VS / 读顶点缓冲 VS / 纯红 FS）建出来了没"
             " —— VkResult %d / %d / %d（0 = 建出来了）；读顶点缓冲那份声明的输入 = Location 0、4 分量 float"
-            "（与 .work/logs/tri-ladder-spv.txt 的自证逐项对上）", (int)r0, (int)r1, (int)r2);
+            "（与 .work/logs/tri-ladder-spv.txt 的自证逐项对上）；**片段那一份的变体 = %d**"
+            "（0 = 纯红缺省 / 1 = +interlock capability / 2 = 3 个输出 / 3 = 两者 / "
+            "4 = 游戏的描述符接口 + 极简代码 / 5 = 同接口 + 复刻游戏算术；见 DM_TRI_FS_VARIANT）",
+            (int)r0, (int)r1, (int)r2, fsv);
     }
     return g_lsh[which].mod ? &g_lsh[which] : NULL;
 }

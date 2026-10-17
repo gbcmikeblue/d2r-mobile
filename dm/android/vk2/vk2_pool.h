@@ -181,6 +181,12 @@ void vk2_pool_del(void *mem);
 // histogram and logs (details for the first few). len == 0 is treated as one byte.
 int  vk2_addr(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off);
 
+// N4-k：`VkBuffer` → 它作为池块时的**字节数**（找不到返回 0 = 不是池的块）。
+// 用途只有一个：把 UBO 描述符的范围从 `VK_WHOLE_SIZE` 收到 `min(maxUniformBufferRange, 块剩余字节)`
+// （见 `nvn_vk.c` 的 `DM_UBO_RANGE`）。块是 960 MB，而 uniform buffer 的范围不得超过
+// `maxUniformBufferRange`——这是规范要求，也是 N4-k 量到的"绘制一个像素不落"的那一条。
+uint64_t vk2_buf_bytes(VkBuffer buf);
+
 // N4：按**客体地址**标脏（回放层的绑定点与拷贝点用的就是这两个）。反查 → 把对应的池内偏移标脏；
 // 命中返回 1，没落在池里返回 0（**不报红**：绑定点的地址常常落在池外，那是正常情形）。
 //   ① `vk2_touch_cpu`：**"这段接下来要被 GPU 用了，而它可能被 CPU 写过"** —— 绑定点（VB/IB/UBO/SSBO/贴图）

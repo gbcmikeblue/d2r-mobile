@@ -84,6 +84,19 @@ const vk2_pool *vk2_pool_at(int i) {
     pthread_mutex_unlock(&g_mu);
     return p;
 }
+// N4-k：`VkBuffer` → **块的字节数**（找不到 = 0，表示"不是池里的块"）。
+// 为什么要有它：`nvn_vk.c` 的 `desc_write` 要把 UBO 描述符的范围从 `VK_WHOLE_SIZE` 收到
+// `min(maxUniformBufferRange, 块剩余字节)`（`DM_UBO_RANGE=1`）；"块剩余多少"只有这一层知道。
+uint64_t vk2_buf_bytes(VkBuffer buf) {
+    if (buf == VK_NULL_HANDLE) return 0;
+    uint64_t out = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_npool && !out; i++)
+        for (int k = 0; k < g_pools[i].nchunk; k++)
+            if (g_pools[i].chunk[k].buf == buf) { out = (uint64_t)g_pools[i].chunk[k].size; break; }
+    pthread_mutex_unlock(&g_mu);
+    return out;
+}
 vk2_dirty *vk2_pool_dirty(int i) {
     vk2_dirty *d = NULL;
     pthread_mutex_lock(&g_mu);

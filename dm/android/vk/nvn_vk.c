@@ -2528,6 +2528,44 @@ static int texel_off_by_env(void) {
     return once;
 }
 
+// ===========================================================================
+// N4-k：`DM_UBO_RANGE=1`（**缺省关**）—— 把"指向池块"的 UBO 描述符的**范围**从 `VK_WHOLE_SIZE` 收到
+// `min(maxUniformBufferRange, 块剩余字节)`。
+//
+// 为什么（本轮真机读数，N4-k）：`vsfull` 档（**我们自己的**全屏三角形 + **我们自己的**片段着色器 + 我们自己的
+// 状态）三轮整片 85 = 落屏；把片段着色器换成**游戏那份**三轮整片 152 = 一个像素不落；而**我们自己写的**
+// 一份"接口与游戏那份逐项相同、代码只有一句 `o0 = 纯红`"的片段着色器（`DM_TRI_FS_VARIANT=iface`）
+// **也整片 152** ⇒ **不是着色器的代码，是它声明的绑定**。
+// 三条绑定里唯一不合规的那一条就在这儿：`desc_write` 给 UBO 描述符写的范围是 **`VK_WHOLE_SIZE`**，
+// 而缓冲是池的**块**（960 MB）⇒ 有效范围 960 MB ≫ `maxUniformBufferRange`（本机 65536）。
+// 规范要求**uniform buffer 的范围不得超过 `maxUniformBufferRange`**；旧路（`make_pool_buffer`）的块本来就
+// 带 UBO 位（N4-b 的批注把这条"块内小段另绑一个小缓冲"的合规做法留档待将来），而**描述符范围**这一层
+// 一直没人查过。判据（写死）：叠在 `iface` 档上，**已知色底盘 152 上出现非 152 = 这条修法成立**。
+static int ubo_range_clamp_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_UBO_RANGE");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_UBO_RANGE=1：指向池块的 **UBO 描述符范围** 从 VK_WHOLE_SIZE 收到 "
+                   "min(maxUniformBufferRange, 块剩余字节)。为什么：块是 960 MB，而 uniform buffer 的范围不得超过 "
+                   "maxUniformBufferRange（本机 65536）—— 规范要求；本轮 N4-k 量到「绑上游戏的片段着色器"
+                   "（或我们那份接口相同、代码极简的 FS）」时整片不落屏，而「不绑任何描述符」时落屏");
+    }
+    return v;
+}
+
+// `maxUniformBufferRange`（只问一次）
+static uint64_t ubo_range_cap(void) {
+    static uint64_t cap;
+    if (!cap) {
+        VkPhysicalDeviceProperties p;
+        memset(&p, 0, sizeof p);
+        if (vk_phys() != VK_NULL_HANDLE) vkGetPhysicalDeviceProperties(vk_phys(), &p);
+        cap = p.limits.maxUniformBufferRange ? p.limits.maxUniformBufferRange : 65536u;
+    }
+    return cap;
+}
+
 static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n,
                       const vk_pipe_bind *b, int nb, uint32_t *dyn) {
     // 一屏最多 64 条绑定，用静态数组（mtl_exec 递归，不能用大栈帧 | see the note on gfx_state_fill）
@@ -2621,7 +2659,28 @@ static int desc_write(VkDescriptorSet sets[2], const vk_shader *const *sh, int n
                 // should be aligned and a misaligned one is reported once.
                 uint64_t al = off & 255u;
                 if (al) { static int said; if (!said++) LOG("【黄】缓冲地址没按 256 对齐（偏移 %llu）：按对齐下取整 + 动态偏移补", (unsigned long long)off); }
-                bi[nw] = (VkDescriptorBufferInfo){ (VkBuffer)buf, off - al, VK_WHOLE_SIZE };
+                // N4-k：**UBO 的范围**（`DM_UBO_RANGE=1`，缺省关）—— 见上面 `ubo_range_clamp_on()` 那段说明。
+                // 块是 960 MB，而 `VK_WHOLE_SIZE` 会让这条 uniform buffer 的有效范围变成 960 MB
+                // ≫ `maxUniformBufferRange`（本机 65536）⇒ 规范不允许；本轮量到"只要片段着色器真的**读**这条
+                // UBO，这次绘制就一个像素都不落"。收到 `min(上限, 块剩余字节)` 之后就是一条合规的描述符。
+                uint64_t rng = VK_WHOLE_SIZE;
+                if (ubo_range_clamp_on() && b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+                    uint64_t cap = ubo_range_cap();
+                    uint64_t base = off - al;
+                    uint64_t bs = vk2_buf_bytes((VkBuffer)buf);       // 0 = 不是池块（宿主自己的缓冲，照旧）
+                    if (bs) {
+                        uint64_t rem = bs > base ? bs - base : 0;
+                        rng = (rem && rem < cap) ? rem : cap;
+                        static _Atomic uint64_t ncl;
+                        uint64_t k = atomic_fetch_add(&ncl, 1) + 1;
+                        if (k <= 4 || (k & 4095) == 0)
+                            LOG("【查】DM_UBO_RANGE：binding %u 的 UBO 范围 %llu 字节（块 %llu、块内偏移 %llu；"
+                                "上限 %llu）—— 第 %llu 条（VK_WHOLE_SIZE 在这里是 960 MB，超 maxUniformBufferRange）",
+                                b[i].binding, (unsigned long long)rng, (unsigned long long)bs,
+                                (unsigned long long)base, (unsigned long long)cap, (unsigned long long)k);
+                    }
+                }
+                bi[nw] = (VkDescriptorBufferInfo){ (VkBuffer)buf, off - al, rng };
                 dyn[nd++] = (uint32_t)al;
             }
             w.descriptorType = b[i].type;
@@ -3280,6 +3339,20 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
     else if (step == VK_TRI_LADDER_VSN) { use_vs = gvs; use_ps = fs; use_st = st; need_desc = 0; vb_mode = 2; }
     // `vso`：**游戏的顶点着色器 + 我们自己的状态**（不绑描述符）—— 与 `vs`/`vsn` 只差"状态与声明细节"
     else if (step == VK_TRI_LADDER_VSO) { use_vs = gvs; use_ps = fs; need_desc = 0; vb_mode = 2; }   // use_st 保持 &ours
+    // N4-k：`vsf` = **游戏的顶点着色器 + 游戏的片段着色器 + 我们自己的状态**（描述符照 `both` 绑上）。
+    // 这是 `vso`（我们的 FS）与 `both`（游戏的状态 + 游戏的 FS）之间的那一格：
+    //   · `vsf` 落屏 ⇒ 游戏的 FS 模块本身没问题（责任在"FS 与游戏状态的组合/声明细节"）；
+    //   · `vsf` 不落屏而 `vso` 落屏 ⇒ 责任落在**游戏的片段着色器模块**上（两者只差 FS 这一样）。
+    // 描述符为什么绑：游戏那份 FS 要 `OpImageSample` 三张贴图，不绑描述符集时采样未定义（引入新变量）；
+    // 而描述符这条路已由 `vs` 档（我们的 FS + 游戏状态 + 描述符，叠 N4-j 修法）实测落屏 ⇒ 绑上才是单变量。
+    else if (step == VK_TRI_LADDER_VSF) { use_vs = gvs; use_ps = gps; need_desc = 1; vb_mode = 2; }   // use_st 保持 &ours
+    // `vsfn`：与 `vsf` 只差"不绑描述符集"（把游戏 FS 的绑定表那一层单独摘出来）
+    else if (step == VK_TRI_LADDER_VSFN) { use_vs = gvs; use_ps = gps; need_desc = 0; vb_mode = 2; }
+    // N4-k ⑨ `vsfull`：**我们自己的全屏三角形 VS** + **游戏的片段着色器** + 我们自己的状态 + 描述符。
+    // 与 `vsf` 只差几何这一样（VS 换成 N4-h 那份只读 `gl_VertexIndex` 的全屏三角形、`vkCmdDraw(3)`）：
+    // 仍然 152 ⇒ **这份片段着色器模块在这台驱动上产不出片元**（与几何无关）；落屏 ⇒ 回到几何链上找。
+    else if (step == VK_TRI_LADDER_VSFULL) { use_vs = vs_idx; use_ps = gps; need_desc = 1; draw3 = 1; }
+    else if (step == VK_TRI_LADDER_BOTH) { use_vs = gvs; use_ps = gps; use_st = st; need_desc = 1; vb_mode = 2; }
     else { use_vs = gvs; use_ps = gps; use_st = st; need_desc = 1; vb_mode = 2; }
     if (!use_vs || use_vs->mod == VK_NULL_HANDLE || (need_desc && (!use_ps || use_ps->mod == VK_NULL_HANDLE))) {
         atomic_fetch_add(&g_n4i_skipnodraw, 1);
@@ -3482,6 +3555,9 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
           : (step == VK_TRI_LADDER_VS) ? "游戏的描述符 + 顶点缓冲（与游戏路径同一段代码）"
           : (step == VK_TRI_LADDER_VSN) ? "游戏的顶点着色器 + 顶点缓冲（**故意不绑描述符集**：把描述符/布局这一层单独摘出来）"
           : (step == VK_TRI_LADDER_VSO) ? "游戏的顶点着色器 + 顶点缓冲，但状态用**我们自己的**（掩码只开附件 0、剔除/混合/深度全关、不声明深度格式）"
+          : (step == VK_TRI_LADDER_VSF) ? "游戏的顶点着色器 + **游戏的片段着色器** + 描述符 + 顶点缓冲，但状态用**我们自己的**（= N4-k：与 `vso` 只差 FS 这一样）"
+          : (step == VK_TRI_LADDER_VSFN) ? "同 `vsf`，但**故意不绑描述符集**（把游戏 FS 的绑定表单独摘出来）"
+          : (step == VK_TRI_LADDER_VSFULL) ? "**我们自己的全屏三角形 VS** + **游戏的片段着色器** + 我们的状态 + 描述符（= 与 `vsf` 只差几何这一样）"
           : "游戏的顶点着色器 + 游戏的片段着色器 + 描述符 + 顶点缓冲（= 原地重放游戏那次绘制）",
             ours.write_mask[0],
             draw3 ? "vkCmdDraw(3)（全屏三角形）" : (indexed && ib_ok ? "vkCmdDrawIndexed（照游戏的计数）" : "vkCmdDraw（照游戏的计数）"),

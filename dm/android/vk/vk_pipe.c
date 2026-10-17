@@ -60,6 +60,64 @@ static VkShaderStageFlags stage_flag(int st) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// N4-k（TOOLS §H.3）：`DM_PIPE_DUMP=1`（**缺省关**）——在 `vkCreateGraphicsPipelines` **之前**把**最终结构体**
+// 逐字段打一行：`gfx_state_desc()` 打的是**影子状态**（`vk_gfx_state`），而真正交给驱动的是这里拼出来的
+// `VkGraphicsPipelineCreateInfo` 与它挂着的那几个 `VkPipeline*StateCreateInfo`。`poly` 那条 bug 的形态正是
+// "**状态表对、翻译那一步错**"，这一行专治这一类（代价 ≈ 30 行、一轮读数、不改时序、不装层）。
+// 节流：**前 32 条 + 每满 256 条一条**。第一版是"前 8 + 每 2048"，而一轮只有 ~86~200 条图形管线 ⇒
+// **绘制 84 那条 3 附件的管线一条都没打出来**（它排在 8 条之后、又永远到不了 2048）——坑 ⑱/㉒的又一次现场：
+// 节流必须按"这一轮实际会发生多少"定。
+// ---------------------------------------------------------------------------
+static int pipe_dump_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_PIPE_DUMP");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_PIPE_DUMP=1：每次建图形管线前把**最终结构体**逐字段打一行"
+                   "（polygonMode / cullMode / frontFace / depthBias / rasterizerDiscard / 各附件的格式与写掩码与混合 / "
+                   "深度模板格式 / 动态状态）；节流 = 前 32 条 + 每满 256 条一条");
+    }
+    return v;
+}
+
+static void pipe_dump(const VkGraphicsPipelineCreateInfo *ci, const VkPipelineRasterizationStateCreateInfo *rs,
+                      const VkPipelineMultisampleStateCreateInfo *ms, const VkPipelineDepthStencilStateCreateInfo *ds,
+                      const VkPipelineColorBlendStateCreateInfo *cbs, const VkPipelineRenderingCreateInfo *prc,
+                      const VkPipelineInputAssemblyStateCreateInfo *ia, const vk_shader *vs, const vk_shader *ps,
+                      uint32_t na, uint32_t nb, uint32_t ndiv) {
+    static _Atomic uint64_t n;
+    uint64_t k = atomic_fetch_add(&n, 1) + 1;
+    if (k > 32 && (k & 255) != 0) return;
+    char at[260]; int ao = 0; at[0] = 0;
+    for (uint32_t i = 0; i < cbs->attachmentCount && i < 8; i++) {
+        const VkPipelineColorBlendAttachmentState *a = &cbs->pAttachments[i];
+        int w = snprintf(at + ao, sizeof at - (size_t)ao, "%s#%u 格式 %d 掩码 %#x 混合%s(%d→%d op %d/%d)",
+                         i ? "；" : "", i, (int)(prc->pColorAttachmentFormats ? prc->pColorAttachmentFormats[i] : -1),
+                         (unsigned)a->colorWriteMask, a->blendEnable ? "开" : "关",
+                         (int)a->srcColorBlendFactor, (int)a->dstColorBlendFactor, (int)a->colorBlendOp, (int)a->alphaBlendOp);
+        if (w <= 0 || (size_t)(ao + w) >= sizeof at) break;
+        ao += w;
+    }
+    if (!ao) snprintf(at, sizeof at, "（没有颜色附件）");
+    LOG("【查】管线最终结构体（第 %llu 条）：顶点 %s 片元 %s；阶段 %u；拓扑 %d（重启 %d）；"
+        "**光栅化** polygonMode %d、cullMode %d、frontFace %d、rasterizerDiscard %d、depthClamp %d、"
+        "lineWidth %g；**深度偏置** en %d（%g/%g/%g）；"
+        "**深度模板** test %d write %d op %d、stencil %d、格式 %d/%d；采样 %d、a2c %d；"
+        "颜色附件 %u → %s；动态状态 %u 个；顶点输入 属性 %u 条 / 流 %u 条 / divisor %u 条",
+        (unsigned long long)k, vs ? vs->key : "无", ps ? ps->key : "无", ci->stageCount,
+        (int)ia->topology, ia->primitiveRestartEnable ? 1 : 0,
+        (int)rs->polygonMode, (int)rs->cullMode, (int)rs->frontFace,
+        rs->rasterizerDiscardEnable ? 1 : 0, rs->depthClampEnable ? 1 : 0, (double)rs->lineWidth,
+        rs->depthBiasEnable ? 1 : 0, (double)rs->depthBiasConstantFactor, (double)rs->depthBiasClamp,
+        (double)rs->depthBiasSlopeFactor,
+        ds->depthTestEnable ? 1 : 0, ds->depthWriteEnable ? 1 : 0, (int)ds->depthCompareOp,
+        ds->stencilTestEnable ? 1 : 0, (int)prc->depthAttachmentFormat, (int)prc->stencilAttachmentFormat,
+        (int)ms->rasterizationSamples, ms->alphaToCoverageEnable ? 1 : 0,
+        cbs->attachmentCount, at, ci->pDynamicState ? ci->pDynamicState->dynamicStateCount : 0,
+        na, nb, ndiv);
+}
+
 // 往合并表里加一条：同号则并入阶段（类型不一致要报红——同一号两种类型是翻译产物本身有问题）
 // Add one entry to the merged table: an existing number merges its stages (a type mismatch is reported as a
 // failure -- one number with two types means the translated artifacts themselves are inconsistent)
@@ -729,6 +787,8 @@ VkPipeline vk_pipe_graphics(const vk_shader *vs, const vk_shader *ps, const vk_g
         .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
         .pColorBlendState = &cbs, .pDynamicState = &dsi, .layout = lay };
     VkPipeline p = VK_NULL_HANDLE;
+    // N4-k（TOOLS §H.3）：把**真正交给驱动的那份结构体**打出来（缺省关）。放在 create 之前 ⇒ 与"驱动收到了什么"逐字段对上。
+    if (pipe_dump_on()) pipe_dump(&ci, &rs, &ms, &ds, &cbs, &prc, &ia, vs, ps, na, nb, ndiv);
     // 同计算管线：走共用的管线缓存（建管线要外部串行化，套一对锁）
     // Same as the compute path: through the shared pipeline cache (creation needs external serialisation, hence the lock)
     vk_dev_pcache_lock();
