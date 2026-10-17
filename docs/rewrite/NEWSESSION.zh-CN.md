@@ -15,7 +15,7 @@
 仓库根 = 本次工作区（提示词里写过的 d:/yiyi/d2r-mobile 已过时，现在实际在 d:/project/d2r-mobile
 —— **以工作区为准**，`.venv` 跟着仓库走），分支 android；HEAD 以 `git log --oneline -3` 为准
 （提交消息的形状：内容提交以「N4-<字母>：」开头，后面跟一条「docs 收尾：交接口径指到 <sha>」；
-上一轮的内容提交是「N4-q：…」；再上一块（N4-p）是 `beb47b5`）。
+上一轮的内容提交是「N4-q：…」，`02ac92b`）。
 本文只留**判据、纪律、索引**：历史读数 A)~W) 与 60 条坑的全文在
 `docs/rewrite/NEWSESSION-ARCHIVE.zh-CN.md`（`归档 §2 · W` = W 段读数全文，`归档 §4 · (60)` = 第 60 条坑全文）。
 
