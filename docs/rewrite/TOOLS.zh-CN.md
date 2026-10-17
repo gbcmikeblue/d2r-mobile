@@ -375,6 +375,18 @@
 | **`DM_TRI_MASK_ALL=1` 叠在 `vsfull` 上仍是 152（3 轮）** | 三个写掩码全开不动判据 ⇒ "被掩码挡掉的输出把 MRT0 带走"这条也排掉 |
 | **`.work/` 本轮新增脚本** | `n4p_gen_fmt.py`（生成格式名字表）、`n4p_mag.py`（六格派生：`bits` 四格 + `scale` 两格 + `ident` 对照 + 逐段自证 + 生成 `vk_tri_fs_n4p_spv.h`）、`n4p_confs.py`（**整份照抄** `n4o-v38.conf`，只换 `DM_TRI_LADDER` / `DM_TRI_FS_VARIANT` 两行、必要时追加一行开关） |
 
+## B²². N4-q 期间量出来的仪器事实（2026-10-17，下次开工直接用）
+
+| 事实 | 读数 / 怎么用 |
+|---|---|
+| **★★★ 两条装载路的差别 = `res.json` 解出的三张数据来源表（`tex` / `cbuf` / `sbuf`）—— 已经量住，别再猜"模块对象 / 驱动缓存"** | 同一份 5480 B 模块、同一批指令、同一条状态、同一批附件，只借这三张表：`ident` **不借 = 0（落屏，3 轮）**、**借 = 152（3 轮）**；对照 `vsfull`+借（那一档本来绑的就是游戏那份 PS）仍 **152（1 轮）** ⇒ **开关本身不改读数**。⇒ 以后凡是"两条路读数不同"，**先把这三张表对齐**再谈别的 |
+| **★ 开关的形状：`DM_TRI_BORROW=1`（缺省关）** | `vk_tri_fs_borrow_from(const vk_shader *src)`（`vk_tri_game.c/.h`）把 `src`（= 游戏那份 PS）的 `tex/cbuf/sbuf` **只拷指针**进阶梯那份 FS，连同装载时解出的 `nvn_slot` / `nvn_sslot`。**调用点两条约束**：① 在 `vk_tri_ladder_shader(2)` **之后**（那份记录要先建出来）；② 在 `vk_pipe_graphics` / `desc_write` **之前**（布局看 `spv[]`、内容看这三张表）。`src` 是 `vk_shader_get` 缓存里那份 ⇒ **只借不释放** |
+| **★ 空表会造成什么：每条 UBO 都绑成宿主 `support_buffer`、贴图绑空白** | `desc_cbuf_slot()` 找不到条目返回 **-1** ⇒ `desc_buf_range()` 落进 `slot <= 2` 那一支 ⇒ `bank_get()` 的宿主常量段；贴图 `desc_tex_ref()` 返回 NULL ⇒ 走空白回退。自证行（借前/借后同一格）：借前 `set1/4` = `res.json 槽 -1`、三条 sampler **没有 NVN 槽号**；借后 **`set1/4 → 槽 6`**、**`set1/1..3 → NVN 贴图槽 14/12/13、采样器槽 1`**、动态偏移 **1** 个 |
+| **★ 自证行的形状（`nvn_vk.c`，只读、前 3 次插入）** | `【查】DM_TRI_LADDER=<档>：**绑定内容**自证（第 N 次插入）—— 游戏那份 PS \`<键>\`：tex a / cbuf b / sbuf c；这一档的 FS \`<键>\`：tex … / …（\`DM_TRI_BORROW\` 已借/没借）；合并后绑定 n 条、动态偏移 m 个：set1/0 uniform buffer（<声明者键>）res.json 槽 -1；set1/1 combined image sampler（…）NVN 贴图槽 14/采样器槽 1；…` ⇒ **"这一档到底绑到了什么"一眼可读**（以前只有绑定条数） |
+| **★★ 数据齐全后重做 N4-o 的格：那一对彻底不成立** | 全部 `vsfullf` + `DM_TRI_BORROW=1`，各 3 轮：`magr` **0**、`maglo` **0**、`nanflag38` **0**（⇒ 采样值仍 `< 2^-20`、**不是 NaN** —— `maglo` 的 0 有 NaN 这条替代解释，必须配 `nanflag38` 才闭合）；`no38` **152**、`v38` **152**、`movetail` **152** ⇒ 删它 / 换值 / 搬位置**都不落**。⇒ 数据齐全时落屏只与"**体的原始写**"＋"**末尾有没有第二条写**"有关 |
+| **⚠ `DM_DESC_POOL_BIG=0` 会让游戏路径整段被静默跳过** | 基座 conf 为与旧轮可比写着 `=0` ⇒ 每帧约 **1011 个描述符集**之后 `【黄】描述符集分配失败（… 2 个池都没额度了 ⇒ 这一次绘制被静默跳过）` 就持续出现（N4-l 量过 27756 次/轮）。⇒ **判"画面"的轮次必须按缺省开（`=1`）跑**；做 A/B 时才写 `=0` 并在结论里注明 |
+| **`.work/` 本轮新增脚本** | `n4q_confs.py`（**整份照抄** `n4p-ident.conf`，只换 `DM_TRI_LADDER` / `DM_TRI_FS_VARIANT` 两行、追加 `DM_TRI_BORROW=1`）、`n4q_regress.py`（四探针，尾巴 `n4qregress`） |
+
 ## C. 建议补（都不难，但能省好几轮）
 
 | 建议 | 为什么值得 |

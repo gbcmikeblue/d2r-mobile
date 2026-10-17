@@ -3436,6 +3436,13 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
     if (!vs_idx || !vs_vb || !fs) { atomic_fetch_add(&g_n4i_skipnodraw, 1); return; }
     if (!st->color_count || !att_w || !att_h) { atomic_fetch_add(&g_n4i_skipfmt, 1); return; }
 
+    // N4-q：`DM_TRI_BORROW=1`（缺省关）—— 把阶梯那份 FS 的**数据来源表**（tex/cbuf/sbuf，连同装载时解出来的
+    // NVN 槽号）从**游戏那份 PS** 借过来，`spv[]` 反射与指令一条不动。要回答的是 N4-p 剩下的那一句：
+    // **"同一份模块字节走两条装载路读数不同，差在哪一层？"** —— 这里只改"每条绑定绑到哪份数据"。
+    // 必须赶在 `vk_pipe_graphics` / `desc_write` 之前（布局按 `spv[]`、内容按这三张表）。
+    // `vsfull`/`vsf` 的 `use_ps` 本来就是 `gps`，借不借都一样（下面的自证行会把两条路都打出来）。
+    int borrowed = vk_tri_fs_borrow_from(gps);
+
     // ---- 这一次绘制的计数：与游戏路径**同一份载荷、同一套读法** ----
     uint32_t count = 0, instances = 1, first = 0, base_vertex = 0, base_instance = 0;
     int indexed = (op == OP_DRAW_IDX);
@@ -3574,6 +3581,36 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
         if (dsl1) sets[1] = desc_alloc(g_cur_slot, dsl1);
         int nb = (sets[0] && sets[1]) ? vk_pipe_binds(pair, 2, binds, VK_SPV_MAXB) : -1;
         nd = nb >= 0 ? desc_write(sets, pair, 2, binds, nb, dyn) : -1;
+        // N4-q 自证（只读）：两条装载路的**数据来源表**（tex/cbuf/sbuf）+ **合并后的绑定表前几条**以及每条在这
+        // 一档里解到的数据来源（UBO 的 res.json 槽号、贴图的 NVN 贴图/采样器槽号）。判读：借之前我们的 FS 那三张
+        // 表全 0 ⇒ 每条 UBO 走宿主 support_buffer、贴图空白；借之后应当与 `vsfull` 那一档逐条相同。
+        // 只打前 3 次插入（日志别被刷爆）。
+        static int said_bind;
+        if (said_bind < 3 && nb > 0 && nd >= 0) {
+            said_bind++;
+            char bb[800]; int bo = 0; bb[0] = 0;
+            for (int i2 = 0; i2 < nb && bo < 620; i2++) {
+                const vk_shader *stx = desc_stage_of(pair, 2, binds[i2].set, binds[i2].binding);
+                const vk_tex_ref *tr2 = stx ? desc_tex_ref(stx, binds[i2].binding) : NULL;
+                int cs2 = stx ? desc_cbuf_slot(stx, binds[i2].binding) : -999;
+                bo += snprintf(bb + bo, sizeof bb - (size_t)bo, "%sset%u/%u %s（%s）", i2 ? "；" : "",
+                               binds[i2].set, binds[i2].binding, vk_spv_kind_name(binds[i2].kind),
+                               stx ? stx->key : "无");
+                if (binds[i2].kind == VK_SPV_UBO && bo < 740)
+                    bo += snprintf(bb + bo, sizeof bb - (size_t)bo, " res.json 槽 %d", cs2);
+                else if (binds[i2].kind == VK_SPV_SSBO && bo < 740)
+                    bo += snprintf(bb + bo, sizeof bb - (size_t)bo, " 地址表槽 %d", cs2);
+                else if (tr2 && bo < 740)
+                    bo += snprintf(bb + bo, sizeof bb - (size_t)bo, " NVN 贴图槽 %d/采样器槽 %d",
+                                   tr2->nvn_slot, tr2->nvn_sslot);
+            }
+            LOG("【查】DM_TRI_LADDER=%s：**绑定内容**自证（第 %d 次插入）—— 游戏那份 PS `%s`：tex %u / cbuf %u / "
+                "sbuf %u；这一档的 FS `%s`：tex %u / cbuf %u / sbuf %u（`DM_TRI_BORROW` %s）；合并后绑定 %d 条、"
+                "动态偏移 %d 个：%s",
+                sname, said_bind, gps ? gps->key : "无", gps ? gps->ntex : 0, gps ? gps->ncbuf : 0, gps ? gps->nsbuf : 0,
+                use_ps ? use_ps->key : "无", use_ps ? use_ps->ntex : 0, use_ps ? use_ps->ncbuf : 0, use_ps ? use_ps->nsbuf : 0,
+                borrowed ? "已借" : "没借", nb, nd, bb);
+        }
         if (nd < 0 || !lay) {
             atomic_fetch_add(&g_n4i_skipdesc, 1);
             LOG("【黄】DM_TRI_LADDER=%s：描述符集/布局写不出来（游戏第 %llu 次绘制、顶点 %s）"

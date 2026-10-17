@@ -481,6 +481,28 @@ int vk_tri_ladder_mode(void) {
     return g_ladder;
 }
 
+// ---------------------------------------------------------------------------
+// N4-q：`DM_TRI_BORROW=1`（缺省关）—— 见 vk_tri_game.h 上那一段（判据与两条候选都写在那里）
+// ---------------------------------------------------------------------------
+static int borrow_parse(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_TRI_BORROW");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (v) LOG("【查】DM_TRI_BORROW=1：把阶梯那份 FS 的**数据来源表**（`tex` / `cbuf` / `sbuf` 三张，"
+                   "连同装载时解出来的 NVN 槽号）从**游戏那份 PS** 借过来 —— `spv[]` 反射与**指令一条都不动**，"
+                   "只改「每条绑定绑到哪份数据」。为什么要有它：那三张表是 `vk_shader.c` 的 `load()` 从 "
+                   "`<键>.res.json` 里解出来的，而阶梯这条路自己建模块、从来没有它们 ⇒ `desc_cbuf_slot()` 一律 -1 "
+                   "⇒ 每条 UBO 都落进「绑宿主 support_buffer」那一支、贴图绑空白。判据：`ident` + 本开关 "
+                   "**变回 152 ⇒ 候选①（差别就在这三张表）；仍是 0 ⇒ 候选②（模块对象 / 驱动缓存）**");
+    }
+    return v;
+}
+
+int vk_tri_fs_borrow(void) { return borrow_parse(); }
+
+// 函数体放在 `g_lsh` 声明之后（文件下方 `vk_tri_ladder_shader` 旁边）—— 那里才有 `g_lsh`。
+
 int vk_tri_ladder_arm(uint64_t draw_index, uint64_t color0_ser) {
     if (!vk_tri_game_on()) return 0;
     ladder_parse();
@@ -620,6 +642,27 @@ const vk_shader *vk_tri_ladder_shader(int which) {
             nforced, nref, nfin);
     }
     return g_lsh[which].mod ? &g_lsh[which] : NULL;
+}
+
+// N4-q：把阶梯那份 FS 的**数据来源表**从游戏那份 PS 借过来（判据见 vk_tri_game.h 上那一段）。
+// 必须在 `vk_tri_ladder_shader(2)` 之后调（那份记录要先建出来）；只改"绑定内容"，`spv[]` 与指令一条不动。
+int vk_tri_fs_borrow_from(const vk_shader *src) {
+    if (!borrow_parse() || !src) return 0;
+    if (g_lsh[2].mod == VK_NULL_HANDLE) return 0;
+    // 只拷指针：`src` 活到进程结束（`vk_shader_get` 的缓存），这里释放任何东西都是错的。
+    // Pointers only: `src` lives until the process exits (the vk_shader_get cache), so freeing anything here is wrong.
+    g_lsh[2].tex = src->tex;   g_lsh[2].ntex = src->ntex;
+    g_lsh[2].cbuf = src->cbuf; g_lsh[2].ncbuf = src->ncbuf;
+    g_lsh[2].sbuf = src->sbuf; g_lsh[2].nsbuf = src->nsbuf;
+    static int said;
+    if (!said++) {
+        LOG("【查】DM_TRI_BORROW：借完了 —— 源 = 游戏那份 PS `%s`（tex %u / cbuf %u / sbuf %u，阶段 %d）；"
+            "阶梯那份 FS `%s` 现在是 tex %u / cbuf %u / sbuf %u（`spv[]` 声明 %u 条、一条没动）；"
+            "**指令逐字节相同**这件事由 `DM_TRI_FS_VARIANT=ident` 保证（见 N4-p 的 sha256 对照）",
+            src->key, src->ntex, src->ncbuf, src->nsbuf, src->stage,
+            g_lsh[2].key, g_lsh[2].ntex, g_lsh[2].ncbuf, g_lsh[2].nsbuf, g_lsh[2].nspv);
+    }
+    return 1;
 }
 
 void vk_tri_ladder_stats(uint64_t *inserts, uint64_t *nopipe) {

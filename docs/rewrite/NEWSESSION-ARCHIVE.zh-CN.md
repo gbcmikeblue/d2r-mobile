@@ -205,7 +205,7 @@ capability（10 vs 1，已被 `capall` 排掉）/ execution mode（都是 `Origi
 **旧路全部保留、可随时退回**（`DM_GFX2` 缺省关）。
 ```
 
-## §2 已经量出来的读数（A) N0 … W) N4-p，逐字保留）
+## §2 已经量出来的读数（A) N0 … X) N4-q，逐字保留）
 
 ```text
 已经量出来的（**直接用，不要重量**）：
@@ -922,6 +922,35 @@ W) **N4-p 的读数**（2026-10-17 本轮做完；结论见 `ANDROID_PLAN` §八
 · 读数 `n4-n4p-{fmt{a,b},fmt2{a,b},vsfull{a,b,c},maskall{a,b,c},magr{b,c},maglo{b,c},magup{a,c},magdn{a,b,c},ident{a,b,c},times1{a,b,c}}`；
   **作废**：`-magra` / `-magloa` / `-magupb`（装机后第一轮 / 冷启动，出图 0、无判据行）；
   器械 `.work/n4p_gen_fmt.py` / `n4p_mag.py` / `n4p_confs.py` / `n4p_regress.py`。
+
+X) **N4-q 的读数**（2026-10-17 本轮做完；结论见 `ANDROID_PLAN` §八·N4-q，仪器事实见 `TOOLS` B²²）：
+· **★ 器械**：新开关 `DM_TRI_BORROW=1`（缺省关）+ `vk_tri_fs_borrow_from(src)`（`vk_tri_game.c/.h`）——
+  把游戏那份 PS 的 `tex` / `cbuf` / `sbuf` 三张**数据来源表**（连同装载时解出的 `nvn_slot`/`nvn_sslot`）**只拷指针**
+  借给阶梯那份 FS，`spv[]` 反射与**指令一条不动**；调用点在 `n4i_ladder_draw` 里、`vk_pipe_graphics` 与 `desc_write`
+  之前。`nvn_vk.c` 另加一段**只读**自证（前 3 次插入）。
+· **★ 自证（同一轮日志原文）**：`【查】DM_TRI_BORROW：借完了 —— 源 = 游戏那份 PS 8e80084d3c30340a
+  （tex 3 / cbuf 1 / sbuf 0，阶段 1）；阶梯那份 FS n4i-tri-fs 现在是 tex 3 / cbuf 1 / sbuf 0（spv[] 声明 5 条、一条没动）`；
+  绑定内容：`set1/0 uniform buffer res.json 槽 -1`（support_buffer，游戏那份也一样）、**`set1/4 uniform buffer res.json 槽 6`**、
+  **`set1/1..3 combined image sampler → NVN 贴图槽 14/12/13、采样器槽 1`**、动态偏移 **1** 个。
+  借之前：`set1/4` 也是 `-1`、三条 sampler **没有 NVN 槽号** ⇒ 每条 UBO 都落进「绑宿主 `support_buffer`」那一支、贴图绑空白。
+· **★★ 决定性格（同一构建、单变量、各 3 轮）**：`ident`（不借，锚点）**0 / 0（3 轮 `a/b/c`）**；
+  `ident` + 借 **152 / 152（3 轮 `a/b/c`）**；对照 `vsfull` + 借 **152（1 轮）** ⇒ **候选① 成立**、
+  开关本身不改读数（`vsfull` 的 `use_ps` 本来就是游戏那份 PS）。
+· **★★ 数据齐全后重做 N4-o 的格（`vsfullf` + 借，各 3 轮）**：`magr` **0**、`maglo` **0**、`nanflag38` **0**
+  ⇒ 采样值仍 `< 2^-20`、**不是 NaN**；`no38` **152**、`v38` **152**、`movetail` **152**
+  ⇒ **删掉 Location 2 的写 / 把值换常量 / 把写搬到末尾，一个都不落** ⇒ **N4-o 那套「值 × 位置」在数据齐全时一格都不成立**。
+· **★ 结构**：数据齐全时**只有「体 + 末尾再补一条写」那几格落屏**、「体的原始写」一格都不落
+  （`ident` / `no38` / `v38` / `movetail` 全 152）⇒ 下一块 = **N4-r**：先离线读这份体的分支结构（`%34` 的写在哪层分支、
+  与 `OpReturn`/`OpKill` 的支配关系），再判"末尾那条写改变了什么"。
+· **⚠ 顺带看到（本轮未处理）**：基座 conf 里的 `DM_DESC_POOL_BIG=0`（为与旧轮可比）让每帧约 **1011 个描述符集**
+  之后池就耗尽、`【黄】描述符集分配失败 … 这一次绘制被静默跳过` 持续出现 ⇒ 游戏路径整段绘制被跳过；
+  两臂都带、不影响本轮对照，但**判"画面"的轮次必须按缺省开跑**。
+· **回归**：N1/N2/N3/N4-b 四探针各一轮（`…-n4qregress.txt`）+ `.work/regress_diff.py n4pregress n4qregress` ⇒
+  **判据字段 0 项不一致**（41 / 48 / 89 / 59 个共同键；抖动的只有时间/内存与 `VK2_D3_TO_D4_GAIN_PM`）。
+· **本轮没有改新地基的任何模块**（`vk2_*.c` 一行未动）；改的只有 `vk_tri_game.c/.h`（+ `DM_TRI_BORROW` 与
+  `vk_tri_fs_borrow_from`）与 `nvn_vk.c`（+ 一段只读自证 + 一次借表调用）。
+· 读数 `n4-n4q-{vsfull, ident{a,b,c}, identb{a,b,c}, magrb{a,b,c}, maglob{a,b,c}, nan38b{a,b,c}, no38b{a,b,c},
+  v38b{a,b,c}, movetailb{a,b,c}}`（19 轮全部有效、每轮都有判据行）；器械 `.work/n4q_confs.py` / `n4q_regress.py`。
 ```
 
 ## §3 瘦身前的「本轮目标：N4-p」（逐字保留）
