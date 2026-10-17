@@ -815,6 +815,16 @@ vs **`vs` 档（只把 FS 换成我们那份纯红）⇒ 85（3 轮）** ⇒ **�
   刷上去的已知色 **152**（看着像"有内容"，其实是自己刷的）。**看画面的 conf 只许有 `DM_GFX2=1` +
   `DM_WIN_SRC=<序号>`（+ 被测开关）**；并且**开关自证那行要能看出"真的跑的是新码"**（本轮启动头的
   `构建 … : …` 还是旧的 `__DATE__`，是靠新代码才有的 `【查】DM_POLY_MODE_NVN=1：…` 才判出来的 —— 坑 ④ 的又一次现场）。
+  ㉞ **抓帧器 / trace_processor 的门槛与判定（2026-10-17 实测，细节见 `TOOLS` §H）**：**trace_processor 对两个卡点
+  都没有增量**（它答调度/频率，卡点 A 不在它视野、卡点 B 已被 atrace 覆盖）⇒ **不做**。**gfxreconstruct 有真增量**
+  （驱动视角的调用记录 + 回放 `--dump-resources` 逐 draw dump 附件，**不经过我们的读回路径**），**但官方两条路
+  这台机上都走不通**：`/data/local/debug` **建不了**（shell 只能写 `/data/local/tmp`）、`settings put global …` 被
+  MIUI 拒（`WRITE_SECURE_SETTINGS`）⇒ 只能走 **A1 那套"层 .so 进 APK + `setprop debug.vulkan.layer.1`"**
+  （已实测可读回）。另三条会白跑的：`page_guard` **与 `crash.c` 的 SIGSEGV 处理器冲突**（要 `memory_tracking_mode=
+  userfaultfd`；`assisted` 依赖 `vkFlushMappedMemoryRanges`，而**全库一次都没调过**）、4 GB 池的影子内存
+  （`MemAvailable` ≈ 8.1 GB，勉强）、以及**离线解析工具在桌面**（Android 端不支持 `gfxrecon-convert`/`-info`）。
+  ⇒ **顺序：先做 `TOOLS` §H.3 那个"打最终结构体"的自证（≈20 行、0 依赖，专治"状态表对、翻译那步错"这一类），
+  再走 N4-k 的两档；两条都打不通才开抓帧**。
    ```
 
 ---

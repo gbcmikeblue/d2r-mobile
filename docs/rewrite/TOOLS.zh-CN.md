@@ -306,7 +306,8 @@
 | 主机 / 工具链 | NDK 30.0.16248370、CMake 3.31.6、`android-31` / `arm64-v8a`、JDK 21 | 不变 |
 | 第一台真机 | Redmi K90（`8b1f1e50`，Adreno 830，Vulkan 1.3.284） | 插好；`adb devices -l` 能看到；用 `.work/uptime.py` 确认没重启过 |
 | 第二台真机 | Redmi `pearl`（`VC9TGM45MNJB8TSG`，Mali-G610 MC6，Vulkan 1.1.177） | **不使用**（2026-10-16 口径变更：新路径只用第一台 ⇒ **N1~N6 全在第一台上做、N5 暂缓**）；真要重开见 `ANDROID_PLAN`「M3-3e」第九节（人在设备旁 + 明确同意 + 从最小尺寸起步） |
-| `trace_processor`（读 `.work/trace/stall.pftrace`） | **仍缺**：工作区没有 `.work/trace/`，也没有能跑它的机器 | 不阻塞新路径；要用先确认机器 |
+| `trace_processor`（读 `.work/trace/stall.pftrace`） | **仍缺**（工作区没有 `.work/trace/`，也没有能跑它的机器）；**2026-10-17 判定：对本项目的两个卡点都没有增量** —— 它答"调度 / 频率 / 队列"，而**卡点 A（片元不出来）不在它的视野里**、**卡点 B（~10 秒停顿）已由 `atrace` 覆盖**（atrace 更便宜、还带 `sched_blocked_reason: … caller=`） | **不做**。要用先确认机器，并把"它能回答哪一句"写在读数前面 |
+| gfxreconstruct（Vulkan 抓帧） | **有真增量，但不是第一步**（2026-10-17 判定，闸门逐条实测，见 §H）。**唯一不可替代的能力**：① **驱动视角的完整调用记录**（能抓"我们以为设了 X、实际提交了 Y"这一类 —— **N4-j 的 `poly` bug 正是这一类**，抓一帧就能看见 `polygonMode = VK_POLYGON_MODE_POINT`）；② 回放时 `--dump-resources` 可**逐 draw** dump 附件，不依赖我们的读回路径、也不受"混合 ONE→ONE 把写黑藏起来"那个陷阱影响 | 先看 §H 的五道闸门；**第一步只能是"用已知答案标定"**（抓修法前的一帧，在转出来的 JSONL 里搜 `polygonMode`，应当看到 `POINT`）；拿不到桌面解析工具就别开 |
 | Vulkan Validation Layers（真机） | **已备齐、已跑通**（A1，2026-10-16）：层 `.so`（27,684,688 字节）取自 Khronos `android-binaries-1.4.363.0.zip`，进 APK 靠 `build_apk.cmd` 里**缺省关**的 `DM_VKLAYER=1` 可选段 | 配方见 **§G**（不用 root、不改代码）；`.work/vklayer_round.py` 一轮、`.work/vklayer_off.py` 退回常态；A1/N4-g 都用过 |
 | NDK 自带着色器工具 | `shader-tools/windows-x86_64/` 里有 **`glslc.exe` / `spirv-dis.exe` / `spirv-as.exe`** | 反汇编看 `.spv`、写自己最小的着色器都用它们（见 **B¹²**） |
 | 设备侧数据 | RomFS / SPIR-V / 改写产物已在两台 `/data/local/tmp/dm/` | 不变；新地基不动它们 |
@@ -541,3 +542,46 @@
 ⚠ **`builtin_check` 的已知局限**：它只看 `OpDecorate`，**不看 `OpMemberDecorate`**（结构体成员的 BuiltIn，比如
 `gl_PerVertex` 里的 `ClipDistance`）⇒ 层报"ClipDistance 数组 8 + CullDistance 1"而本脚本报"0 份"就是这原因 ——
 **"脚本说没有"不等于"真的没有"，先看它的覆盖范围**。
+
+## H. 抓帧调试器（gfxreconstruct）与 trace_processor 对本项目的判定（2026-10-17，闸门逐条实测）
+
+**背景**：N4-j 定案了「多边形模式」那条 bug 之后，画面仍未出来、责任收到"游戏的片段着色器那一侧"。
+于是问：**抓帧器（gfxreconstruct）与 trace_processor 能不能帮上忙？** 下面是判定与**已经实测过**的闸门
+（脚本 `.work/n4k_capture_gate.py`：只读、不装东西、不跑游戏轮）。
+
+| 问题 | gfxreconstruct（Vulkan 抓帧） | trace_processor（perfetto 的离线读数器） |
+|---|---|---|
+| **能回答"为什么片元不出来"吗** | **不能直接回答**。它是**输入记录**，不是输出诊断；要拿到"输出"得**回放 + `--dump-resources`** | **完全不能**（它答调度 / 频率 / 队列，与片元无关） |
+| **对本项目当前两个卡点** | 卡点 A（画面全零 / N4-k）：**有增量** —— ① **驱动视角**的完整调用记录（能抓"我们以为设了 X、实际提交了 Y"这一类，**`poly` bug 正是这一类**）；② 回放 `--dump-resources` 可**逐 draw** dump 附件，**不经过我们的读回路径**，也不受"混合 ONE→ONE 把写黑藏起来"那个陷阱影响。卡点 B（~10 秒停顿）：**不能用**（抓帧大幅改时序） | 卡点 A：**0**。卡点 B：**≈0** —— 与 `atrace` 重叠，而 atrace 更便宜、带 `sched_blocked_reason: … caller=`；且 perfetto 在这台机上拿不到 kgsl 那一族原子（SELinux） |
+| **结论** | **排到"N4-k 的便宜路"之后，当第三条路**；真要用，**第一步只能是"用已知答案标定"** | **不做** |
+
+### H.1 五道闸门（2 已否 / 2 已过 / 1 待验）
+
+| # | 闸门 | 判据 | 实测（2026-10-17，`8b1f1e50`） |
+|---|---|---|---|
+| ① | 官方路线 B 的层放置点 `/data/local/debug/vulkan` | 能 `mkdir` + `touch` | **✗ 否**：`mkdir: '/data/local/debug': Permission denied`（shell 只能写 `/data/local/tmp`）⇒ 文档那条路不可用 |
+| ② | 官方路线 A 的前置 `settings put global …` | 能写入并读回 | **✗ 否**：`SecurityException: … WRITE_SECURE_SETTINGS`（MIUI，与「M3-3d」同因）⇒ 官方路线 A 死 |
+| ③ | 替代路线：**层 `.so` 进 APK + `setprop`**（= A1 那套） | `setprop debug.vulkan.layer.1` / `debug.vulkan.layers` 能读回；loader 能从 APK 里加载层 | **✓ 过**：单数版写→读回 `VK_LAYER_LUNARG_gfxreconstruct`、清回为空；复数版 A1 已证明能加载校验层 ⇒ **这条路可行，代价 = 打包 + 一轮抓帧** |
+| ④ | 抓帧产物的落点 | app 能写 `/sdcard/Android/data/<pkg>/files` | **✓ 过**（复核过；A0 起一直可用） |
+| ⑤ | **离线解析工具**（`gfxrecon-convert` → JSON Lines / `gfxrecon-info`） | 能在**桌面**跑 | **⚠ 待验**：官方文档明说 Android 端**不支持**这两个（只能拉回桌面处理），而桌面二进制**只随 Vulkan SDK 主包分发**（不在 Android 那个 zip 里）⇒ 要另装 SDK 或自建。**这一步拿不到，抓帧对我们的价值就只剩"证明层能加载"——那就不值得开** |
+
+### H.2 三条会让抓帧白跑（或跑崩）的硬约束
+
+- **产物**：`gfxreconstruct-vulkan-sdk-1.4.363.0-android.zip`（**77.36 MB**，LunarG release 直链；A1 已证明 GitHub
+  直链 + `curl --retry 5 -C -` 在本机能下完，`urllib` 会 `IncompleteRead`）。
+- **`page_guard` 与 `crash.c` 的 SIGSEGV 处理器冲突**（官方文档明写）：本项目宿主**确实装了** SIGSEGV 处理器
+  （`main_apk.c:69` 的注释就写着"宿主的 `crash.c` 已经装了"）⇒ 抓帧必须 `debug.gfxrecon.memory_tracking_mode=userfaultfd`；
+  而 `assisted` 模式依赖应用调 `vkFlushMappedMemoryRanges` —— **全库一次都没调过** ⇒ assisted 抓到的内存不可信。
+- **4 GB 池会给影子内存加压**：实测 `MemAvailable = 8,490,800 kB`（≈8.1 GB）、`SwapTotal` 16 GB、池 4 GB
+  ⇒ userfaultfd 模式**勉强够但要盯**；并且抓帧会**极慢**（不只拷 4 GB，还有几十万次绘制）。
+  只许 `capture_frames` 抓 **1~2 帧**（默认是"抓所有帧"；帧号从 1 开始）。
+
+### H.3 更便宜、且针对**同一类** bug 的仪器：打"最终结构体"而不是"影子状态"
+
+`poly` 那条 bug 的形态是"**状态表对、翻译那一步错**"（`gfx_state_desc` 打的是 `vk_gfx_state`，而真正交给驱动的是
+`vk_pipe_graphics` 里拼出来的 `VkPipelineRasterizationStateCreateInfo`）。这一类 bug 的**最便宜**仪器不是抓帧器，而是
+**在 `vkCreateGraphicsPipelines` 之前把最终结构体逐字段打一行**（`polygonMode` / `cullMode` / `frontFace` /
+`depthBiasEnable` + 三系数 / `rasterizerDiscardEnable` / `depthClampEnable` / 各附件的 `colorWriteMask` 与 `blend`），
+并在 `vkCmdDraw*` 前打一次"这一次用的管线 + 绑定的 set + 动态状态（视口/裁剪）"。
+**代价 ≈ 20 行 + 一轮读数**，且**不需要**下载、不需要装层、不改时序。
+⇒ 建议顺序：**① 这个自证 → ② N4-k 的两档（`vsf` + 离线 SPIR-V/附件一致性）→ ③ 若都打不通，再开抓帧**（并按 H.1 ⑤ 先确认桌面解析工具）。
