@@ -44,6 +44,15 @@ int vk_fmt_to_vk(int nvn_fmt, VkFormat *out);
 VkImage vk_tex_image(const tex_t *t);
 VkImageView vk_tex_view(const tex_t *t, const view_t *v);
 
+// N4-p：这个附件**真实**会拿到哪个 VkFormat —— 与 `view_for` 建视图时**同一套优先级**（底图格式，
+// 视图的 `set_format` 可重解释它）。**只算不建**：不拿锁、不建 VkImageView，纯诊断入口。
+// 为什么需要它：管线填的颜色格式取的是**底图**的 NVN 格式（`gfx_state_fill` → `g_rs.color[i]->d.format`），
+// 而附件视图走的是 `view_for` —— 两条路一旦不同，管线声明的附件格式与真实附件格式就不同类，
+// 在 Vulkan 里是 UB（校验层不一定报）。
+// The VkFormat this attachment **really** gets -- the same precedence `view_for` uses when it builds the view
+// (the base format, which a view's `set_format` may reinterpret). **Compute only**: no lock, no VkImageView.
+VkFormat vk_tex_view_fmt(const tex_t *t, const view_t *v);
+
 // 读回路径那把锁（g_one_mu）的账本：谁持有、在做什么、已持多久，门外是谁、等了多久（定义在 vk_tex.c）。
 // 停住 / 按需转储时打出来 —— 与"等待点"那一行（mtl_wait_state_dump）一起看，就能读出"谁在等谁"。
 // The ledger of the read-back path's lock (g_one_mu): who holds it, doing what, for how long, and who is waiting

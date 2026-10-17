@@ -24,6 +24,7 @@
 #include "vk_tri_fs_n4m_spv.h"    // N4-m：`blit` + isnan 守卫 + precise（OpIsNan/OpSelect/NoContraction；自证 .work/logs/n4m-fs-variants.txt）
 #include "vk_tri_fs_n4n_spv.h"    // N4-n：游戏那份的「壳 + 我自己的 body」（自证 .work/logs/n4n-shellbody.txt）
 #include "vk_tri_fs_n4o_spv.h"    // N4-o：体一字不动，只在 OpReturn 前补一小段写 Location 0（自证 .work/logs/n4o-variants.txt）
+#include "vk_tri_fs_n4p_spv.h"    // N4-p：把 |%118|/%120|/%122| 的量级对三个阈值写成 0/1 位（自证 .work/logs/n4p-mag.txt）
 #include "dm.h"
 
 #include <stdatomic.h>
@@ -433,10 +434,19 @@ int vk_tri_fs_variant(void) {
     else if (!strcmp(e, "v38")) g_fsv = 25;       // N4-o ⑥：%38 照写、只把它的值换成常量 (0,0,0,0)
     else if (!strcmp(e, "nanflag38")) g_fsv = 26; // N4-o ⑦：%38 照写 + 尾部把 isnan(%118/%120/%122) 写进 %34
     else if (!strcmp(e, "isinf38")) g_fsv = 27;   // N4-o ⑧：%38 照写 + 尾部把 isinf(%118/%120/%122) 写进 %34
+    else if (!strcmp(e, "magr")) g_fsv = 28;      // N4-p ①：%38 照写 + 尾部把 |%118| 对 {1024,65024,2^30} 的位写进 %34
+    else if (!strcmp(e, "magg")) g_fsv = 29;      // N4-p ②：同上，换 |%120|
+    else if (!strcmp(e, "magb")) g_fsv = 30;      // N4-p ③：同上，换 |%122|
+    else if (!strcmp(e, "maglo")) g_fsv = 31;     // N4-p ④：|%118| 对 {2^-20,2^-10,1}（只在 magr 读到 0 时跑）
+    else if (!strcmp(e, "magup")) g_fsv = 32;     // N4-p ⑤：%38 的值 ×2^16（链路/位置/条数都不动）
+    else if (!strcmp(e, "magdn")) g_fsv = 33;     // N4-p ⑥：%38 的值 ×2^-16（推到 R11F 里落成 0）
+    else if (!strcmp(e, "ident")) g_fsv = 34;     // N4-p 对照：游戏那份模块一字不改，只走 vsfullf 这条路
+    else if (!strcmp(e, "times1")) g_fsv = 35;    // N4-p 对照：%38 的值 ×1.0（只多三条 OpFMul，值一位不变）
     else {
         LOG("【黄】DM_TRI_FS_VARIANT=%s 认不出来（只认识 cap / 3out / 3out_cap / iface / blit / if_ubo / if_smp / "
             "smp1 / ubo4 / ubo0 / decl / capf64 / capgather / capimg / capgroup / capall / blitn / shellbody / "
-            "bodyout / tailred / vals / nanflag / movetail / no38 / v38 / nanflag38 / isinf38）——按关处理", e);
+            "bodyout / tailred / vals / nanflag / movetail / no38 / v38 / nanflag38 / isinf38 / "
+            "magr / magg / magb / maglo / magup / magdn / ident / times1）——按关处理", e);
         return 0;
     }
     LOG("【查】DM_TRI_FS_VARIANT=%s：阶梯用的那份**我们自己的**片段着色器换成变体 %d"
@@ -454,6 +464,14 @@ int vk_tri_fs_variant(void) {
             "20/21 与 `bodyout`（整向量写 + 我们的常量，N4-n 3 轮 85）构成 2×2：**写法 × 值**；"
             "23 只差**位置**。自证 .work/logs/n4o-variants.txt（逐段对比 + 函数体 opcode + spirv-val）",
             e);
+    if (g_fsv >= 28)
+        LOG("【查】DM_TRI_FS_VARIANT=%s：N4-p 的**量级格** —— `%%38` **照写**（真实值一条不动），只在 `OpReturn`"
+            "之前把 `|%%118|`（28）/ `|%%120|`（29）/ `|%%122|`（30）对 **{1024, 65024, 2^30}** 的比较写成 0/1 位、"
+            "写进 `%%34` 的 R/G/B（31 = `|%%118|` 对 {2^-20, 2^-10, 1}）⇒ 亮度 **0 / 85 / 170 / 255** = "
+            "<1024 / [1024,65024) / [65024,2^30) / ≥2^30（65024 = 附件 2 那个 B10G11R11_UFLOAT 的上限，"
+            "fp16 的上限是 65504）；**32/33 = 只把 `%%38` 的值 ×2^16 / ×2^-16**（链路与位置都不动 ⇒ 这两格的判据"
+            "就是落屏）；**34 = 游戏那份模块一字不改**、**35 = 只多三条 `OpFMul ×1.0`**（这两格是对照："
+            "分清「值」与「多一条指令」）；自证 .work/logs/n4p-mag.txt", e);
     return g_fsv;
 }
 
@@ -534,6 +552,14 @@ const vk_shader *vk_tri_ladder_shader(int which) {
         else if (fsv == 25) { fsw = VK_TRI_FS_V38; fsn = (size_t)VK_TRI_FS_V38_WORDS; }
         else if (fsv == 26) { fsw = VK_TRI_FS_NANFLAG38; fsn = (size_t)VK_TRI_FS_NANFLAG38_WORDS; }
         else if (fsv == 27) { fsw = VK_TRI_FS_ISINF38; fsn = (size_t)VK_TRI_FS_ISINF38_WORDS; }
+        else if (fsv == 28) { fsw = VK_TRI_FS_MAGR; fsn = (size_t)VK_TRI_FS_MAGR_WORDS; }
+        else if (fsv == 29) { fsw = VK_TRI_FS_MAGG; fsn = (size_t)VK_TRI_FS_MAGG_WORDS; }
+        else if (fsv == 30) { fsw = VK_TRI_FS_MAGB; fsn = (size_t)VK_TRI_FS_MAGB_WORDS; }
+        else if (fsv == 31) { fsw = VK_TRI_FS_MAGLO; fsn = (size_t)VK_TRI_FS_MAGLO_WORDS; }
+        else if (fsv == 32) { fsw = VK_TRI_FS_MAGUP; fsn = (size_t)VK_TRI_FS_MAGUP_WORDS; }
+        else if (fsv == 33) { fsw = VK_TRI_FS_MAGDN; fsn = (size_t)VK_TRI_FS_MAGDN_WORDS; }
+        else if (fsv == 34) { fsw = VK_TRI_FS_IDENT; fsn = (size_t)VK_TRI_FS_IDENT_WORDS; }
+        else if (fsv == 35) { fsw = VK_TRI_FS_TIMES1; fsn = (size_t)VK_TRI_FS_TIMES1_WORDS; }
         // -------------------------------------------------------------------
         // N4-l：**这一份 FS 也要走"按阶段分空间"与"反射"**（以前没有）。
         // 游戏那几份是在 `vk_shader.c` 的 `load()` 里做的（PS 的绑定整体挪到 set 1，然后把 SPIR-V 声明的绑定

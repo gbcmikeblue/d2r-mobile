@@ -1430,6 +1430,21 @@ int vk_tex_same_size_serials(uint32_t w, uint32_t h, uint64_t *out, int cap) {
 // Get (creating if needed) a view. An empty view, or one that sets none of the "limit/reinterpret" bits, is the base
 // view. `target` uses the same values as ent_build's switch (0 = 1D, 1 = 2D, 2 = 3D, 3 = 1D array, 4 = 2D array,
 // 8 = cube, 9 = cube array).
+// N4-p：**附件的真实格式**（只算不建，见 vk_tex.h 的说明）。
+// 顺序与 `view_for` 逐条一致：先底图格式（`ent_build` 用的是 `vk_fmt_to_vk(t->d.format)`），
+// 视图设了 `set_format` 且它有 Vulkan 对应物时由它重解释；没有对应物时 `view_for` 会退回底图格式，
+// 这里也一样（不重复报黄，`view_for` 那一处已经报过）。
+VkFormat vk_tex_view_fmt(const tex_t *t, const view_t *v) {
+    if (!t) return VK_FORMAT_UNDEFINED;
+    VkFormat f = VK_FORMAT_UNDEFINED;
+    if (!vk_fmt_to_vk(t->d.format, &f)) f = VK_FORMAT_UNDEFINED;
+    if (v && v->set_format) {
+        VkFormat f2 = VK_FORMAT_UNDEFINED;
+        if (vk_fmt_to_vk(v->format, &f2) && f2 != VK_FORMAT_UNDEFINED) f = f2;
+    }
+    return f;
+}
+
 static VkImageView view_for(ent_t *e, const view_t *v) {
     if (!v || !(v->set_levels || v->set_layers || v->set_format || v->set_target)) { atomic_fetch_add(&g_vw_base, 1); return e->view; }
     for (int i = 0; i < ENT_VIEWS; i++)

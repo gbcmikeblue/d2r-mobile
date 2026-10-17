@@ -205,7 +205,7 @@ capability（10 vs 1，已被 `capall` 排掉）/ execution mode（都是 `Origi
 **旧路全部保留、可随时退回**（`DM_GFX2` 缺省关）。
 ```
 
-## §2 已经量出来的读数（A) N0 … V) N4-o，逐字保留）
+## §2 已经量出来的读数（A) N0 … W) N4-p，逐字保留）
 
 ```text
 已经量出来的（**直接用，不要重量**）：
@@ -884,6 +884,44 @@ V) **N4-o 的读数**（2026-10-17 本轮做完；结论见 `ANDROID_PLAN` §八
 · 读数 `n4-n4o-{tailred{b,c},vals{b,c},nanflag{a,b,c},movetail{a,b,c},no38{a,b,c},v38{a,b,c},nanflag38{a,b,c},isinf38{a,c}}`；
   **作废**：`-tailreda` / `-valsa` / `-isinf38b`（装机后第一轮 / 冷启动，出图 0、无判据行）；
   器械 `.work/n4o_variants.py` / `n4o_confs.py` / `n4o_regress.py` / `n4o_fmt.py`（抽附件格式，**只抽得到前两个**）。
+
+W) **N4-p 的读数**（2026-10-17 本轮做完；结论见 `ANDROID_PLAN` §八·N4-p，仪器事实见 `TOOLS` B²¹）：
+· **★ 先补仪器（只读）**：`vk_tex.c/.h` 加 `vk_tex_view_fmt(t, v)`（按 `view_for` 同一套优先级算"附件**真实**会拿到
+  哪个 VkFormat"，**只算不建**：不拿 `g_mu`、不建 `VkImageView`）；插入明细改成**一个附件一行** ——
+  `[i] 序号 / 底图 NVN 格式 / 管线声明 VkFormat / **真实（视图）** / 两侧是否一致 / 本机可作颜色附件·可混合`
+  （后两格是 `vkGetPhysicalDeviceFormatProperties` 的设备真值），深度附件同样一行。
+  ⚠ 第一版把三个拼进一行，被 `log_line` 的 **1200 字节**缓冲截断（中文一字 3 字节），且 `fo += snprintf(...)`
+  在溢出后 `sizeof fb - fo` 变成天文数字（越界写）⇒ 改成一附件一行。
+· **★ 附件格式（4 轮逐项相同）**：`Location 0` = 序号 28、NVN `0x29` → **97 = `R16G16B16A16_SFLOAT`**；
+  `Location 1` = 序号 27、`0x25` → **37 = `R8G8B8A8_UNORM`**；`Location 2` = 序号 26、`0x3f` →
+  **122 = `B10G11R11_UFLOAT_PACK32`**；**声明 == 真实（视图）**、三个都能当颜色附件 + 可混合、**没有深度附件**。
+  ⚠ **坑 (60) 的 `97 = R32_UINT` 是错的**（`R32_UINT` = 98）：名字改由 `.work/n4p_gen_fmt.py` 从 NDK 的
+  `vulkan_core.h` **生成**（`.work/logs/n4p-fmt-table.txt`，128 个格式）。
+· **★ 量级（`bits` 四格：`%38` 照写，只在 `OpReturn` 前补一段，把 `|x|` 对三个阈值的比较写成 0/1 位进 `%34` 的 R/G/B）**：
+  `magr`（`{1024, 65024, 2^30}`）**0 / 0（2 轮 `b/c`）**、`maglo`（`{2^-20, 2^-10, 1}`）**0 / 0（2 轮 `b/c`）**
+  ⇒ **`|%118| < 2^-20 ≈ 9.5e-7`**（近似 0）；`magg`/`magb` 没跑（`magr` 已到底）。
+  刻度：亮度只能落在 **0 / 85 / 170 / 255**（读回是"钳到 [0,1] + 1/2.2 伽马"，而 0/1 伽马前后不动）。
+· **★ 两条"只改值"的格（`%38` 三条 `OpStore` 的源各自乘常数，`OpLoad` 留着 ⇒ 链路活着、位置与条数都不动）**：
+  `magup`（×2^16）**0 / 0（2 轮 `a/c`）**、`magdn`（×2^-16）**0 / 0（3 轮）** ⇒ **两格都"落屏"**（不自洽）。
+· **★★ 两条对照把上面那条推翻一半**：`ident`（游戏那份模块**一字不改**、只走 `vsfullf` 那条
+  "复制 → `vk_spv_force_set` → 建模块 → `vk_spv_scan`" 的路）**0 / 0（3 轮）**；
+  `times1`（只多三条 `OpFMul ×1.0`，值一位不变）**0 / 0（3 轮）**；而 **`vsfull`（同一份 5480 字节、游戏自己装载的
+  那个模块对象）**152**（3 轮，本轮重跑）**。设备上 `/data/local/tmp/dm/spv/8e80084d3c30340a.spv` 与本地副本
+  **sha256 逐字节相同**（5480 B）⇒ **152 不是"这份着色器体"的性质**，而是**"谁装载的那一个模块对象"**的差别。
+· **★ 旁证**：`DM_TRI_MASK_ALL=1` 叠在 `vsfull` 上仍是 **152（3 轮）** ⇒ 写掩码不是原因。
+· **★ 三条结论**：① 附件格式这层**排掉**（含"第三个数从来没打过"那个坑）；② `%118` 的量级 `< 2^-20`；
+  ③ **`ident` 落屏 / `vsfull` 不落** ⇒ **V 段那对「`%38` 的值 × 它的位置」只能算"`vsfull` 那条装载路上的现象"**，
+  不是着色器体的性质；② 的量级读数也只在"我们那条路"上成立（那条路的采样值可能是空的 —— `vals`/`magr`/`maglo`
+  读到的都是 0，与"我们那份模块没有 `res.json` 的数据来源表"相符）。
+· **下一轮第一问（N4-q）**：把 `res.json` 解出的 `tex/cbuf/sbuf` **三张数据来源表借给**我们那份 `fs`
+  （只改绑定内容、指令一条不动），看 `ident` 是否从 0 变回 152。
+· **回归**：N1/N2/N3/N4-b 四探针各一轮（`…-n4pregress.txt`）+ `.work/regress_diff.py n4oregess n4pregress` ⇒
+  **判据字段 0 项不一致**（41 / 48 / 89 / 59 个共同键）。
+· **本轮没有改新地基的任何模块**（`vk2_*.c` 一行未动）；改的只有 `vk_tex.c/.h`（+`vk_tex_view_fmt`）、
+  `nvn_vk.c`（两段只读日志）、`vk_tri_game.c`（8 个变体名）+ 新的内联 SPIR-V 头 `dm/android/vk/vk_tri_fs_n4p_spv.h`。
+· 读数 `n4-n4p-{fmt{a,b},fmt2{a,b},vsfull{a,b,c},maskall{a,b,c},magr{b,c},maglo{b,c},magup{a,c},magdn{a,b,c},ident{a,b,c},times1{a,b,c}}`；
+  **作废**：`-magra` / `-magloa` / `-magupb`（装机后第一轮 / 冷启动，出图 0、无判据行）；
+  器械 `.work/n4p_gen_fmt.py` / `n4p_mag.py` / `n4p_confs.py` / `n4p_regress.py`。
 ```
 
 ## §3 瘦身前的「本轮目标：N4-p」（逐字保留）

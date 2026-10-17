@@ -3734,6 +3734,45 @@ static void n4i_ladder_draw(VkCommandBuffer cb, uint64_t draw_index, const vk_gf
             ours.write_mask[0],
             draw3 ? "vkCmdDraw(3)（全屏三角形）" : (indexed && ib_ok ? "vkCmdDrawIndexed（照游戏的计数）" : "vkCmdDraw（照游戏的计数）"),
             (unsigned long long)atomic_load(&g_n4i_logs));
+        // N4-p：**附件的格式逐项**（只读，本轮第一件事）。为什么要有它：上面那一行只打 `color[0]`/`color[1]`
+        // （坑 (60)：第 3 个从来没打过），而且打的只是**管线声明**的格式 —— 它取的是**底图**的 NVN 格式
+        // （`gfx_state_fill` 里 `g_rs.color[i]->d.format`），而附件视图走 `vk_tex_view` → `view_for`，
+        // 那里 `view_t::set_format` 能**重解释**格式。两条路一旦不同，管线声明与真实附件格式就不同类
+        // —— 在 Vulkan 里是 UB，校验层不一定报。"本机可作颜色附件/可混合"两格是 `vkGetPhysicalDeviceFormatProperties`
+        // 的直接读数（设备真值，不是名字表），用来判"这个格式到底能不能当附件"。
+        {
+            // 一行一个附件（**不要**拼成一行：`log_line` 的缓冲是 1200 字节，中文一个字 3 字节 ——
+            // N4-p 第一版把三个拼进一行，读数在中途被截断，且 `fo` 溢出后 `sizeof fb - fo` 变成天文数字）。
+            // One line per attachment: `log_line`'s buffer is 1200 bytes and a Chinese character is 3 of them.
+            LOG("【查】DM_TRI_LADDER=%s：**附件格式逐项**（N4-p 新增，只读）：%u 个颜色附件、深度 %s；"
+                "这一刻那份片元着色器的三个输出都是 **vec4 float**（`.work/spv/8e80084d3c30340a` 的 %%34/%%36/%%38）",
+                sname, use_st->color_count, g_rs.depth ? "有" : "无");
+            for (uint32_t i2 = 0; i2 < use_st->color_count && i2 < 8; i2++) {
+                const tex_t *t2 = i2 < g_rs.ncolor ? g_rs.color[i2] : NULL;
+                const view_t *v2 = (i2 < g_rs.ncolor && g_rs.has_cview[i2]) ? &g_rs.cview[i2] : NULL;
+                VkFormat real = vk_tex_view_fmt(t2, v2);
+                VkFormatProperties fp; memset(&fp, 0, sizeof fp);
+                if (vk_phys() != VK_NULL_HANDLE && real != VK_FORMAT_UNDEFINED)
+                    vkGetPhysicalDeviceFormatProperties(vk_phys(), real, &fp);
+                LOG("【查】  [%u] 序号 %llu：底图 NVN %#x → 管线声明 VkFormat %d、**真实（视图）%d**；"
+                    "视图%s / %s；本机可作颜色附件 %s、可混合 %s",
+                    i2, (unsigned long long)(t2 ? t2->serial : 0), t2 ? (unsigned)t2->d.format : 0u,
+                    (int)use_st->color[i2], (int)real,
+                    (v2 == NULL) ? "没带 cview" : ((v2->set_format ? "设了 set_format" : "没设 set_format")),
+                    (int)use_st->color[i2] == (int)real ? "**两侧一致**" : "**★两侧不一致**",
+                    (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ? "是" : "**否**",
+                    (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) ? "是" : "否");
+            }
+            if (g_rs.depth) {
+                const view_t *dv2 = g_rs.has_dview ? &g_rs.dview : NULL;
+                VkFormat dr = vk_tex_view_fmt(g_rs.depth, dv2);
+                LOG("【查】  深度：序号 %llu，底图 NVN %#x → 管线声明 %d/%d、真实 %d；视图%s、%s",
+                    (unsigned long long)g_rs.depth->serial, (unsigned)g_rs.depth->d.format,
+                    (int)use_st->depth_fmt, (int)use_st->stencil_fmt, (int)dr,
+                    (dv2 == NULL) ? "没带 dview" : (dv2->set_format ? "设了 set_format" : "没设 set_format"),
+                    (int)use_st->depth_fmt == (int)dr ? "**两侧一致**" : "**★两侧不一致**");
+            }
+        }
         // N4-j：两边状态的**全字段**摊平（**游戏那一刻** vs **我们这条管线**）—— 本轮要的是"逐字段对照"，
         // 上面那条汇总行只打了其中一小部分（frontFace / 偏置 / a2c / alpha 侧混合 / 模板 / poly 都没打）。
         {
